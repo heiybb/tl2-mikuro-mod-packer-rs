@@ -519,14 +519,18 @@ fn encode_value(enc: &str, vals: &[String], out: &mut Vec<u8>) -> Result<(), Str
             }
         }
         "string" => enc_short_string(&vals[0], out),
-        "g2" => {
-            out.extend_from_slice(&f32le(parse_f64(&vals[0])?));
-            out.extend_from_slice(&f32le(parse_f64(&vals[1])?));
-        }
-        "g3" => {
-            out.extend_from_slice(&f32le(parse_f64(&vals[0])?));
-            out.extend_from_slice(&f32le(parse_f64(&vals[1])?));
-            out.extend_from_slice(&f32le(parse_f64(&vals[2])?));
+        "g2" | "g3" => {
+            // A bare "<FLOAT>RIGHT:1" line (no X/Y/Z suffixes) matches a g3
+            // schema prop with a single value — the reference implementation
+            // raises (IndexError) and the file errors out; mirror that instead
+            // of panicking on the missing components.
+            let n = if enc == "g2" { 2 } else { 3 };
+            if vals.len() < n {
+                return Err(format!("{enc} property has {} of {n} components", vals.len()));
+            }
+            for v in &vals[..n] {
+                out.extend_from_slice(&f32le(parse_f64(v)?));
+            }
         }
         "curve" => {
             let parts: Vec<&str> = if vals[0].is_empty() {
@@ -740,20 +744,26 @@ fn collect_group_nodes(objs: &[LObject]) -> Result<Vec<DgNode>, String> {
     Ok(nodes)
 }
 
+/// CHOICE -> @16 index. GUTS (sub_10115320 @0x10115ea4) linear-scans the
+/// static table `["ALL", "Weight", "Random Chance"]` (init sub_114D37D0) with
+/// a CASE-SENSITIVE wstring compare; no match -> 0. Audited vs the DLL —
+/// exact-match, NOT case-normalized (a hand-authored "WEIGHT" is ALL to GUTS).
 fn choice_index(s: &str) -> u8 {
-    match s.trim().to_uppercase().as_str() {
-        "ALL" => 0,
-        "WEIGHT" => 1,
-        "RANDOM CHANCE" => 2,
-        _ => 0,
+    match s {
+        "Weight" => 1,
+        "Random Chance" => 2,
+        _ => 0, // "ALL" is index 0 and so is any unmatched value
     }
 }
 
-fn gamemode_index(s: &str) -> u8 {
-    match s.trim().to_uppercase().as_str() {
-        "NORMAL" => 1,
-        "NEW GAME PLUS" => 2,
-        _ => 0,
+/// GAME MODE -> @27. GUTS (sub_10115320 @0x10116201): absent/empty -> 0; any
+/// non-empty value -> `2 - (value == L"NORMAL")` — case-sensitive exact, so
+/// every non-"NORMAL" value (incl. "NEW GAME PLUS") is 2.
+fn gamemode_index(present_value: Option<&str>) -> u8 {
+    match present_value {
+        None | Some("") => 0,
+        Some("NORMAL") => 1,
+        Some(_) => 2,
     }
 }
 
@@ -803,14 +813,24 @@ fn emit_dg_node(
         dgtags().get(&tag).copied().unwrap_or(0xFFFF_FFFF)
     };
     out.extend_from_slice(&tagid.to_le_bytes());
-    // @25 NO TAG FOUND, @26 LEVEL UNIQUE, @27 GAME MODE
-    out.push(0);
+    // @25 NO TAG FOUND, @26 LEVEL UNIQUE, @27 GAME MODE.
+    // @25 is the Group's own <BOOL>NO TAG FOUND property (default 0) — GUTS
+    // reads it via sub_10286FC0(obj, "NO TAG FOUND", 0) at 0x101161a5. The
+    // shipped corpus never authors it as a BOOL (the 20 known-garbage base
+    // files carry it mis-typed as <STRING>, which the DLL reads as stale
+    // memory), so this stays 0 on the whole corpus; it only fires for a
+    // hand-authored mod that sets the bool explicitly.
+    let ntf = tp
+        .get("NO TAG FOUND")
+        .map(|s| s.trim().to_lowercase() == "true")
+        .unwrap_or(false);
+    out.push(ntf as u8);
     let lu = tp
         .get("LEVEL UNIQUE")
         .map(|s| s.trim().to_lowercase() == "true")
         .unwrap_or(false);
     out.push(lu as u8);
-    out.push(gamemode_index(tp.get("GAME MODE").map(String::as_str).unwrap_or("")));
+    out.push(gamemode_index(tp.get("GAME MODE").map(String::as_str)));
     // active / deactive theme id lists
     let active = parse_id_list(tp.get("ACTIVE THEMES").map(String::as_str).unwrap_or(""))?;
     out.extend_from_slice(&(active.len() as u32).to_le_bytes());
