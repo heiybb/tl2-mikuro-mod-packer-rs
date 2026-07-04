@@ -1,0 +1,1076 @@
+//! .MOD container writer + pipeline orchestration (port of packer.py).
+//!
+//! Everything is synthesized FROM SCRATCH — no reference .MOD is consulted.
+//! Header from MOD.DAT (build_header), manifest tree from a MEDIA scan
+//! (build_manifest_dirs), PAK data section with the byte-exact writers.
+//! The PAK rollingHash and the manifest mhash are BOTH validated by the game
+//! and are computed here (leaving either 0 breaks the mod — see the RE notes
+//! in the Python original / project memory).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use indexmap::IndexMap;
+use rayon::prelude::*;
+use regex::Regex;
+
+use crate::bindat::compile_dat_file;
+use crate::binlayout::compile_layout_file;
+use crate::raw;
+
+/// In-memory converted files, keyed by UPPER rel path (no MEDIA/ prefix),
+/// '/'-separated. Insertion-ordered (mirrors the Python dict).
+pub type Overrides = IndexMap<String, Vec<u8>>;
+
+pub const TYPE_DIR: u8 = 7;
+pub const TYPE_UNKNOWN: u8 = 18;
+
+const MOD_MAGIC: u16 = 4;
+const MOD_FLAGS: u32 = 0;
+const DEFAULT_GAMEVER: u64 = 0x0005_0009_0019_0001;
+
+/// TL2 base install MEDIA dir (env-overridable).
+pub fn tl2_media_dir() -> PathBuf {
+    std::env::var("TL2_MEDIA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"E:\Torchlight 2\MEDIA"))
+}
+
+/// Extension → manifest TYPE code (EditorGuts sub_102A1EA0 + sub_102A24F0).
+fn ext_type_of(ext: &str) -> Option<u8> {
+    Some(match ext {
+        ".DAT" | ".TEMPLATE" | ".BINDAT" => 0,
+        ".LAYOUT" | ".BINLAYOUT" => 1,
+        ".MESH" => 2,
+        ".SKELETON" => 3,
+        ".DDS" => 4,
+        ".PNG" => 5,
+        ".WAV" | ".OGG" => 6,
+        ".MATERIAL" => 8,
+        ".RAW" => 9,
+        ".UILAYOUT" => 10,
+        ".IMAGESET" => 11,
+        ".TTF" | ".TTC" => 12,
+        ".FONT" => 13,
+        ".ANIMATION" => 16,
+        ".HIE" => 17,
+        ".SCHEME" => 19,
+        ".LOOKNFEEL" => 20,
+        ".MPP" => 21,
+        ".BIK" => 23,
+        ".JPG" => 24,
+        _ => return None,
+    })
+}
+
+/// Manifest type code for an UPPER file name; .BINDAT/.BINLAYOUT names are
+/// classified by the SOURCE extension they wrap.
+pub fn ext_type(name_upper: &str) -> u8 {
+    let mut base = name_upper;
+    for suf in [".BINDAT", ".BINLAYOUT"] {
+        if let Some(b) = base.strip_suffix(suf) {
+            base = b;
+            break;
+        }
+    }
+    match base.rfind('.') {
+        None => TYPE_UNKNOWN,
+        Some(dot) => ext_type_of(&base[dot..]).unwrap_or(TYPE_UNKNOWN),
+    }
+}
+
+/// Store-vs-compress: everything zlib-compressed except .JPG (type 24), and
+/// anything >= 0x1900000 is stored (GUTS' compress-buffer cap).
+fn is_store_type(typ: u8) -> bool {
+    typ == 24
+}
+
+// ── gamever (Torchlight2.exe VS_FIXEDFILEINFO) ─────────────────────────────
+
+#[cfg(windows)]
+fn read_gamever_exe(exe: &Path) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    let wide: Vec<u16> = exe
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut handle = 0u32;
+        let size = GetFileVersionInfoSizeW(wide.as_ptr(), &mut handle);
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        if GetFileVersionInfoW(wide.as_ptr(), 0, size, buf.as_mut_ptr() as *mut _) == 0 {
+            return None;
+        }
+        let sub: Vec<u16> = "\\".encode_utf16().chain(std::iter::once(0)).collect();
+        let mut lp: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut ln: u32 = 0;
+        if VerQueryValueW(buf.as_ptr() as *const _, sub.as_ptr(), &mut lp, &mut ln) == 0 {
+            return None;
+        }
+        let ffi = lp as *const u32;
+        if *ffi != 0xFEEF_04BD {
+            return None;
+        }
+        let ms = *ffi.add(2);
+        let ls = *ffi.add(3);
+        let (w4, w5) = ((ms & 0xFFFF) as u64, ((ms >> 16) & 0xFFFF) as u64);
+        let (w6, w7) = ((ls & 0xFFFF) as u64, ((ls >> 16) & 0xFFFF) as u64);
+        Some(w5 | (w4 << 16) | (w7 << 32) | (w6 << 48))
+    }
+}
+
+#[cfg(not(windows))]
+fn read_gamever_exe(_exe: &Path) -> Option<u64> {
+    None
+}
+
+/// gameVersion u64 from Torchlight2.exe (== EditorGuts sub_103F8CD0), else the
+/// 1.25.9.5 default. Env `TL2_MOD_GAMEVER` overrides (handled by the caller).
+pub fn read_gamever(install_dir: Option<&Path>) -> u64 {
+    let install = match install_dir {
+        Some(d) => d.to_path_buf(),
+        None => tl2_media_dir()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default(),
+    };
+    let exe = install.join("Torchlight2.exe");
+    if !exe.is_file() {
+        return DEFAULT_GAMEVER;
+    }
+    read_gamever_exe(&exe).unwrap_or(DEFAULT_GAMEVER)
+}
+
+// ── MOD.DAT reader ─────────────────────────────────────────────────────────
+
+pub struct ModMeta {
+    pub name: String,
+    pub title: String,
+}
+
+pub fn read_mod_metadata(mod_dir: &Path) -> ModMeta {
+    let base = mod_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mod_dat = mod_dir.join("MOD.DAT");
+    if !mod_dat.exists() {
+        return ModMeta {
+            name: base.clone(),
+            title: base,
+        };
+    }
+    let text = read_mod_dat_text(&mod_dat);
+    let get = |key: &str| -> Option<String> {
+        let re = Regex::new(&format!(r"<STRING>{key}:([^\r\n]+)")).unwrap();
+        re.captures(&text).map(|c| c[1].trim().to_string())
+    };
+    let name = get("MOD_FILE_NAME").unwrap_or_else(|| base.clone());
+    let title = get("DISPLAYNAME")
+        .or_else(|| get("MOD_TITLE"))
+        .unwrap_or_else(|| name.clone());
+    ModMeta { name, title }
+}
+
+fn read_mod_dat_text(path: &Path) -> String {
+    let raw = std::fs::read(path).unwrap_or_default();
+    // UTF-16-LE strict, falling back to UTF-8 (mirrors _parse_mod_dat).
+    let units: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let text = match String::from_utf16(&units) {
+        Ok(t) if raw.len() % 2 == 0 => t,
+        _ => String::from_utf8_lossy(&raw).to_string(),
+    };
+    text.trim_start_matches('\u{FEFF}').to_string()
+}
+
+pub struct Header {
+    pub ver: u16,
+    pub modver: u16,
+    pub gamever: u64,
+    pub title: String,
+    pub author: String,
+    pub descr: String,
+    pub website: String,
+    pub download: String,
+    pub modid: u64,
+    pub flags: u32,
+    pub req_hash: u64,
+    pub reqs: Vec<(String, u64, u16)>,
+    pub dels: Vec<String>,
+    pub mhash: u32,
+    pub root: String,
+    pub fc: u32,
+}
+
+fn parse_mod_dat(mod_dir: &Path) -> (BTreeMap<String, String>, Vec<(String, u64, u16)>, Vec<String>) {
+    let path = mod_dir.join("MOD.DAT");
+    let mut fields: BTreeMap<String, String> = BTreeMap::new();
+    let mut reqs = Vec::new();
+    let mut dels = Vec::new();
+    if !path.exists() {
+        return (fields, reqs, dels);
+    }
+    let text = read_mod_dat_text(&path);
+
+    // Top-level scalar fields (first occurrence wins; case-insensitive key).
+    let field_re = Regex::new(r"<[^>]+>([A-Za-z0-9_]+)\s*:([^\r\n]*)").unwrap();
+    for c in field_re.captures_iter(&text) {
+        let key = c[1].to_uppercase();
+        fields.entry(key).or_insert_with(|| c[2].trim().to_string());
+    }
+
+    // REQUIRED_MODS block.
+    let rm_re = Regex::new(r"(?is)\[REQUIRED_MODS\](.*?)\[/REQUIRED_MODS\]").unwrap();
+    if let Some(rm) = rm_re.captures(&text) {
+        let body = &rm[1];
+        let nm_re = Regex::new(r"(?i)<[^>]+>NAME\s*:([^\r\n]*)").unwrap();
+        let gid_re = Regex::new(r"(?i)<[^>]+>(?:MOD_ID|GUID|ID)\s*:\s*(-?\d+)").unwrap();
+        let ver_re = Regex::new(r"(?i)<[^>]+>VERSION\s*:\s*(-?\d+)").unwrap();
+        for blk in split_before_tag(body) {
+            if let Some(g) = gid_re.captures(blk) {
+                let name = nm_re
+                    .captures(blk)
+                    .map(|c| c[1].trim().to_string())
+                    .unwrap_or_default();
+                let gid = g[1].parse::<i64>().unwrap_or(0) as u64;
+                let ver = ver_re
+                    .captures(blk)
+                    .and_then(|c| c[1].parse::<i64>().ok())
+                    .unwrap_or(0) as u64 as u16;
+                reqs.push((name, gid, ver));
+            }
+        }
+    }
+
+    // REMOVE_FILES block.
+    let rf_re = Regex::new(r"(?is)\[REMOVE_FILES\](.*?)\[/REMOVE_FILES\]").unwrap();
+    if let Some(rf) = rf_re.captures(&text) {
+        let item_re = Regex::new(r"<STRING>[^:]*:([^\r\n]*)").unwrap();
+        for c in item_re.captures_iter(&rf[1]) {
+            let v = c[1].trim();
+            if !v.is_empty() {
+                dels.push(v.to_string());
+            }
+        }
+    }
+    (fields, reqs, dels)
+}
+
+/// Python `re.split(r'(?=\[[A-Za-z0-9_]+\])', body)` — split before each tag.
+fn split_before_tag(body: &str) -> Vec<&str> {
+    let tag_re = Regex::new(r"\[[A-Za-z0-9_]+\]").unwrap();
+    let mut cuts = vec![0usize];
+    for m in tag_re.find_iter(body) {
+        if m.start() != 0 {
+            cuts.push(m.start());
+        }
+    }
+    cuts.push(body.len());
+    cuts.windows(2).map(|w| &body[w[0]..w[1]]).collect()
+}
+
+/// Synthesize the .MOD header from MOD.DAT (mirrors build_header).
+pub fn build_header(mod_dir: &Path, gamever: Option<u64>) -> Header {
+    let (fields, reqs, dels) = parse_mod_dat(mod_dir);
+    let get_i = |key: &str| -> i64 {
+        fields
+            .get(key)
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    let gamever = gamever.unwrap_or_else(|| {
+        match std::env::var("TL2_MOD_GAMEVER") {
+            Ok(env) if !env.is_empty() => {
+                let t = env.trim();
+                if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                    u64::from_str_radix(hex, 16).unwrap_or_else(|_| read_gamever(None))
+                } else {
+                    t.parse::<u64>().unwrap_or_else(|_| read_gamever(None))
+                }
+            }
+            _ => read_gamever(None),
+        }
+    });
+    let base = mod_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Header {
+        ver: MOD_MAGIC,
+        modver: ((get_i("VERSION") + 1) & 0xFFFF) as u16,
+        gamever,
+        title: fields.get("NAME").cloned().unwrap_or(base),
+        author: fields.get("AUTHOR").cloned().unwrap_or_default(),
+        descr: fields.get("DESCRIPTION").cloned().unwrap_or_default(),
+        website: fields.get("WEBSITE").cloned().unwrap_or_default(),
+        download: fields.get("DOWNLOAD_URL").cloned().unwrap_or_default(),
+        modid: get_i("MOD_ID") as u64,
+        flags: MOD_FLAGS,
+        req_hash: 0, // 0 when no REQUIRED_MODS (all our mods); documented gap otherwise
+        reqs,
+        dels,
+        mhash: 0,
+        root: "MEDIA/".to_string(),
+        fc: 0,
+    }
+}
+
+// ── byte writers ───────────────────────────────────────────────────────────
+
+fn w_ss(s: &str, out: &mut Vec<u8>) {
+    raw::ss(s, out);
+}
+
+pub fn w_header(h: &Header, off_data: u32, off_man: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&h.ver.to_le_bytes());
+    out.extend_from_slice(&h.modver.to_le_bytes());
+    out.extend_from_slice(&h.gamever.to_le_bytes());
+    out.extend_from_slice(&off_data.to_le_bytes());
+    out.extend_from_slice(&off_man.to_le_bytes());
+    for s in [&h.title, &h.author, &h.descr, &h.website, &h.download] {
+        w_ss(s, &mut out);
+    }
+    out.extend_from_slice(&h.modid.to_le_bytes());
+    out.extend_from_slice(&h.flags.to_le_bytes());
+    out.extend_from_slice(&h.req_hash.to_le_bytes());
+    out.extend_from_slice(&(h.reqs.len() as u16).to_le_bytes());
+    for (n, i, v) in &h.reqs {
+        w_ss(n, &mut out);
+        out.extend_from_slice(&i.to_le_bytes());
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&(h.dels.len() as u16).to_le_bytes());
+    for d in &h.dels {
+        w_ss(d, &mut out);
+    }
+    out
+}
+
+/// Manifest record: (crc, type, name, off, size, ftime).
+pub type Rec = (u32, u8, String, u32, u32, u64);
+pub type Dirs = Vec<(String, Vec<Rec>)>;
+
+pub fn w_manifest(h: &Header, dirs: &Dirs) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&h.mhash.to_le_bytes());
+    w_ss(&h.root, &mut out);
+    out.extend_from_slice(&h.fc.to_le_bytes());
+    out.extend_from_slice(&(dirs.len() as u32).to_le_bytes());
+    for (dname, recs) in dirs {
+        w_ss(dname, &mut out);
+        out.extend_from_slice(&(recs.len() as u32).to_le_bytes());
+        for (crc, typ, name, off, size, ft) in recs {
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.push(*typ);
+            w_ss(name, &mut out);
+            out.extend_from_slice(&off.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&ft.to_le_bytes());
+        }
+    }
+    out
+}
+
+// ── the two validated hashes ───────────────────────────────────────────────
+
+/// PAK data-section rolling hash (VALIDATED by the game at mod-load).
+/// divisor = 25 + (695696193*N mod 2^32) mod 51; stride = max(2, N/divisor);
+/// h = N; fold every stride-th byte from offset 8 as (i8)b + 33*h; + last byte.
+pub fn pak_rolling_hash(data: &[u8]) -> u32 {
+    let n = data.len();
+    if n <= 8 {
+        return 0;
+    }
+    let divisor = 25 + (695_696_193u32.wrapping_mul(n as u32)) % 51;
+    let mut stride = n / divisor as usize;
+    if stride <= 1 {
+        stride = 2;
+    }
+    let mut h = n as u32;
+    let mut k = 8usize;
+    while k < n {
+        h = (data[k] as i8 as i32 as u32).wrapping_add(h.wrapping_mul(33));
+        k += stride;
+    }
+    (data[n - 1] as i8 as i32 as u32).wrapping_add(h.wrapping_mul(33))
+}
+
+/// Manifest-TOC hashValue (mhash) — VALIDATED on game-ENTER. Seed 8234,
+/// stride = 15 + (695696193*N mod 2^32) mod 11, samples from offset 0.
+pub fn pak_manifest_hash(manifest: &[u8]) -> u32 {
+    let n = manifest.len();
+    if n == 0 {
+        return 0;
+    }
+    let stride = (15 + (695_696_193u32.wrapping_mul(n as u32)) % 11) as usize;
+    let mut h: u32 = 8234;
+    let mut k = 0usize;
+    while k < n {
+        h = (manifest[k] as i8 as i32 as u32).wrapping_add(h.wrapping_mul(33));
+        k += stride;
+    }
+    h
+}
+
+// ── MEDIA scan → manifest tree ─────────────────────────────────────────────
+
+const FILETIME_EPOCH_DELTA: u64 = 116_444_736_000_000_000;
+
+fn filetime_of(md: &std::fs::Metadata) -> u64 {
+    // Python: int(st_mtime * 1e7) + delta, st_mtime = float seconds.
+    match md.modified() {
+        Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => {
+                let secs = d.as_secs() as f64 + d.subsec_nanos() as f64 * 1e-9;
+                (secs * 10_000_000.0) as u64 + FILETIME_EPOCH_DELTA
+            }
+            Err(_) => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+/// (rel_upper_with_MEDIA, manifest_name, type, ftime) in name-interleaved DFS
+/// order, with the PNG→DDS dedup, unioned with in-memory overrides.
+fn collect_media_files(
+    media_dir: &Path,
+    overrides: Option<&Overrides>,
+) -> Vec<(String, String, u8, u64)> {
+    let mut files = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    fn walk(
+        disk_dir: &Path,
+        rel_prefix: &str,
+        overrides: Option<&Overrides>,
+        files: &mut Vec<(String, String, u8, u64)>,
+        seen: &mut BTreeSet<String>,
+    ) {
+        let mut entries: Vec<(String, std::fs::DirEntry)> = match std::fs::read_dir(disk_dir) {
+            Ok(rd) => rd
+                .flatten()
+                .map(|e| (e.file_name().to_string_lossy().to_uppercase(), e))
+                .collect(),
+            Err(_) => return,
+        };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let names_u: BTreeSet<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+        for (nmu, e) in entries {
+            let name = e.file_name().to_string_lossy().to_string();
+            let rel = format!("{rel_prefix}{name}");
+            let relu = rel.to_uppercase();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                walk(&e.path(), &format!("{rel}/"), overrides, files, seen);
+                continue;
+            }
+            // Compiled outputs ride under the source name.
+            if nmu.ends_with(".BINDAT") || nmu.ends_with(".BINLAYOUT") {
+                continue;
+            }
+            // PNG→DDS dedup (same dir OR in overrides).
+            if nmu.ends_with(".PNG") {
+                let dds_sib = format!("{}.DDS", &nmu[..nmu.len() - 4]);
+                let dds_ov = format!("{}.DDS", &relu[6..relu.len() - 4]);
+                if names_u.contains(&dds_sib)
+                    || overrides.map(|o| o.contains_key(&dds_ov)).unwrap_or(false)
+                {
+                    continue;
+                }
+            }
+            seen.insert(relu.clone());
+            let ft = e.metadata().map(|m| filetime_of(&m)).unwrap_or(0);
+            let typ = ext_type(&nmu);
+            files.push((relu, nmu, typ, ft));
+        }
+    }
+
+    walk(media_dir, "MEDIA/", overrides, &mut files, &mut seen);
+
+    if let Some(ov) = overrides {
+        for key in ov.keys() {
+            let ku = key.to_uppercase();
+            if ku.ends_with(".BINDAT") || ku.ends_with(".BINLAYOUT") {
+                continue;
+            }
+            let relu = format!("MEDIA/{ku}");
+            if seen.contains(&relu) {
+                continue;
+            }
+            seen.insert(relu.clone());
+            let name = ku.rsplit('/').next().unwrap_or(&ku).to_string();
+            let typ = ext_type(&ku);
+            files.push((relu, name, typ, 0));
+        }
+    }
+    files
+}
+
+/// Manifest dir-tree from a MEDIA scan (mirrors build_manifest_dirs).
+pub fn build_manifest_dirs(media_dir: &Path, overrides: Option<&Overrides>) -> (Dirs, u32) {
+    let files = collect_media_files(media_dir, overrides);
+
+    let mut dir_files: BTreeMap<String, Vec<Rec>> = BTreeMap::new();
+    let mut dir_subdirs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut all_dirs: BTreeSet<String> = BTreeSet::new();
+
+    fn ensure_dir(
+        dpath: &str,
+        all_dirs: &mut BTreeSet<String>,
+        dir_files: &mut BTreeMap<String, Vec<Rec>>,
+        dir_subdirs: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        if all_dirs.contains(dpath) {
+            return;
+        }
+        all_dirs.insert(dpath.to_string());
+        dir_files.entry(dpath.to_string()).or_default();
+        dir_subdirs.entry(dpath.to_string()).or_default();
+        if dpath == "MEDIA/" {
+            return;
+        }
+        let trimmed = &dpath[..dpath.len() - 1];
+        let parent = match trimmed.rfind('/') {
+            Some(i) => format!("{}/", &trimmed[..i]),
+            None => "MEDIA/".to_string(),
+        };
+        ensure_dir(&parent, all_dirs, dir_files, dir_subdirs);
+        let leaf = dpath[parent.len()..].to_string();
+        dir_subdirs.get_mut(&parent).unwrap().insert(leaf);
+    }
+
+    ensure_dir("MEDIA/", &mut all_dirs, &mut dir_files, &mut dir_subdirs);
+    for (relu, name, typ, ft) in files {
+        let dpath = match relu.rfind('/') {
+            Some(i) => format!("{}/", &relu[..i]),
+            None => "MEDIA/".to_string(),
+        };
+        ensure_dir(&dpath, &mut all_dirs, &mut dir_files, &mut dir_subdirs);
+        dir_files
+            .get_mut(&dpath)
+            .unwrap()
+            .push((0, typ, name, 0, 0, ft));
+    }
+
+    let mut dirs: Dirs = vec![(
+        String::new(),
+        vec![(0, TYPE_DIR, "MEDIA/".to_string(), 0, 0, 0)],
+    )];
+    let mut file_count: u32 = 1;
+    for dpath in &all_dirs {
+        let mut recs = dir_files.remove(dpath).unwrap_or_default();
+        for leaf in &dir_subdirs[dpath] {
+            recs.push((0, TYPE_DIR, leaf.clone(), 0, 0, 0));
+        }
+        file_count += recs.len() as u32;
+        dirs.push((dpath.clone(), recs));
+    }
+    (dirs, file_count)
+}
+
+/// Bytes packed for a manifest entry (UPPER rel path, no MEDIA/ prefix):
+/// compiled form first (overrides then disk), else the raw file.
+fn content_for(rel_upper: &str, media_dir: &Path, overrides: Option<&Overrides>) -> Option<Vec<u8>> {
+    let mut cands: Vec<String> = Vec::new();
+    if rel_upper.ends_with(".DAT")
+        || rel_upper.ends_with(".TEMPLATE")
+        || rel_upper.ends_with(".ANIMATION")
+        || rel_upper.ends_with(".HIE")
+    {
+        cands.push(format!("{rel_upper}.BINDAT"));
+    } else if rel_upper.ends_with(".LAYOUT") {
+        cands.push(format!("{rel_upper}.BINLAYOUT"));
+    }
+    cands.push(rel_upper.to_string());
+    if let Some(ov) = overrides {
+        for c in &cands {
+            if let Some(data) = ov.get(c) {
+                return Some(data.clone());
+            }
+        }
+    }
+    for c in &cands {
+        let disk = media_dir.join(c.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if disk.is_file() {
+            if let Ok(data) = std::fs::read(&disk) {
+                return Some(data);
+            }
+        }
+    }
+    None
+}
+
+/// Build a .MOD entirely from scratch. Returns the written byte count.
+pub fn pack_mod(
+    media_dir: &Path,
+    output_path: &Path,
+    original_mod_dir: Option<&Path>,
+    overrides: Option<&Overrides>,
+) -> std::io::Result<usize> {
+    let default_mod_dir = media_dir.parent().unwrap_or(media_dir).to_path_buf();
+    let mod_dir = original_mod_dir.unwrap_or(&default_mod_dir);
+
+    let mut h = build_header(mod_dir, None);
+    let (dirs, file_count) = build_manifest_dirs(media_dir, overrides);
+    h.fc = file_count;
+
+    // Pass A: resolve every record to a placeholder or a content block.
+    enum Item {
+        Placeholder(Rec),
+        Block(usize), // index into blocks
+    }
+    struct Block {
+        typ: u8,
+        name: String,
+        ft: u64,
+        content: Vec<u8>,
+        size: u32, // decompressed (original) length
+        store: bool,
+        comp: Vec<u8>,
+        csz: u32,
+        crc: u32,
+    }
+    let mut plan: Vec<(String, Vec<Item>)> = Vec::new();
+    let mut blocks: Vec<Block> = Vec::new();
+    for (dname, recs) in &dirs {
+        let mut items = Vec::new();
+        for (_crc, typ, name, _off, _size, ft) in recs {
+            if *typ == TYPE_DIR {
+                items.push(Item::Placeholder((0, *typ, name.clone(), 0, 0, *ft)));
+                continue;
+            }
+            let full_upper = format!("{dname}{name}").to_uppercase();
+            let rel_upper = full_upper
+                .strip_prefix("MEDIA/")
+                .unwrap_or(&full_upper)
+                .to_string();
+            match content_for(&rel_upper, media_dir, overrides) {
+                None => items.push(Item::Placeholder((0, *typ, name.clone(), 0, 0, *ft))),
+                Some(content) => {
+                    let store = is_store_type(*typ) || content.len() >= 0x190_0000;
+                    let size = content.len() as u32;
+                    blocks.push(Block {
+                        typ: *typ,
+                        name: name.clone(),
+                        ft: *ft,
+                        content,
+                        size,
+                        store,
+                        comp: Vec::new(),
+                        csz: 0,
+                        crc: 0,
+                    });
+                    items.push(Item::Block(blocks.len() - 1));
+                }
+            }
+        }
+        plan.push((dname.clone(), items));
+    }
+
+    // Pass B: compress + crc in parallel (zlib level 6 == GUTS).
+    blocks.par_iter_mut().for_each(|blk| {
+        blk.crc = crc32fast::hash(&blk.content);
+        if blk.store {
+            blk.comp = std::mem::take(&mut blk.content);
+            blk.csz = 0;
+        } else {
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
+            enc.write_all(&blk.content).unwrap();
+            blk.comp = enc.finish().unwrap();
+            blk.csz = blk.comp.len() as u32;
+            blk.content = Vec::new();
+        }
+    });
+
+    // Pass C: assemble the data section strictly in manifest order.
+    let mut data: Vec<u8> = vec![0u8; 8]; // [maxCompressedBlockSize][rollingHash]
+    let mut max_csz: u32 = 0;
+    let mut new_dirs: Dirs = Vec::new();
+    for (dname, items) in plan {
+        let mut nr: Vec<Rec> = Vec::new();
+        for it in items {
+            match it {
+                Item::Placeholder(rec) => nr.push(rec),
+                Item::Block(bi) => {
+                    let blk = &blocks[bi];
+                    let off = data.len() as u32;
+                    data.extend_from_slice(&blk.size.to_le_bytes());
+                    data.extend_from_slice(&blk.csz.to_le_bytes());
+                    data.extend_from_slice(&blk.comp);
+                    if blk.csz > max_csz {
+                        max_csz = blk.csz;
+                    }
+                    nr.push((blk.crc, blk.typ, blk.name.clone(), off, blk.size, blk.ft));
+                }
+            }
+        }
+        new_dirs.push((dname, nr));
+    }
+
+    data[0..4].copy_from_slice(&max_csz.to_le_bytes());
+    let rh = pak_rolling_hash(&data);
+    data[4..8].copy_from_slice(&rh.to_le_bytes());
+
+    let off_data = w_header(&h, 0, 0).len() as u32;
+    let off_man = off_data + data.len() as u32;
+    let mut manifest = w_manifest(&h, &new_dirs);
+    let mh = pak_manifest_hash(&manifest);
+    manifest[2..6].copy_from_slice(&mh.to_le_bytes());
+
+    let mut out = w_header(&h, off_data, off_man);
+    out.extend_from_slice(&data);
+    out.extend_from_slice(&manifest);
+    std::fs::write(output_path, &out)?;
+    Ok(out.len())
+}
+
+// ── conversion pipeline ────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub struct ConvertResults {
+    pub bindat: usize,
+    pub binlayout: usize,
+    pub raw: usize,
+    pub mpp: usize,
+    pub errors: Vec<String>,
+}
+
+/// Persist a converted file: into `overrides` (keyed by UPPER rel path) or to disk.
+fn emit_converted(
+    path: &Path,
+    data: Vec<u8>,
+    media_dir: &Path,
+    overrides: Option<&mut Overrides>,
+) -> std::io::Result<()> {
+    match overrides {
+        Some(ov) => {
+            let rel = path
+                .strip_prefix(media_dir)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
+                .to_uppercase();
+            ov.insert(rel, data);
+            Ok(())
+        }
+        None => std::fs::write(path, data),
+    }
+}
+
+fn walk_files_sorted(root: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries: Vec<(String, PathBuf, bool)> = match std::fs::read_dir(root) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| {
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                (e.file_name().to_string_lossy().to_uppercase(), e.path(), is_dir)
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut dirs = Vec::new();
+    for (_n, p, is_dir) in entries {
+        if is_dir {
+            dirs.push(p);
+        } else {
+            out.push(p);
+        }
+    }
+    for d in dirs {
+        walk_files_sorted(&d, out);
+    }
+}
+
+/// Run all conversions on a MEDIA directory (mirrors convert_all).
+pub fn convert_all(
+    media_dir: &Path,
+    mut overrides: Option<&mut Overrides>,
+    mpp_backend: &str,
+    raw_mode: &str,
+) -> ConvertResults {
+    let mut results = ConvertResults::default();
+
+    let mut all_files = Vec::new();
+    walk_files_sorted(media_dir, &mut all_files);
+    let mut dat_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut layout_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for f in &all_files {
+        let fu = f
+            .file_name()
+            .map(|s| s.to_string_lossy().to_uppercase())
+            .unwrap_or_default();
+        let is_dat = (fu.ends_with(".DAT")
+            || fu.ends_with(".TEMPLATE")
+            || fu.ends_with(".ANIMATION")
+            || fu.ends_with(".HIE"))
+            && !fu.contains(".BIN");
+        if is_dat {
+            let mut bp = f.as_os_str().to_owned();
+            bp.push(".BINDAT");
+            dat_jobs.push((f.clone(), PathBuf::from(bp)));
+        } else if fu.ends_with(".LAYOUT") {
+            let mut bp = f.as_os_str().to_owned();
+            bp.push(".BINLAYOUT");
+            layout_jobs.push((f.clone(), PathBuf::from(bp)));
+        }
+    }
+
+    // 1. DAT → BINDAT (parallel; per-file hash ids are self-contained).
+    eprintln!("  Converting DAT→BINDAT... ({} files)", dat_jobs.len());
+    let bindat_out: Vec<(PathBuf, Result<Vec<u8>, String>)> = dat_jobs
+        .par_iter()
+        .map(|(dp, bp)| (bp.clone(), compile_dat_file(dp).map_err(|e| format!("{}: {e}", dp.display()))))
+        .collect();
+    for (bp, res) in bindat_out {
+        match res {
+            Ok(gen) => {
+                if emit_converted(&bp, gen, media_dir, overrides.as_deref_mut()).is_ok() {
+                    results.bindat += 1;
+                }
+            }
+            Err(e) => results.errors.push(format!("BINDAT {e}")),
+        }
+    }
+
+    // 2. LAYOUT → BINLAYOUT (parallel).
+    eprintln!("  Converting LAYOUT→BINLAYOUT... ({} files)", layout_jobs.len());
+    let layout_out: Vec<(PathBuf, Result<Vec<u8>, String>)> = layout_jobs
+        .par_iter()
+        .map(|(lp, bp)| {
+            (
+                bp.clone(),
+                compile_layout_file(lp).map_err(|e| format!("{}: {e}", lp.display())),
+            )
+        })
+        .collect();
+    for (bp, res) in layout_out {
+        match res {
+            Ok(gen) => {
+                if emit_converted(&bp, gen, media_dir, overrides.as_deref_mut()).is_ok() {
+                    results.binlayout += 1;
+                }
+            }
+            Err(e) => results.errors.push(format!("BINLAYOUT {e}")),
+        }
+    }
+
+    // 3. RAW indices (ON-DEMAND per content type).
+    if !matches!(raw_mode, "none" | "skip") {
+        eprintln!("  Generating RAW files (on-demand per content type)...");
+        results.raw = generate_raw_files(media_dir, overrides.as_deref_mut());
+    } else {
+        eprintln!("  Skipping RAW generation (raw=none).");
+    }
+
+    // 4. MPP pathing grids.
+    if !matches!(mpp_backend, "none" | "skip") {
+        eprintln!("  Generating MPP files (backend={mpp_backend})...");
+        match generate_mpp_files(media_dir, overrides.as_deref_mut(), mpp_backend, None) {
+            Ok(n) => results.mpp = n,
+            Err(e) => {
+                if mpp_backend == "dll" {
+                    eprintln!(
+                        "  WARNING: byte-exact DLL MPP backend unavailable ({e});\n           \
+                         falling back to APPROXIMATE offline MPP."
+                    );
+                    match generate_mpp_files(media_dir, overrides.as_deref_mut(), "re", None) {
+                        Ok(n) => results.mpp = n,
+                        Err(e2) => results.errors.push(format!("MPP: {e2}")),
+                    }
+                } else {
+                    results.errors.push(format!("MPP: {e}"));
+                }
+            }
+        }
+    }
+
+    results
+}
+
+fn emit_raw(
+    raw_name: &str,
+    data: Option<Vec<u8>>,
+    media_dir: &Path,
+    overrides: Option<&mut Overrides>,
+) -> usize {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return 0,
+    };
+    match overrides {
+        Some(ov) => {
+            ov.insert(raw_name.to_uppercase(), data);
+            1
+        }
+        None => {
+            if std::fs::write(media_dir.join(raw_name), data).is_ok() {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Generate the 7 RAW index files (order mirrors _run_raw_builders).
+pub fn generate_raw_files(media_dir: &Path, mut overrides: Option<&mut Overrides>) -> usize {
+    let mut count = 0;
+    count += emit_raw("ROOMPIECES.RAW", raw::build_roompieces(media_dir), media_dir, overrides.as_deref_mut());
+    count += emit_raw("SKILLS.RAW", raw::build_skills(media_dir), media_dir, overrides.as_deref_mut());
+    count += emit_raw("MISSILES.RAW", raw::build_missiles(media_dir), media_dir, overrides.as_deref_mut());
+    count += emit_raw("AFFIXES.RAW", raw::build_affixes(media_dir), media_dir, overrides.as_deref_mut());
+    count += emit_raw("TRIGGERABLES.RAW", raw::build_triggerables(media_dir), media_dir, overrides.as_deref_mut());
+    count += emit_raw("UNITDATA.RAW", raw::build_unitdata(media_dir), media_dir, overrides.as_deref_mut());
+    count += emit_raw("UI.RAW", raw::build_ui(media_dir), media_dir, overrides.as_deref_mut());
+    count
+}
+
+/// Generate .MPP pathing grids (backend "re" offline / "dll" byte-exact).
+pub fn generate_mpp_files(
+    media_dir: &Path,
+    mut overrides: Option<&mut Overrides>,
+    backend: &str,
+    install_dir: Option<&Path>,
+) -> Result<usize, String> {
+    match backend {
+        "none" | "skip" => return Ok(0),
+        "dll" => return crate::mpp::dll::generate_mpp_files_dll(media_dir, overrides, install_dir),
+        "re" => {}
+        other => return Err(format!("unknown mpp backend: {other:?}")),
+    }
+
+    let base_install = install_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(tl2_media_dir);
+    let layouts_dir = media_dir.join("LAYOUTS");
+    let mut jobs = Vec::new();
+    let mut all = Vec::new();
+    walk_files_sorted(&layouts_dir, &mut all);
+    for f in all {
+        if f.file_name()
+            .map(|s| s.to_string_lossy().to_uppercase().ends_with(".LAYOUT"))
+            .unwrap_or(false)
+        {
+            jobs.push(f);
+        }
+    }
+    if jobs.is_empty() {
+        return Ok(0);
+    }
+
+    let ctx = crate::mpp::pipeline::Context::new(media_dir, Some(&base_install));
+    let out: Vec<(PathBuf, Option<Vec<u8>>)> = jobs
+        .par_iter()
+        .map(|lp| (lp.clone(), crate::mpp::compile_mpp(lp, &ctx).ok()))
+        .collect();
+
+    let mut count = 0;
+    let mut failed: Vec<(PathBuf, &str)> = Vec::new();
+    for (lp, data) in out {
+        let lps = lp.to_string_lossy().to_string();
+        let mpp_path = if lps.to_uppercase().ends_with(".LAYOUT") {
+            PathBuf::from(format!("{}.mpp", &lps[..lps.len() - ".LAYOUT".len()]))
+        } else {
+            PathBuf::from(format!("{lps}.mpp"))
+        };
+        match data {
+            Some(d) if !d.is_empty() => {
+                let _ = emit_converted(&mpp_path, d, media_dir, overrides.as_deref_mut());
+                count += 1;
+            }
+            _ => {
+                // fall back to the base install's shipped .mpp (stale but walkable)
+                let rel = mpp_path
+                    .strip_prefix(media_dir)
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|_| mpp_path.clone());
+                let base_mpp = base_install.join(&rel);
+                if base_mpp.exists() {
+                    if let Ok(bytes) = std::fs::read(&base_mpp) {
+                        let _ = emit_converted(&mpp_path, bytes, media_dir, overrides.as_deref_mut());
+                        count += 1;
+                        failed.push((lp, "compile failed -> copied base .mpp (stale)"));
+                        continue;
+                    }
+                }
+                failed.push((lp, "compile failed AND no base .mpp -> tile will be STUBBED"));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        eprintln!("  WARNING: {} layout(s) failed offline MPP compile:", failed.len());
+        for (lp, msg) in failed.iter().take(12) {
+            eprintln!("           {}: {msg}", lp.display());
+        }
+    }
+    Ok(count)
+}
+
+// ── deploy helpers ─────────────────────────────────────────────────────────
+
+/// Real Documents folder (OneDrive-aware, HKCU Shell Folders\Personal).
+pub fn documents_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+        if let Ok(k) = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
+        {
+            if let Ok(val) = k.get_value::<String, _>("Personal") {
+                return PathBuf::from(expand_env(&val));
+            }
+        }
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    PathBuf::from(home).join("Documents")
+}
+
+/// %VAR% expansion (os.path.expandvars subset for registry values).
+fn expand_env(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        if let Some(j) = rest[i + 1..].find('%') {
+            let var = &rest[i + 1..i + 1 + j];
+            match std::env::var(var) {
+                Ok(v) => out.push_str(&v),
+                Err(_) => {
+                    out.push('%');
+                    out.push_str(var);
+                    out.push('%');
+                }
+            }
+            rest = &rest[i + 2 + j..];
+        } else {
+            out.push_str(&rest[i..]);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// %Documents%\My Games\Runic Games\Torchlight 2\mods
+pub fn tl2_mods_dir() -> PathBuf {
+    documents_dir()
+        .join("My Games")
+        .join("Runic Games")
+        .join("Torchlight 2")
+        .join("mods")
+}
