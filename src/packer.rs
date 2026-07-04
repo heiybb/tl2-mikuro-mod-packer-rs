@@ -23,6 +23,28 @@ use crate::raw;
 /// '/'-separated. Insertion-ordered (mirrors the Python dict).
 pub type Overrides = IndexMap<String, Vec<u8>>;
 
+/// Phase timing (enabled by env MIKURO_TIMING=1): eprintln a labelled duration.
+fn timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MIKURO_TIMING").map(|v| v == "1").unwrap_or(false))
+}
+
+struct Phase(&'static str, std::time::Instant);
+
+impl Phase {
+    fn start(name: &'static str) -> Self {
+        Phase(name, std::time::Instant::now())
+    }
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) {
+        if timing_enabled() {
+            eprintln!("    [timing] {:<28} {:>8.3}s", self.0, self.1.elapsed().as_secs_f64());
+        }
+    }
+}
+
 pub const TYPE_DIR: u8 = 7;
 pub const TYPE_UNKNOWN: u8 = 18;
 
@@ -622,10 +644,13 @@ pub fn pack_mod(
     let mod_dir = original_mod_dir.unwrap_or(&default_mod_dir);
 
     let mut h = build_header(mod_dir, None);
+    let ph = Phase::start("pack: manifest scan");
     let (dirs, file_count) = build_manifest_dirs(media_dir, overrides);
+    drop(ph);
     h.fc = file_count;
 
     // Pass A: resolve every record to a placeholder or a content block.
+    let ph = Phase::start("pack: resolve content (A)");
     enum Item {
         Placeholder(Rec),
         Block(usize), // index into blocks
@@ -678,7 +703,9 @@ pub fn pack_mod(
         plan.push((dname.clone(), items));
     }
 
+    drop(ph);
     // Pass B: compress + crc in parallel (zlib level 6 == GUTS).
+    let ph = Phase::start("pack: compress+crc (B)");
     blocks.par_iter_mut().for_each(|blk| {
         blk.crc = crc32fast::hash(&blk.content);
         if blk.store {
@@ -694,7 +721,9 @@ pub fn pack_mod(
         }
     });
 
+    drop(ph);
     // Pass C: assemble the data section strictly in manifest order.
+    let ph = Phase::start("pack: assemble (C)");
     let mut data: Vec<u8> = vec![0u8; 8]; // [maxCompressedBlockSize][rollingHash]
     let mut max_csz: u32 = 0;
     let mut new_dirs: Dirs = Vec::new();
@@ -723,6 +752,8 @@ pub fn pack_mod(
     let rh = pak_rolling_hash(&data);
     data[4..8].copy_from_slice(&rh.to_le_bytes());
 
+    drop(ph);
+    let ph = Phase::start("pack: hash+manifest+write");
     let off_data = w_header(&h, 0, 0).len() as u32;
     let off_man = off_data + data.len() as u32;
     let mut manifest = w_manifest(&h, &new_dirs);
@@ -733,6 +764,7 @@ pub fn pack_mod(
     out.extend_from_slice(&data);
     out.extend_from_slice(&manifest);
     std::fs::write(output_path, &out)?;
+    drop(ph);
     Ok(out.len())
 }
 
@@ -829,6 +861,7 @@ pub fn convert_all(
 
     // 1. DAT → BINDAT (parallel; per-file hash ids are self-contained).
     eprintln!("  Converting DAT→BINDAT... ({} files)", dat_jobs.len());
+    let ph = Phase::start("convert: bindat");
     let bindat_out: Vec<(PathBuf, Result<Vec<u8>, String>)> = dat_jobs
         .par_iter()
         .map(|(dp, bp)| (bp.clone(), compile_dat_file(dp).map_err(|e| format!("{}: {e}", dp.display()))))
@@ -844,7 +877,9 @@ pub fn convert_all(
         }
     }
 
+    drop(ph);
     // 2. LAYOUT → BINLAYOUT (parallel).
+    let ph = Phase::start("convert: binlayout");
     eprintln!("  Converting LAYOUT→BINLAYOUT... ({} files)", layout_jobs.len());
     let layout_out: Vec<(PathBuf, Result<Vec<u8>, String>)> = layout_jobs
         .par_iter()
@@ -866,7 +901,9 @@ pub fn convert_all(
         }
     }
 
+    drop(ph);
     // 3. RAW indices (ON-DEMAND per content type).
+    let ph = Phase::start("convert: raw");
     if !matches!(raw_mode, "none" | "skip") {
         eprintln!("  Generating RAW files (on-demand per content type)...");
         results.raw = generate_raw_files(media_dir, overrides.as_deref_mut());
@@ -874,7 +911,9 @@ pub fn convert_all(
         eprintln!("  Skipping RAW generation (raw=none).");
     }
 
+    drop(ph);
     // 4. MPP pathing grids.
+    let ph = Phase::start("convert: mpp");
     if !matches!(mpp_backend, "none" | "skip") {
         eprintln!("  Generating MPP files (backend={mpp_backend})...");
         match generate_mpp_files(media_dir, overrides.as_deref_mut(), mpp_backend, None) {
@@ -896,6 +935,7 @@ pub fn convert_all(
         }
     }
 
+    drop(ph);
     results
 }
 
