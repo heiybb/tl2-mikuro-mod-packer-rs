@@ -8,7 +8,6 @@
 //! in the Python original / project memory).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -649,7 +648,10 @@ pub fn pack_mod(
     drop(ph);
     h.fc = file_count;
 
-    // Pass A: resolve every record to a placeholder or a content block.
+    // Pass A: resolve every record to a placeholder or a content block. The
+    // content fetch (disk reads of every non-compiled file) dominates pack
+    // time on texture-heavy mods when serial, so it runs in parallel with
+    // order preserved (record order is untouched — only the reads overlap).
     let ph = Phase::start("pack: resolve content (A)");
     enum Item {
         Placeholder(Rec),
@@ -666,13 +668,18 @@ pub fn pack_mod(
         csz: u32,
         crc: u32,
     }
-    let mut plan: Vec<(String, Vec<Item>)> = Vec::new();
-    let mut blocks: Vec<Block> = Vec::new();
+    // A1: enumerate records; collect one fetch job per non-dir record.
+    enum Slot {
+        Placeholder(Rec),
+        File { typ: u8, name: String, ft: u64, job: usize },
+    }
+    let mut shape: Vec<(String, Vec<Slot>)> = Vec::new();
+    let mut jobs: Vec<String> = Vec::new(); // rel_upper per job
     for (dname, recs) in &dirs {
-        let mut items = Vec::new();
+        let mut slots = Vec::new();
         for (_crc, typ, name, _off, _size, ft) in recs {
             if *typ == TYPE_DIR {
-                items.push(Item::Placeholder((0, *typ, name.clone(), 0, 0, *ft)));
+                slots.push(Slot::Placeholder((0, *typ, name.clone(), 0, 0, *ft)));
                 continue;
             }
             let full_upper = format!("{dname}{name}").to_uppercase();
@@ -680,31 +687,58 @@ pub fn pack_mod(
                 .strip_prefix("MEDIA/")
                 .unwrap_or(&full_upper)
                 .to_string();
-            match content_for(&rel_upper, media_dir, overrides) {
-                None => items.push(Item::Placeholder((0, *typ, name.clone(), 0, 0, *ft))),
-                Some(content) => {
-                    let store = is_store_type(*typ) || content.len() >= 0x190_0000;
-                    let size = content.len() as u32;
-                    blocks.push(Block {
-                        typ: *typ,
-                        name: name.clone(),
-                        ft: *ft,
-                        content,
-                        size,
-                        store,
-                        comp: Vec::new(),
-                        csz: 0,
-                        crc: 0,
-                    });
-                    items.push(Item::Block(blocks.len() - 1));
-                }
+            slots.push(Slot::File {
+                typ: *typ,
+                name: name.clone(),
+                ft: *ft,
+                job: jobs.len(),
+            });
+            jobs.push(rel_upper);
+        }
+        shape.push((dname.clone(), slots));
+    }
+    // A2: parallel fetch (order-preserving collect).
+    let contents: Vec<Option<Vec<u8>>> = jobs
+        .par_iter()
+        .map(|rel| content_for(rel, media_dir, overrides))
+        .collect();
+    // A3: build the ordered plan + block list.
+    let mut plan: Vec<(String, Vec<Item>)> = Vec::new();
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut contents = contents;
+    for (dname, slots) in shape {
+        let mut items = Vec::new();
+        for slot in slots {
+            match slot {
+                Slot::Placeholder(rec) => items.push(Item::Placeholder(rec)),
+                Slot::File { typ, name, ft, job } => match contents[job].take() {
+                    None => items.push(Item::Placeholder((0, typ, name, 0, 0, ft))),
+                    Some(content) => {
+                        let store = is_store_type(typ) || content.len() >= 0x190_0000;
+                        let size = content.len() as u32;
+                        blocks.push(Block {
+                            typ,
+                            name,
+                            ft,
+                            content,
+                            size,
+                            store,
+                            comp: Vec::new(),
+                            csz: 0,
+                            crc: 0,
+                        });
+                        items.push(Item::Block(blocks.len() - 1));
+                    }
+                },
             }
         }
-        plan.push((dname.clone(), items));
+        plan.push((dname, items));
     }
 
     drop(ph);
-    // Pass B: compress + crc in parallel (zlib level 6 == GUTS).
+    // Pass B: compress + crc in parallel. Backend = libdeflate at level 6
+    // (~2.8x miniz_oxide at a slightly BETTER ratio on real mod data); output
+    // is a standard zlib stream — the game inflates it identically.
     let ph = Phase::start("pack: compress+crc (B)");
     blocks.par_iter_mut().for_each(|blk| {
         blk.crc = crc32fast::hash(&blk.content);
@@ -712,11 +746,16 @@ pub fn pack_mod(
             blk.comp = std::mem::take(&mut blk.content);
             blk.csz = 0;
         } else {
-            let mut enc =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
-            enc.write_all(&blk.content).unwrap();
-            blk.comp = enc.finish().unwrap();
-            blk.csz = blk.comp.len() as u32;
+            let mut c = libdeflater::Compressor::new(
+                libdeflater::CompressionLvl::new(6).expect("valid zlib level"),
+            );
+            let mut buf = vec![0u8; c.zlib_compress_bound(blk.content.len())];
+            let n = c
+                .zlib_compress(&blk.content, &mut buf)
+                .expect("zlib_compress_bound-sized buffer");
+            buf.truncate(n);
+            blk.comp = buf;
+            blk.csz = n as u32;
             blk.content = Vec::new();
         }
     });
@@ -964,16 +1003,43 @@ fn emit_raw(
     }
 }
 
-/// Generate the 7 RAW index files (order mirrors _run_raw_builders).
+/// Generate the 7 RAW index files. The builders are independent, so they run
+/// CONCURRENTLY (each internally rayon-parallel too — rayon nests fine); the
+/// EMIT order stays the canonical _run_raw_builders sequence, so the manifest
+/// record order is unchanged.
 pub fn generate_raw_files(media_dir: &Path, mut overrides: Option<&mut Overrides>) -> usize {
+    fn timed(name: &'static str, f: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let t0 = std::time::Instant::now();
+        let r = f();
+        if timing_enabled() {
+            eprintln!("      [timing] raw {:<20} {:>8.3}s", name, t0.elapsed().as_secs_f64());
+        }
+        r
+    }
+    let mut roompieces = None;
+    let mut skills = None;
+    let mut missiles = None;
+    let mut affixes = None;
+    let mut triggerables = None;
+    let mut unitdata = None;
+    let mut ui = None;
+    rayon::scope(|s| {
+        s.spawn(|_| roompieces = timed("ROOMPIECES", || raw::build_roompieces(media_dir)));
+        s.spawn(|_| skills = timed("SKILLS", || raw::build_skills(media_dir)));
+        s.spawn(|_| missiles = timed("MISSILES", || raw::build_missiles(media_dir)));
+        s.spawn(|_| affixes = timed("AFFIXES", || raw::build_affixes(media_dir)));
+        s.spawn(|_| triggerables = timed("TRIGGERABLES", || raw::build_triggerables(media_dir)));
+        s.spawn(|_| unitdata = timed("UNITDATA", || raw::build_unitdata(media_dir)));
+        s.spawn(|_| ui = timed("UI", || raw::build_ui(media_dir)));
+    });
     let mut count = 0;
-    count += emit_raw("ROOMPIECES.RAW", raw::build_roompieces(media_dir), media_dir, overrides.as_deref_mut());
-    count += emit_raw("SKILLS.RAW", raw::build_skills(media_dir), media_dir, overrides.as_deref_mut());
-    count += emit_raw("MISSILES.RAW", raw::build_missiles(media_dir), media_dir, overrides.as_deref_mut());
-    count += emit_raw("AFFIXES.RAW", raw::build_affixes(media_dir), media_dir, overrides.as_deref_mut());
-    count += emit_raw("TRIGGERABLES.RAW", raw::build_triggerables(media_dir), media_dir, overrides.as_deref_mut());
-    count += emit_raw("UNITDATA.RAW", raw::build_unitdata(media_dir), media_dir, overrides.as_deref_mut());
-    count += emit_raw("UI.RAW", raw::build_ui(media_dir), media_dir, overrides.as_deref_mut());
+    count += emit_raw("ROOMPIECES.RAW", roompieces, media_dir, overrides.as_deref_mut());
+    count += emit_raw("SKILLS.RAW", skills, media_dir, overrides.as_deref_mut());
+    count += emit_raw("MISSILES.RAW", missiles, media_dir, overrides.as_deref_mut());
+    count += emit_raw("AFFIXES.RAW", affixes, media_dir, overrides.as_deref_mut());
+    count += emit_raw("TRIGGERABLES.RAW", triggerables, media_dir, overrides.as_deref_mut());
+    count += emit_raw("UNITDATA.RAW", unitdata, media_dir, overrides.as_deref_mut());
+    count += emit_raw("UI.RAW", ui, media_dir, overrides.as_deref_mut());
     count
 }
 

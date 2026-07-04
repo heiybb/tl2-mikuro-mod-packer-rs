@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use rayon::prelude::*;
 use regex::Regex;
@@ -121,13 +121,21 @@ fn read_dat(path: &Path) -> String {
     decode_utf16le_lossy(&data)
 }
 
+/// Compiled-regex cache. THREAD-LOCAL, not a global Mutex: the RAW builders
+/// call this from every rayon worker for every field of every .DAT — a shared
+/// lock serialized the whole phase (measured: 16 threads gave only 3.5x over
+/// 1 thread). Per-thread compilation costs ~20 patterns per worker once.
 fn re_cached(pattern: &str) -> Regex {
-    static CACHE: OnceLock<Mutex<HashMap<String, Regex>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut m = cache.lock().unwrap();
-    m.entry(pattern.to_string())
-        .or_insert_with(|| Regex::new(pattern).expect("valid regex"))
-        .clone()
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<String, Regex>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        c.borrow_mut()
+            .entry(pattern.to_string())
+            .or_insert_with(|| Regex::new(pattern).expect("valid regex"))
+            .clone()
+    })
 }
 
 /// `_field`: first `<[A-Z0-9 ]+>{name}\s*:\s*([^\r\n]*)` match, trimmed.
@@ -312,33 +320,38 @@ pub fn build_missiles(media_dir: &Path) -> Option<Vec<u8>> {
     if lays.is_empty() {
         return None;
     }
-    let desc_re = re_cached(r"(?m)<STRING>DESCRIPTOR\s*:\s*Missile\s*$");
-    let name_re = re_cached(r"<STRING>MISSILE NAME\s*:\s*([^\r\n]*)");
-    let mut body = Vec::new();
-    let mut count: u16 = 0;
-    for lp in &lays {
-        let t = read_dat(lp);
-        count += 1;
-        let objs = objects_body(&t);
-        let mut names = Vec::new();
-        for pb in split_before_properties(objs) {
-            if desc_re.is_match(pb) {
-                let n = name_re
-                    .captures(pb)
-                    .map(|c| c[1].trim().to_string())
-                    .unwrap_or_else(|| "NA".to_string());
-                names.push(n.to_uppercase());
+    // Per-layout entries are independent — order-preserving parallel map.
+    let entries: Vec<Vec<u8>> = lays
+        .par_iter()
+        .map(|lp| {
+            let desc_re = re_cached(r"(?m)<STRING>DESCRIPTOR\s*:\s*Missile\s*$");
+            let name_re = re_cached(r"<STRING>MISSILE NAME\s*:\s*([^\r\n]*)");
+            let t = read_dat(lp);
+            let objs = objects_body(&t);
+            let mut names = Vec::new();
+            for pb in split_before_properties(objs) {
+                if desc_re.is_match(pb) {
+                    let n = name_re
+                        .captures(pb)
+                        .map(|c| c[1].trim().to_string())
+                        .unwrap_or_else(|| "NA".to_string());
+                    names.push(n.to_uppercase());
+                }
             }
-        }
-        ss(&media_path(lp, media_dir), &mut body);
-        body.push(names.len() as u8);
-        for n in &names {
-            ss(n, &mut body);
-        }
-    }
+            let mut e = Vec::new();
+            ss(&media_path(lp, media_dir), &mut e);
+            e.push(names.len() as u8);
+            for n in &names {
+                ss(n, &mut e);
+            }
+            e
+        })
+        .collect();
     let mut out = Vec::new();
-    u16le(count, &mut out);
-    out.extend_from_slice(&body);
+    u16le(lays.len() as u16, &mut out);
+    for e in entries {
+        out.extend_from_slice(&e);
+    }
     Some(out)
 }
 
@@ -418,39 +431,38 @@ pub fn build_ui(media_dir: &Path) -> Option<Vec<u8>> {
     if lays.is_empty() {
         return None;
     }
-    let mut body = Vec::new();
-    let mut count: u32 = 0;
-    for lp in &lays {
-        let blk = match menu_definition_props(&read_dat(lp)) {
-            Some(b) => b,
-            None => continue,
-        };
-        let menu_name = menu_str(&blk, "MENU NAME");
-        if menu_name.is_empty() || menu_bool(&blk, "DO NOT CREATE") {
-            continue;
-        }
-        count += 1;
-        let f0 = (menu_bool(&blk, "ALWAYS VISIBLE") || menu_bool(&blk, "CREATE ON LOAD")) as u8;
-        ss(&menu_name, &mut body);
-        ss(&media_path(lp, media_dir), &mut body);
-        let ty = menu_str(&blk, "TYPE");
-        let st = menu_str(&blk, "GAME STATE");
-        u32le(
-            idx_of(&UI_TYPES, if ty.is_empty() { None } else { Some(&ty) }),
-            &mut body,
-        );
-        u32le(
-            idx_of(&UI_STATES, if st.is_empty() { None } else { Some(&st) }),
-            &mut body,
-        );
-        body.push(f0);
-        body.push(menu_bool(&blk, "MULTIPLAYER ONLY") as u8);
-        body.push(menu_bool(&blk, "SINGLEPLAYER ONLY") as u8);
-        ss(&menu_str(&blk, "KEY BINDING"), &mut body);
-    }
+    // Per-layout entries are independent — order-preserving parallel map
+    // (the UI tree can be 100+ MB of .LAYOUT text; serial reads dominated).
+    let entries: Vec<Option<Vec<u8>>> = lays
+        .par_iter()
+        .map(|lp| {
+            let blk = menu_definition_props(&read_dat(lp))?;
+            let menu_name = menu_str(&blk, "MENU NAME");
+            if menu_name.is_empty() || menu_bool(&blk, "DO NOT CREATE") {
+                return None;
+            }
+            let f0 =
+                (menu_bool(&blk, "ALWAYS VISIBLE") || menu_bool(&blk, "CREATE ON LOAD")) as u8;
+            let mut e = Vec::new();
+            ss(&menu_name, &mut e);
+            ss(&media_path(lp, media_dir), &mut e);
+            let ty = menu_str(&blk, "TYPE");
+            let st = menu_str(&blk, "GAME STATE");
+            u32le(idx_of(&UI_TYPES, if ty.is_empty() { None } else { Some(&ty) }), &mut e);
+            u32le(idx_of(&UI_STATES, if st.is_empty() { None } else { Some(&st) }), &mut e);
+            e.push(f0);
+            e.push(menu_bool(&blk, "MULTIPLAYER ONLY") as u8);
+            e.push(menu_bool(&blk, "SINGLEPLAYER ONLY") as u8);
+            ss(&menu_str(&blk, "KEY BINDING"), &mut e);
+            Some(e)
+        })
+        .collect();
+    let included: Vec<&Vec<u8>> = entries.iter().flatten().collect();
     let mut out = Vec::new();
-    u32le(count, &mut out);
-    out.extend_from_slice(&body);
+    u32le(included.len() as u32, &mut out);
+    for e in included {
+        out.extend_from_slice(e);
+    }
     Some(out)
 }
 
@@ -459,7 +471,35 @@ pub fn build_ui(media_dir: &Path) -> Option<Vec<u8>> {
 const UNIT_CATEGORIES: [&str; 4] = ["ITEMS", "MONSTERS", "PLAYERS", "PROPS"];
 
 type Attrs = HashMap<String, String>;
-type AttrCache = Mutex<HashMap<String, Option<std::sync::Arc<Attrs>>>>;
+
+/// Sharded path->attrs cache: the UNITDATA BASEFILE-chain resolution hits it
+/// several times per unit from every worker, so a single Mutex serializes.
+pub struct AttrCache {
+    shards: Vec<Mutex<HashMap<String, Option<std::sync::Arc<Attrs>>>>>,
+}
+
+impl AttrCache {
+    fn new() -> Self {
+        AttrCache {
+            shards: (0..64).map(|_| Mutex::new(HashMap::new())).collect(),
+        }
+    }
+
+    fn shard(&self, key: &str) -> &Mutex<HashMap<String, Option<std::sync::Arc<Attrs>>>> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        &self.shards[(h.finish() as usize) % self.shards.len()]
+    }
+
+    fn get(&self, key: &str) -> Option<Option<std::sync::Arc<Attrs>>> {
+        self.shard(key).lock().unwrap().get(key).cloned()
+    }
+
+    fn insert(&self, key: String, val: Option<std::sync::Arc<Attrs>>) {
+        self.shard(&key).lock().unwrap().insert(key, val);
+    }
+}
 
 /// Top-level [UNIT] attributes only (depth-1 lines), first occurrence wins.
 fn unit_attrs(text: &str) -> Attrs {
@@ -528,15 +568,15 @@ fn norm_key(path: &Path) -> String {
 
 fn unit_attrs_for(path: &Path, cache: &AttrCache) -> Option<std::sync::Arc<Attrs>> {
     let key = norm_key(path);
-    if let Some(v) = cache.lock().unwrap().get(&key) {
-        return v.clone();
+    if let Some(v) = cache.get(&key) {
+        return v;
     }
     let attrs = if path.is_file() {
         Some(std::sync::Arc::new(unit_attrs(&read_dat(path))))
     } else {
         None
     };
-    cache.lock().unwrap().insert(key, attrs.clone());
+    cache.insert(key, attrs.clone());
     attrs
 }
 
@@ -648,7 +688,7 @@ pub fn build_unitdata(media_dir: &Path) -> Option<Vec<u8>> {
         return None;
     }
     let install = install_media();
-    let cache: AttrCache = Mutex::new(HashMap::new());
+    let cache = AttrCache::new();
     let mut out = Vec::new();
     let mut emitted = 0usize;
     for cat in UNIT_CATEGORIES {
