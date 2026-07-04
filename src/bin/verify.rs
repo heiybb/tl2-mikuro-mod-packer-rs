@@ -35,6 +35,7 @@ fn main() {
         Some("bindat-corpus") => verify_bindat_corpus(Path::new(&args[1]), Path::new(&args[2])),
         Some("raw") => verify_raw(Path::new(&args[1])),
         Some("mpp") => verify_mpp(&args[1..]),
+        Some("mpp-corpus") => verify_mpp_corpus(Path::new(&args[1]), Path::new(&args[2])),
         _ => {
             eprintln!("usage: verify binlayout|bindat|bindat-corpus|raw|mpp <media_dir> ...");
             std::process::exit(1);
@@ -244,6 +245,83 @@ fn verify_raw(media: &Path) {
             (None, None) => println!("{name}: skipped (no source)"),
         }
     }
+}
+
+/// Full-corpus MPP A/B vs the DLL-oracle regen corpus (tools/mpp_corpus):
+/// for every oracle .MPP, compile the matching MEDIA/LAYOUTS .LAYOUT offline
+/// and compare header dims + per-cell bytes. Expected to land on the
+/// documented ~99.71% cell floor if the Rust port equals the Python one.
+fn verify_mpp_corpus(media: &Path, corpus: &Path) {
+    let t0 = std::time::Instant::now();
+    let ctx = mikuro_mod_rs::mpp::pipeline::Context::new(media, None);
+    let ctx_s = t0.elapsed().as_secs_f64();
+
+    let mut oracle_files = Vec::new();
+    walk(corpus, &mut oracle_files);
+    let oracle: Vec<PathBuf> = oracle_files
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_uppercase().ends_with(".MPP"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    struct Row {
+        byte_exact: bool,
+        dim_match: bool,
+        cells: u64,
+        diff: u64,
+        err: bool,
+    }
+    let t1 = std::time::Instant::now();
+    let rows: Vec<Row> = oracle
+        .par_iter()
+        .map(|op| {
+            let rel = op.strip_prefix(corpus).unwrap_or(op);
+            let rels = rel.to_string_lossy();
+            let lp = media
+                .join("LAYOUTS")
+                .join(format!("{}.LAYOUT", &rels[..rels.len() - ".MPP".len()]));
+            let shipped = std::fs::read(op).unwrap_or_default();
+            let gen = match mikuro_mod_rs::mpp::compile_mpp(&lp, &ctx) {
+                Ok(g) => g,
+                Err(_) => {
+                    return Row { byte_exact: false, dim_match: false, cells: 0, diff: 0, err: true }
+                }
+            };
+            let byte_exact = gen == shipped;
+            let dim_match =
+                gen.len() >= 8 && shipped.len() >= 8 && gen[..8] == shipped[..8] && gen.len() == shipped.len();
+            let (cells, diff) = if dim_match {
+                let n = (gen.len() - 24) as u64;
+                let d = gen[24..]
+                    .iter()
+                    .zip(&shipped[24..])
+                    .filter(|(a, b)| a != b)
+                    .count() as u64;
+                (n, d)
+            } else {
+                (0, 0)
+            };
+            Row { byte_exact, dim_match, cells, diff, err: false }
+        })
+        .collect();
+    let compile_s = t1.elapsed().as_secs_f64();
+
+    let n = rows.len();
+    let byte_exact = rows.iter().filter(|r| r.byte_exact).count();
+    let dim_match = rows.iter().filter(|r| r.dim_match).count();
+    let errs = rows.iter().filter(|r| r.err).count();
+    let cells: u64 = rows.iter().map(|r| r.cells).sum();
+    let diff: u64 = rows.iter().map(|r| r.diff).sum();
+    println!("== MPP full-corpus A/B vs DLL oracle (Rust offline backend) ==");
+    println!("context build: {ctx_s:.1}s   compile+compare {n} tiles: {compile_s:.1}s");
+    println!("byte-exact files: {byte_exact}/{n}   dim-match: {dim_match}/{n}   errors: {errs}");
+    println!(
+        "cells (dim-matched): {cells}   diff: {diff}   accuracy: {:.4}%",
+        100.0 * (cells - diff) as f64 / cells.max(1) as f64
+    );
 }
 
 fn verify_mpp(args: &[String]) {

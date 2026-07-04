@@ -75,6 +75,22 @@ rollingHash + mhash 自洽;唯一字节差异 = zlib 压缩流(libdeflate,Rust �
   (≈99.7% cell 精确,已知天花板)。要字节精确用 `--mpp dll`(走同一个原生 DLL,速度
   即原生 MPP 列)。
 
+### MPP 全语料 A/B(`verify mpp-corpus`,2026-07-04)
+
+对 1293-tile DLL oracle 语料(`TL2-RE/tools/mpp_corpus`)全量对比:
+
+```
+compile+compare 1293 tiles: 10.3s   (context 0.1s)
+byte-exact files: 118/1293   dim-match: 1272/1293
+cells: 95,773,940   diff: 276,839   accuracy: 99.7109%
+```
+
+**diff 计数与 Python/numba 版的存档数字(276839 / 95.7M)逐 cell 一致** — f64 内核
+逐操作对齐的移植在全语料尺度上 cell-for-cell 等价。残差是已被实验封闭的信息论下限
+(原生烘焙自身在 cliff/multichunk 上不确定 + per-instance 运行时 nocollide 收录,
+蒙特卡洛证明 95-100% 残差 cell 对浮点扰动鲁棒),换语言/换精度都不会移动它;
+字节精确唯一途径是 `--mpp dll`。
+
 ## 用法
 
 ```powershell
