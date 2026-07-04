@@ -54,7 +54,24 @@ fn main() -> ExitCode {
     // single-file subcommands
     match argv.first().map(String::as_str) {
         Some("compile-dat") if argv.len() >= 3 => {
-            return match mikuro_mod_rs::bindat::compile_dat_file(Path::new(&argv[1])) {
+            // Optional: --global-dict <bindat_string_dict.bin> compiles with the
+            // GLOBAL corpus string-id scheme (exact GUTS sub_10289A40 output)
+            // instead of per-file hash ids.
+            let mut dict_path: Option<String> = None;
+            let mut rest = argv[3..].iter();
+            while let Some(a) = rest.next() {
+                if a == "--global-dict" {
+                    dict_path = rest.next().cloned();
+                }
+            }
+            let res = match dict_path {
+                Some(dp) => mikuro_mod_rs::bindat::CorpusDict::load(Path::new(&dp))
+                    .and_then(|d| {
+                        mikuro_mod_rs::bindat::compile_dat_file_corpus(Path::new(&argv[1]), &d)
+                    }),
+                None => mikuro_mod_rs::bindat::compile_dat_file(Path::new(&argv[1])),
+            };
+            return match res {
                 Ok(data) => {
                     std::fs::write(&argv[2], &data).expect("write output");
                     println!("wrote {} bytes", data.len());

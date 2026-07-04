@@ -32,10 +32,11 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("binlayout") => verify_binlayout(Path::new(&args[1])),
         Some("bindat") => verify_bindat_selfparse(Path::new(&args[1])),
+        Some("bindat-corpus") => verify_bindat_corpus(Path::new(&args[1]), Path::new(&args[2])),
         Some("raw") => verify_raw(Path::new(&args[1])),
         Some("mpp") => verify_mpp(&args[1..]),
         _ => {
-            eprintln!("usage: verify binlayout|bindat|raw|mpp <media_dir> ...");
+            eprintln!("usage: verify binlayout|bindat|bindat-corpus|raw|mpp <media_dir> ...");
             std::process::exit(1);
         }
     }
@@ -138,6 +139,78 @@ fn verify_bindat_selfparse(media: &Path) {
         "bindat self-parse: {ok} ok, {err} err of {} ({:.1}s)",
         dats.len(),
         t0.elapsed().as_secs_f64()
+    );
+}
+
+/// Compile every *.DAT with a shipped sibling *.DAT.BINDAT using the GLOBAL
+/// corpus dict and byte-compare (the Python `bindat.py verify` equivalent —
+/// expect ~15976/16084 on the base game). Also times hash-id mode on the same
+/// set for a like-for-like performance comparison.
+fn verify_bindat_corpus(media: &Path, dict_path: &Path) {
+    let t0 = std::time::Instant::now();
+    let dict = mikuro_mod_rs::bindat::CorpusDict::load(dict_path).expect("load corpus dict");
+    let load_s = t0.elapsed().as_secs_f64();
+
+    let mut files = Vec::new();
+    walk(media, &mut files);
+    let pairs: Vec<(PathBuf, PathBuf)> = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_uppercase().ends_with(".DAT.BINDAT"))
+                .unwrap_or(false)
+        })
+        .filter_map(|bp| {
+            let s = bp.to_string_lossy();
+            let dp = PathBuf::from(&s[..s.len() - ".BINDAT".len()]);
+            if dp.exists() {
+                Some((dp, bp.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // timed: compile only (compare against shipped happens untimed afterwards)
+    let t1 = std::time::Instant::now();
+    let outputs: Vec<Result<Vec<u8>, String>> = pairs
+        .par_iter()
+        .map(|(dp, _bp)| mikuro_mod_rs::bindat::compile_dat_file_corpus(dp, &dict))
+        .collect();
+    let corpus_s = t1.elapsed().as_secs_f64();
+
+    let t2 = std::time::Instant::now();
+    let hash_ok: usize = pairs
+        .par_iter()
+        .map(|(dp, _bp)| mikuro_mod_rs::bindat::compile_dat_file(dp).is_ok() as usize)
+        .sum();
+    let hash_s = t2.elapsed().as_secs_f64();
+
+    let results: Vec<(bool, bool)> = pairs
+        .par_iter()
+        .zip(&outputs)
+        .map(|((_dp, bp), out)| match out {
+            Ok(gen) => (*gen == std::fs::read(bp).unwrap_or_default(), false),
+            Err(_) => (false, true),
+        })
+        .collect();
+    let ok = results.iter().filter(|(m, _e)| *m).count();
+    let err = results.iter().filter(|(_m, e)| *e).count();
+    println!("== DAT->BINDAT corpus-dict mode (GLOBAL ids, == GUTS sub_10289A40) ==");
+    println!(
+        "dict: {} strings, max_id={:#x}, loaded in {load_s:.2}s",
+        dict.len(),
+        dict.max_id
+    );
+    println!(
+        "{} files: {ok} byte-exact vs shipped, {} diff, {err} err   ({corpus_s:.2}s)",
+        pairs.len(),
+        pairs.len() - ok - err
+    );
+    println!(
+        "hash-id mode on same {} files: {hash_ok} compiled   ({hash_s:.2}s)  -> corpus overhead {:+.1}%",
+        pairs.len(),
+        (corpus_s / hash_s - 1.0) * 100.0
     );
 }
 

@@ -14,11 +14,12 @@
 //!                          u32 child_count; NODE* }
 //!   PROP { u32 key_hash; u32 type; value (8B if type in {3,7} else 4B) }
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::rghash::rg_hash;
 use crate::text::{
-    decode_dat_bytes, py_splitlines, utf16_unit_len, wstr_to_utf16le, wstrip, WStr,
+    bytes_to_units_le, decode_dat_bytes, py_splitlines, units_to_wstr, utf16_unit_len,
+    wstr_to_utf16le, wstrip, WStr,
 };
 
 const EMPTY_ID: u32 = 0xFFFF_FFFF;
@@ -234,25 +235,84 @@ impl HashStringDict {
 
 const STRING_TYPES: [u32; 2] = [5, 8];
 
-fn collect_strings(node: &Node, out: &mut BTreeSet<WStr>) {
+/// Collect distinct STRING/TRANSLATE values in TREE-TRAVERSAL order (props in
+/// source order, then children depth-first) — the order GUTS' collector
+/// (sub_10289950) interns them in, which is what fixes the id a NEW string
+/// gets from the global counter (sub_1023E9F0: `id = counter++`).
+fn collect_strings_ordered(node: &Node, seen: &mut HashSet<WStr>, out: &mut Vec<WStr>) {
     for (tc, _k, v) in &node.props {
-        if STRING_TYPES.contains(tc) && !v.is_empty() {
-            out.insert(v.clone());
+        if STRING_TYPES.contains(tc) && !v.is_empty() && seen.insert(v.clone()) {
+            out.push(v.clone());
         }
     }
     for ch in &node.children {
-        collect_strings(ch, out);
+        collect_strings_ordered(ch, seen, out);
     }
 }
 
-fn serialize_node(node: &Node, sdict: &HashStringDict, out: &mut Vec<u8>) {
+/// The reconstructed GLOBAL string-id dictionary (GUTS' session-persistent
+/// interner state, rebuilt from the shipped corpus' string tables). With it,
+/// compilation reproduces the shipped global-id scheme — the exact
+/// sub_10289A40 behaviour — instead of the per-file hash-id scheme.
+pub struct CorpusDict {
+    s2id: HashMap<WStr, u32>,
+    pub max_id: u32,
+}
+
+impl CorpusDict {
+    /// Load the compact binary dump (`MKSD1\0`, u32 count, u32 max_id, then
+    /// per entry `u32 id; u16 unit_len; UTF-16LE units`).
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if data.len() < 14 || &data[..6] != b"MKSD1\0" {
+            return Err(format!("{}: not a MKSD1 string dict", path.display()));
+        }
+        let count = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
+        let max_id = u32::from_le_bytes(data[10..14].try_into().unwrap());
+        let mut s2id = HashMap::with_capacity(count);
+        let mut off = 14usize;
+        for _ in 0..count {
+            if off + 6 > data.len() {
+                return Err("truncated string dict".into());
+            }
+            let id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            let units = u16::from_le_bytes(data[off + 4..off + 6].try_into().unwrap()) as usize;
+            off += 6;
+            if off + units * 2 > data.len() {
+                return Err("truncated string dict entry".into());
+            }
+            let s = units_to_wstr(&bytes_to_units_le(&data[off..off + units * 2]));
+            off += units * 2;
+            s2id.insert(s, id);
+        }
+        Ok(CorpusDict { s2id, max_id })
+    }
+
+    pub fn len(&self) -> usize {
+        self.s2id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.s2id.is_empty()
+    }
+}
+
+fn resolve_id(ids: &HashMap<WStr, u32>, s: &[u32]) -> u32 {
+    if s.is_empty() {
+        EMPTY_ID
+    } else {
+        ids[s]
+    }
+}
+
+fn serialize_node(node: &Node, ids: &HashMap<WStr, u32>, out: &mut Vec<u8>) {
     out.extend_from_slice(&rg_hash(&node.name).to_le_bytes());
     out.extend_from_slice(&(node.props.len() as u32).to_le_bytes());
     for (tc, key, value) in &node.props {
         out.extend_from_slice(&rg_hash(key).to_le_bytes());
         out.extend_from_slice(&tc.to_le_bytes());
         match tc {
-            5 | 8 => out.extend_from_slice(&sdict.get(value).to_le_bytes()),
+            5 | 8 => out.extend_from_slice(&resolve_id(ids, value).to_le_bytes()),
             6 => out.extend_from_slice(&encode_bool(value).to_le_bytes()),
             2 => out.extend_from_slice(&encode_float_bits(value).to_le_bytes()),
             4 => out.extend_from_slice(&((encode_int(value) as u64 & 0xFFFF_FFFF) as u32).to_le_bytes()),
@@ -262,24 +322,22 @@ fn serialize_node(node: &Node, sdict: &HashStringDict, out: &mut Vec<u8>) {
     }
     out.extend_from_slice(&(node.children.len() as u32).to_le_bytes());
     for ch in &node.children {
-        serialize_node(ch, sdict, out);
+        serialize_node(ch, ids, out);
     }
 }
 
-/// Serialize a parsed node tree to BINDAT bytes.
-pub fn compile_tree(roots: &[Node]) -> Result<Vec<u8>, String> {
-    if roots.is_empty() {
-        return Err("no root section parsed from DAT".into());
-    }
-    let mut string_set: BTreeSet<WStr> = BTreeSet::new();
-    for r in roots {
-        collect_strings(r, &mut string_set);
-    }
-    let sdict = HashStringDict::new(&string_set);
-    // id -> string, ascending by id (BTreeMap iteration).
+fn serialize_with_ids(
+    roots: &[Node],
+    ordered: &[WStr],
+    ids: &HashMap<WStr, u32>,
+) -> Vec<u8> {
+    // id -> string, ascending. Iterate in FIRST-APPEARANCE order so that when
+    // the corpus dict maps two distinct strings to one id (715 majority-vote
+    // collisions in the shipped corpus), the LAST one wins — matching the
+    // Python reference's dict-comprehension overwrite.
     let mut id_list: BTreeMap<u32, &WStr> = BTreeMap::new();
-    for (s, &i) in &sdict.s2id {
-        id_list.insert(i, s);
+    for s in ordered {
+        id_list.insert(ids[s], s);
     }
     let first_id = id_list.keys().next().copied().unwrap_or(0);
 
@@ -297,9 +355,57 @@ pub fn compile_tree(roots: &[Node]) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&enc);
     }
     for r in roots {
-        serialize_node(r, &sdict, &mut out);
+        serialize_node(r, ids, &mut out);
     }
-    Ok(out)
+    out
+}
+
+/// Serialize a parsed node tree to BINDAT bytes (per-file hash ids — the
+/// production default: no corpus dependency, fully parallel, game-proven).
+pub fn compile_tree(roots: &[Node]) -> Result<Vec<u8>, String> {
+    if roots.is_empty() {
+        return Err("no root section parsed from DAT".into());
+    }
+    let mut seen = HashSet::new();
+    let mut ordered: Vec<WStr> = Vec::new();
+    for r in roots {
+        collect_strings_ordered(r, &mut seen, &mut ordered);
+    }
+    // Preserve the original probe order: sorted (code-point lexicographic).
+    let string_set: BTreeSet<WStr> = ordered.iter().cloned().collect();
+    let sdict = HashStringDict::new(&string_set);
+    let ids: HashMap<WStr, u32> = sdict.s2id.iter().map(|(s, &i)| (s.clone(), i)).collect();
+    Ok(serialize_with_ids(roots, &ordered, &ids))
+}
+
+/// Serialize with the GLOBAL corpus dictionary — the exact sub_10289A40 /
+/// sub_1023E9F0 behaviour: known strings take their session-persistent global
+/// id; unknown strings take `max_id+1, +2, …` in first-appearance (traversal)
+/// order, exactly like GUTS' `id = counter++` at collect time. Reproduces the
+/// shipped global-id scheme byte-for-byte where the source text matches.
+pub fn compile_tree_corpus(roots: &[Node], dict: &CorpusDict) -> Result<Vec<u8>, String> {
+    if roots.is_empty() {
+        return Err("no root section parsed from DAT".into());
+    }
+    let mut seen = HashSet::new();
+    let mut ordered: Vec<WStr> = Vec::new();
+    for r in roots {
+        collect_strings_ordered(r, &mut seen, &mut ordered);
+    }
+    let mut ids: HashMap<WStr, u32> = HashMap::with_capacity(ordered.len());
+    let mut next = dict.max_id.wrapping_add(1);
+    for s in &ordered {
+        let id = match dict.s2id.get(s) {
+            Some(&i) => i,
+            None => {
+                let i = next;
+                next = next.wrapping_add(1);
+                i
+            }
+        };
+        ids.insert(s.clone(), id);
+    }
+    Ok(serialize_with_ids(roots, &ordered, &ids))
 }
 
 /// Compile .DAT bytes (UTF-16, BOM-aware) into BINDAT bytes from scratch.
@@ -313,6 +419,22 @@ pub fn compile_dat_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
 pub fn compile_dat_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     compile_dat_bytes(&data)
+}
+
+/// Compile .DAT bytes with the GLOBAL corpus dictionary (shipped-id scheme).
+pub fn compile_dat_bytes_corpus(data: &[u8], dict: &CorpusDict) -> Result<Vec<u8>, String> {
+    let text = decode_dat_bytes(data);
+    let roots = parse_dat_text(&text);
+    compile_tree_corpus(&roots, dict)
+}
+
+/// Compile a .DAT file with the GLOBAL corpus dictionary.
+pub fn compile_dat_file_corpus(
+    path: &std::path::Path,
+    dict: &CorpusDict,
+) -> Result<Vec<u8>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    compile_dat_bytes_corpus(&data, dict)
 }
 
 /// Number of UTF-16 units a string-table entry writes (used by tests).

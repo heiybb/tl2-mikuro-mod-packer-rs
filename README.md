@@ -115,5 +115,28 @@ cargo build --release
 吞为对象元数据;TAGS.DAT 空根名哈希等 — 详见各文件注释与
 `tl2-packer-formats-bindat-binlayout-mpp` 项目记忆。
 
-未移植:`rules.py`(multichunk 分类只影响诊断信息,不影响 .mpp 字节);Python 端的
-corpus StringDict 测试路径(生产路径本就不用 corpus 字典)。
+未移植:`rules.py`(multichunk 分类只影响诊断信息,不影响 .mpp 字节)。
+
+## BINDAT 双 id 模式(2026-07-04 起)
+
+对 EditorGuts 逐函数审计后,把 `sub_10289A40` 的**确切行为**也实现了(此前只有
+per-file hash id 模式):
+
+- **hash 模式(默认)**:string id = 每文件 RGHash + 线性探测。零语料依赖、天然并行、
+  游戏按文件内表解析已验证。生产打包默认走这条。
+- **corpus 模式**:string id = GUTS 全局 interner 的重建字典
+  (`data/bindat_string_dict.bin`,154627 串,一次性加载 0.05s);未知串按**首现序**
+  `max_id+1, +2, …` 分配 — 与 `sub_1023E9F0` 的 `id = counter++` 语义一致。
+  产物与 shipped 基础游戏 **15976/16084 字节精确**(与 Python 参考实现同数;108 差异
+  = 已知 shipped float quirks + TAGS.DAT,非实现问题)。
+  开启:打包时设 `MIKURO_BINDAT_DICT=<dict.bin>`,或单文件
+  `compile-dat <in> <out> --global-dict <dict.bin>`;
+  验证:`verify bindat-corpus <media_dir> <dict.bin>`。
+
+**性能**:corpus 模式反而略快(全语料 16084 文件编译 ~1.0s vs hash ~1.2-1.7s;
+职业技能 22027 DAT 端到端 1.59s vs 1.75s)— hash 模式要付每文件的排序 BTreeSet +
+探测成本,corpus 模式只是只读查表,且字典在 rayon worker 间零锁共享。**无性能回归**。
+
+**为何默认仍是 hash**:corpus 字典携带 shipped 语料的 715 处 majority-vote id 碰撞
+(两个不同字符串共享一个 id;同文件同时出现时表里后者覆盖前者)。hash 模式保证
+文件内 id 唯一,是更安全的生产默认;corpus 模式用于与 GUTS 产物做字节级 diff/审计。

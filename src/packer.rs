@@ -899,11 +899,35 @@ pub fn convert_all(
     }
 
     // 1. DAT → BINDAT (parallel; per-file hash ids are self-contained).
+    // Optional: env MIKURO_BINDAT_DICT=<path to bindat_string_dict.bin> makes
+    // BINDAT use the GLOBAL corpus-id scheme (the exact GUTS sub_10289A40 /
+    // sub_1023E9F0 behaviour) instead of per-file hash ids. Both load fine in
+    // the game (per-file id resolution is proven); corpus mode additionally
+    // matches the SHIPPED binaries byte-for-byte where the text matches.
+    let corpus_dict = match std::env::var("MIKURO_BINDAT_DICT") {
+        Ok(p) if !p.is_empty() => match crate::bindat::CorpusDict::load(Path::new(&p)) {
+            Ok(d) => {
+                eprintln!("  BINDAT: using GLOBAL corpus string-ids ({} strings)", d.len());
+                Some(d)
+            }
+            Err(e) => {
+                results.errors.push(format!("BINDAT dict: {e} (falling back to hash ids)"));
+                None
+            }
+        },
+        _ => None,
+    };
     eprintln!("  Converting DAT→BINDAT... ({} files)", dat_jobs.len());
     let ph = Phase::start("convert: bindat");
     let bindat_out: Vec<(PathBuf, Result<Vec<u8>, String>)> = dat_jobs
         .par_iter()
-        .map(|(dp, bp)| (bp.clone(), compile_dat_file(dp).map_err(|e| format!("{}: {e}", dp.display()))))
+        .map(|(dp, bp)| {
+            let res = match &corpus_dict {
+                Some(d) => crate::bindat::compile_dat_file_corpus(dp, d),
+                None => compile_dat_file(dp),
+            };
+            (bp.clone(), res.map_err(|e| format!("{}: {e}", dp.display())))
+        })
         .collect();
     for (bp, res) in bindat_out {
         match res {
