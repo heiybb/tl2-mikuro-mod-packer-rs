@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use mikuro_mod_rs::packer::{
+use tl2_mikuro_mod_packer_rs::packer::{
     self, convert_all, pack_mod, read_mod_metadata, tl2_mods_dir, Overrides,
 };
 
@@ -65,11 +65,11 @@ fn main() -> ExitCode {
                 }
             }
             let res = match dict_path {
-                Some(dp) => mikuro_mod_rs::bindat::CorpusDict::load(Path::new(&dp))
+                Some(dp) => tl2_mikuro_mod_packer_rs::bindat::CorpusDict::load(Path::new(&dp))
                     .and_then(|d| {
-                        mikuro_mod_rs::bindat::compile_dat_file_corpus(Path::new(&argv[1]), &d)
+                        tl2_mikuro_mod_packer_rs::bindat::compile_dat_file_corpus(Path::new(&argv[1]), &d)
                     }),
-                None => mikuro_mod_rs::bindat::compile_dat_file(Path::new(&argv[1])),
+                None => tl2_mikuro_mod_packer_rs::bindat::compile_dat_file(Path::new(&argv[1])),
             };
             return match res {
                 Ok(data) => {
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
             };
         }
         Some("compile-layout") if argv.len() >= 3 => {
-            return match mikuro_mod_rs::binlayout::compile_layout_file(Path::new(&argv[1])) {
+            return match tl2_mikuro_mod_packer_rs::binlayout::compile_layout_file(Path::new(&argv[1])) {
                 Ok(data) => {
                     std::fs::write(&argv[2], &data).expect("write output");
                     println!("wrote {} bytes", data.len());
@@ -106,8 +106,8 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            let ctx = mikuro_mod_rs::mpp::pipeline::Context::new(&media, None);
-            return match mikuro_mod_rs::mpp::compile_mpp(Path::new(&argv[1]), &ctx) {
+            let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(&media, None);
+            return match tl2_mikuro_mod_packer_rs::mpp::compile_mpp(Path::new(&argv[1]), &ctx) {
                 Ok(data) => {
                     std::fs::write(&argv[2], &data).expect("write output");
                     println!("wrote {} bytes", data.len());

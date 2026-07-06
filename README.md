@@ -1,4 +1,4 @@
-# mikuro-mod-rs
+# tl2-mikuro-mod-packer-rs
 
 Torchlight 2 `.MOD` 构建器 — `mikuro_mod_packer`(Python 版,位于
 `D:\WizardProject\TL2\TL2-RE`)的 **Rust 移植**,目标是更快的构建速度与单文件可分发的

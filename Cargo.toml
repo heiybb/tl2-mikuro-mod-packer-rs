@@ -1,5 +1,5 @@
 [package]
-name = "mikuro-mod-rs"
+name = "tl2-mikuro-mod-packer-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Torchlight 2 .MOD builder — Rust port of mikuro_mod_packer (BINDAT / BINLAYOUT / RAW / MPP compilers + .MOD container)"

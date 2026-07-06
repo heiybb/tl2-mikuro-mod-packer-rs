@@ -71,7 +71,7 @@ fn verify_binlayout(media: &Path) {
             let orig = std::fs::read(bp).unwrap_or_default();
             let has_dg = orig.len() >= 6
                 && u32::from_le_bytes([orig[2], orig[3], orig[4], orig[5]]) != 0;
-            match mikuro_mod_rs::binlayout::compile_layout_file(lp) {
+            match tl2_mikuro_mod_packer_rs::binlayout::compile_layout_file(lp) {
                 Ok(gen) => (has_dg, gen == orig, if gen == orig { None } else {
                     Some(format!("MISMATCH {} len {} vs {}", lp.display(), gen.len(), orig.len()))
                 }),
@@ -131,7 +131,7 @@ fn verify_bindat_selfparse(media: &Path) {
         .collect();
     let (ok, err): (usize, usize) = dats
         .par_iter()
-        .map(|p| match mikuro_mod_rs::bindat::compile_dat_file(p) {
+        .map(|p| match tl2_mikuro_mod_packer_rs::bindat::compile_dat_file(p) {
             Ok(_) => (1usize, 0usize),
             Err(_) => (0, 1),
         })
@@ -149,7 +149,7 @@ fn verify_bindat_selfparse(media: &Path) {
 /// set for a like-for-like performance comparison.
 fn verify_bindat_corpus(media: &Path, dict_path: &Path) {
     let t0 = std::time::Instant::now();
-    let dict = mikuro_mod_rs::bindat::CorpusDict::load(dict_path).expect("load corpus dict");
+    let dict = tl2_mikuro_mod_packer_rs::bindat::CorpusDict::load(dict_path).expect("load corpus dict");
     let load_s = t0.elapsed().as_secs_f64();
 
     let mut files = Vec::new();
@@ -176,14 +176,14 @@ fn verify_bindat_corpus(media: &Path, dict_path: &Path) {
     let t1 = std::time::Instant::now();
     let outputs: Vec<Result<Vec<u8>, String>> = pairs
         .par_iter()
-        .map(|(dp, _bp)| mikuro_mod_rs::bindat::compile_dat_file_corpus(dp, &dict))
+        .map(|(dp, _bp)| tl2_mikuro_mod_packer_rs::bindat::compile_dat_file_corpus(dp, &dict))
         .collect();
     let corpus_s = t1.elapsed().as_secs_f64();
 
     let t2 = std::time::Instant::now();
     let hash_ok: usize = pairs
         .par_iter()
-        .map(|(dp, _bp)| mikuro_mod_rs::bindat::compile_dat_file(dp).is_ok() as usize)
+        .map(|(dp, _bp)| tl2_mikuro_mod_packer_rs::bindat::compile_dat_file(dp).is_ok() as usize)
         .sum();
     let hash_s = t2.elapsed().as_secs_f64();
 
@@ -217,13 +217,13 @@ fn verify_bindat_corpus(media: &Path, dict_path: &Path) {
 
 fn verify_raw(media: &Path) {
     for (name, gen) in [
-        ("AFFIXES.RAW", mikuro_mod_rs::raw::build_affixes(media)),
-        ("SKILLS.RAW", mikuro_mod_rs::raw::build_skills(media)),
-        ("TRIGGERABLES.RAW", mikuro_mod_rs::raw::build_triggerables(media)),
-        ("MISSILES.RAW", mikuro_mod_rs::raw::build_missiles(media)),
-        ("UI.RAW", mikuro_mod_rs::raw::build_ui(media)),
-        ("UNITDATA.RAW", mikuro_mod_rs::raw::build_unitdata(media)),
-        ("ROOMPIECES.RAW", mikuro_mod_rs::raw::build_roompieces(media)),
+        ("AFFIXES.RAW", tl2_mikuro_mod_packer_rs::raw::build_affixes(media)),
+        ("SKILLS.RAW", tl2_mikuro_mod_packer_rs::raw::build_skills(media)),
+        ("TRIGGERABLES.RAW", tl2_mikuro_mod_packer_rs::raw::build_triggerables(media)),
+        ("MISSILES.RAW", tl2_mikuro_mod_packer_rs::raw::build_missiles(media)),
+        ("UI.RAW", tl2_mikuro_mod_packer_rs::raw::build_ui(media)),
+        ("UNITDATA.RAW", tl2_mikuro_mod_packer_rs::raw::build_unitdata(media)),
+        ("ROOMPIECES.RAW", tl2_mikuro_mod_packer_rs::raw::build_roompieces(media)),
     ] {
         let shipped = std::fs::read(media.join(name)).ok();
         match (gen, shipped) {
@@ -253,7 +253,7 @@ fn verify_raw(media: &Path) {
 /// documented ~99.71% cell floor if the Rust port equals the Python one.
 fn verify_mpp_corpus(media: &Path, corpus: &Path) {
     let t0 = std::time::Instant::now();
-    let ctx = mikuro_mod_rs::mpp::pipeline::Context::new(media, None);
+    let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(media, None);
     let ctx_s = t0.elapsed().as_secs_f64();
 
     let mut oracle_files = Vec::new();
@@ -284,7 +284,7 @@ fn verify_mpp_corpus(media: &Path, corpus: &Path) {
                 .join("LAYOUTS")
                 .join(format!("{}.LAYOUT", &rels[..rels.len() - ".MPP".len()]));
             let shipped = std::fs::read(op).unwrap_or_default();
-            let gen = match mikuro_mod_rs::mpp::compile_mpp(&lp, &ctx) {
+            let gen = match tl2_mikuro_mod_packer_rs::mpp::compile_mpp(&lp, &ctx) {
                 Ok(g) => g,
                 Err(_) => {
                     return Row { byte_exact: false, dim_match: false, cells: 0, diff: 0, err: true }
@@ -326,10 +326,10 @@ fn verify_mpp_corpus(media: &Path, corpus: &Path) {
 
 fn verify_mpp(args: &[String]) {
     let media = PathBuf::from(&args[0]);
-    let ctx = mikuro_mod_rs::mpp::pipeline::Context::new(&media, None);
+    let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(&media, None);
     for lp in &args[1..] {
         let t0 = std::time::Instant::now();
-        match mikuro_mod_rs::mpp::compile_mpp(Path::new(lp), &ctx) {
+        match tl2_mikuro_mod_packer_rs::mpp::compile_mpp(Path::new(lp), &ctx) {
             Ok(data) => {
                 // compare against the sibling shipped .mpp when present
                 let s = lp.to_uppercase();
