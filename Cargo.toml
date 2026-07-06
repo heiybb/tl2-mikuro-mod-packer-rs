@@ -6,7 +6,7 @@ description = "Torchlight 2 .MOD builder — Rust port of mikuro_mod_packer (BIN
 license = "GPL-3.0-or-later"
 
 [[bin]]
-name = "mikuro-mod"
+name = "tl2-mikuro-mod-packer"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,12 +1,12 @@
-//! mikuro-mod — Torchlight 2 .MOD builder CLI (Rust port of mikuro_mod_packer).
+//! tl2-mikuro-mod-packer — Torchlight 2 .MOD builder CLI (Rust port of mikuro_mod_packer).
 //!
-//! Usage: mikuro-mod [--in-place|--temp-copy] [--mpp {re,dll,none}]
+//! Usage: tl2-mikuro-mod-packer [--in-place|--temp-copy] [--mpp {re,dll,none}]
 //!                   [--raw {auto,none}] [--deploy] <mod_directory>
 //!
 //! Extra single-file tools:
-//!   mikuro-mod compile-dat <in.DAT> <out.BINDAT>
-//!   mikuro-mod compile-layout <in.LAYOUT> <out.BINLAYOUT>
-//!   mikuro-mod compile-mpp <in.LAYOUT> <out.mpp> [--media <MEDIA>]
+//!   tl2-mikuro-mod-packer compile-dat <in.DAT> <out.BINDAT>
+//!   tl2-mikuro-mod-packer compile-layout <in.LAYOUT> <out.BINLAYOUT>
+//!   tl2-mikuro-mod-packer compile-mpp <in.LAYOUT> <out.mpp> [--media <MEDIA>]
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,7 +16,7 @@ use tl2_mikuro_mod_packer_rs::packer::{
 };
 
 fn usage() -> ExitCode {
-    eprintln!("Usage: mikuro-mod [--in-place|--temp-copy] [--mpp {{re,dll,none}}] [--raw {{auto,none}}] [--deploy] <mod_directory>");
+    eprintln!("Usage: tl2-mikuro-mod-packer [--in-place|--temp-copy] [--mpp {{re,dll,none}}] [--raw {{auto,none}}] [--deploy] <mod_directory>");
     eprintln!("  (default)    Convert in memory, pack without copying MEDIA (fastest, non-mutating)");
     eprintln!("  --in-place   Write converted files into MEDIA, then pack");
     eprintln!("  --temp-copy  Copy MEDIA to a temp dir, convert there, then pack");
@@ -28,9 +28,9 @@ fn usage() -> ExitCode {
     eprintln!("  --raw none   Skip RAW generation entirely");
     eprintln!();
     eprintln!("Single-file tools:");
-    eprintln!("  mikuro-mod compile-dat <in.DAT> <out.BINDAT>");
-    eprintln!("  mikuro-mod compile-layout <in.LAYOUT> <out.BINLAYOUT>");
-    eprintln!("  mikuro-mod compile-mpp <in.LAYOUT> <out.mpp> [--media <MEDIA>]");
+    eprintln!("  tl2-mikuro-mod-packer compile-dat <in.DAT> <out.BINDAT>");
+    eprintln!("  tl2-mikuro-mod-packer compile-layout <in.LAYOUT> <out.BINLAYOUT>");
+    eprintln!("  tl2-mikuro-mod-packer compile-mpp <in.LAYOUT> <out.mpp> [--media <MEDIA>]");
     ExitCode::FAILURE
 }
 

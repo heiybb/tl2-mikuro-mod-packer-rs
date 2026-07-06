@@ -96,11 +96,11 @@ cells: 95,773,940   diff: 276,839   accuracy: 99.7109%
 ```powershell
 cargo build --release
 # 与 Python CLI 同参数:
-.\target\release\mikuro-mod.exe [--in-place|--temp-copy] [--mpp {re,dll,none}] [--raw {auto,none}] [--deploy] <mod目录>
+.\target\release\tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,dll,none}] [--raw {auto,none}] [--deploy] <mod目录>
 # 单文件工具:
-.\target\release\mikuro-mod.exe compile-dat    <in.DAT>    <out.BINDAT>
-.\target\release\mikuro-mod.exe compile-layout <in.LAYOUT> <out.BINLAYOUT>
-.\target\release\mikuro-mod.exe compile-mpp    <in.LAYOUT> <out.mpp> [--media <MEDIA>]
+.\target\release\tl2-mikuro-mod-packer.exe compile-dat    <in.DAT>    <out.BINDAT>
+.\target\release\tl2-mikuro-mod-packer.exe compile-layout <in.LAYOUT> <out.BINLAYOUT>
+.\target\release\tl2-mikuro-mod-packer.exe compile-mpp    <in.LAYOUT> <out.mpp> [--media <MEDIA>]
 # 语料验证:
 .\target\release\verify.exe binlayout|bindat|raw|mpp <media_dir> ...
 ```
