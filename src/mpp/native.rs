@@ -388,12 +388,67 @@ fn emit_piece(piece: &LayoutObject, m: &Mat4, ctx: &Context, tris: &mut Vec<Tri>
     }
 }
 
+/// Also follow non-tile baked links nested inside tile-alias sub-layouts.
+/// DEFAULT ON (env MPP_NESTED_LINKS=0 to disable) — mirrors Python native._NESTED_PROP_LINKS.
+fn nested_prop_links() -> bool {
+    std::env::var("MPP_NESTED_LINKS").map(|v| v == "1").unwrap_or(true)
+}
+
+/// Follow `lay`'s non-tile baked-prop Layout Links (ONE level) and emit their sub-pieces,
+/// transformed by the accumulated `world0`. Runs on the top layout AND (when nested is on)
+/// inside tile-alias sub-layouts. Deliberately NOT prop->prop recursive: full recursion
+/// pulls in decoration the DLL does not bake (A/B: +191 over-wall for -41 under-wall).
+fn emit_prop_links(
+    lay: &Layout,
+    world0: Option<&Mat4>,
+    ctx: &Context,
+    sub_cache: &mut HashMap<String, Option<Layout>>,
+    tris: &mut Vec<Tri>,
+) {
+    for (oi, o) in lay.objects.iter().enumerate() {
+        if link_target_kind(o) == LinkKind::Tile {
+            continue;
+        }
+        if !link_is_baked_prop(lay, oi) {
+            continue;
+        }
+        let lf = o.props.get("LAYOUT FILE").map(String::as_str).unwrap_or("");
+        let sub_path = match resolve_link_layout(&ctx.media_dir, lf) {
+            Some(p) => p,
+            None => continue,
+        };
+        let key = sub_path.to_string_lossy().to_string();
+        let sub = sub_cache
+            .entry(key)
+            .or_insert_with(|| super::layout::load_layout_file(&sub_path).ok());
+        let sub = match sub {
+            Some(s) => s,
+            None => continue,
+        };
+        let lw = o.world; // NOT scale-stripped here (mirrors Python)
+        let link_world = match world0 {
+            None => lw,
+            Some(w) => w.matmul(&lw),
+        };
+        for pi in sub.room_piece_indices() {
+            if in_backdrop_group(sub, pi, true) {
+                continue;
+            }
+            let piece = &sub.objects[pi];
+            let world = link_world.matmul(&piece.world);
+            emit_piece(piece, &world, ctx, tris);
+        }
+    }
+}
+
 fn follow_tile_links(
     lay: &Layout,
     world0: Option<&Mat4>,
     visited: &HashSet<String>,
     depth: usize,
     ctx: &Context,
+    assemble_links: bool,
+    sub_cache: &mut HashMap<String, Option<Layout>>,
     tris: &mut Vec<Tri>,
 ) {
     if depth > 6 {
@@ -429,9 +484,14 @@ fn follow_tile_links(
             let world = w0.matmul(&piece.world);
             emit_piece(piece, &world, ctx, tris);
         }
+        // The DLL loads the whole nested level, so a prop-link INSIDE this tile-alias sub
+        // (e.g. PASS corridors: 1X1_ALPHAZONE_LM_A -> ECHOINN/TREE_03) is baked too.
+        if assemble_links && nested_prop_links() {
+            emit_prop_links(&sub, Some(&w0), ctx, sub_cache, tris);
+        }
         let mut v2 = visited.clone();
         v2.insert(key);
-        follow_tile_links(&sub, Some(&w0), &v2, depth + 1, ctx, tris);
+        follow_tile_links(&sub, Some(&w0), &v2, depth + 1, ctx, assemble_links, sub_cache, tris);
     }
 }
 
@@ -449,41 +509,24 @@ pub fn gather(layout: &Layout, ctx: &Context, assemble_links: bool) -> Vec<Tri> 
         emit_piece(piece, &world, ctx, &mut tris);
     }
 
-    // ALWAYS follow tile-geometry ALIAS links.
-    follow_tile_links(layout, None, &HashSet::new(), 0, ctx, &mut tris);
+    // Shared across the tile-alias follow (for nested prop-links) and the top-level
+    // prop-link pass, mirroring Python gather's single sub_cache closure.
+    let mut sub_cache: HashMap<String, Option<Layout>> = HashMap::new();
+
+    // ALWAYS follow tile-geometry ALIAS links (and, default-on, their nested prop-links).
+    follow_tile_links(
+        layout,
+        None,
+        &HashSet::new(),
+        0,
+        ctx,
+        assemble_links,
+        &mut sub_cache,
+        &mut tris,
+    );
 
     if assemble_links {
-        let mut sub_cache: HashMap<String, Option<Layout>> = HashMap::new();
-        for (oi, o) in layout.objects.iter().enumerate() {
-            if link_target_kind(o) == LinkKind::Tile {
-                continue;
-            }
-            if !link_is_baked_prop(layout, oi) {
-                continue;
-            }
-            let lf = o.props.get("LAYOUT FILE").map(String::as_str).unwrap_or("");
-            let sub_path = match resolve_link_layout(&ctx.media_dir, lf) {
-                Some(p) => p,
-                None => continue,
-            };
-            let key = sub_path.to_string_lossy().to_string();
-            let sub = sub_cache
-                .entry(key)
-                .or_insert_with(|| super::layout::load_layout_file(&sub_path).ok());
-            let sub = match sub {
-                Some(s) => s,
-                None => continue,
-            };
-            let link_world = o.world; // NOT scale-stripped here (mirrors Python)
-            for pi in sub.room_piece_indices() {
-                if in_backdrop_group(sub, pi, true) {
-                    continue;
-                }
-                let piece = &sub.objects[pi];
-                let world = link_world.matmul(&piece.world);
-                emit_piece(piece, &world, ctx, &mut tris);
-            }
-        }
+        emit_prop_links(layout, None, ctx, &mut sub_cache, &mut tris);
     }
 
     tris
