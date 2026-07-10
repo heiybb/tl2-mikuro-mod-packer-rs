@@ -144,7 +144,11 @@ pub fn link_is_baked_prop(layout: &Layout, obj_idx: usize) -> bool {
     if RUNTIME_LINK_SUBSTR.iter().any(|s| tgt.contains(s)) {
         return false;
     }
-    if tgt.contains("RANDOM") && !tgt.contains("RANDOMIZED") {
+    // "WRANDOMDECO" (DESK02_WRANDOMDECO) = a structural desk with random DECO on top; the desk
+    // base is baked collision, only the deco is random. Frida under-wall trace (VAULT 1X1_S/NS):
+    // the DLL bakes it at the link origin. Other RANDOM furniture (TABLE_WITH_RANDOMPROPS,
+    // WALL_RANDOM_01, FIREPLACE_RANDOM) traced NOT baked, so they stay rejected. Except like FLYER.
+    if tgt.contains("RANDOM") && !tgt.contains("RANDOMIZED") && !tgt.contains("WRANDOMDECO") {
         return false;
     }
     let baked_nest = tgt == "SPAWNER_01.LAYOUT" || tgt.starts_with("JACKALBEAST_SPAWNER");
