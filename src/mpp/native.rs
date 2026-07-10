@@ -77,18 +77,26 @@ fn walk_ancestors<F: FnMut(&LayoutObject) -> bool>(
     false
 }
 
-/// CRandomGroup CHOICE / ACTIVE THEMES on any ancestor => excluded from the
-/// .mpp master collision (sub_1022FF80). `weighted` is vestigial.
+/// CRandomGroup CHOICE / ACTIVE THEMES / DEACTIVE THEMES on any ancestor =>
+/// excluded from the .mpp master collision (sub_1022FF80). `weighted` is vestigial.
+///
+/// sub_1022FF80 tests FIVE consecutive wstring theme fields on the CRandomGroup
+/// (offsets +372/+400/+428/+456/+484); of these only ACTIVE THEMES and DEACTIVE
+/// THEMES are ever authored on shipped level-tile groups (corpus scan: ACTIVE 912,
+/// DEACTIVE 93, other three 0). GROUND TRUTH (frida gate-input trace of
+/// CLevel_RebuildLevel_GenPathing 0x10203fb4 on GENERIC_CAVE 1X1_SEW): all 17
+/// over-wall residual pieces sit under Group 'no goblin' DEACTIVE THEMES=... and
+/// are backdrop-excluded by the DLL (bd=1) — omitting DEACTIVE THEMES over-walled
+/// them. Adding it: full-corpus -6307 over-wall / -10858 total diff, W2w +20 (flat),
+/// 52 tiles better / 1 worse (+5) / +1 dim-mismatch fixed. Refutes the earlier
+/// "per-instance runtime nocollide" residual conclusion — the drop is a
+/// deterministic, text-derivable DEACTIVE-THEMES group gate, not runtime state.
 pub fn in_backdrop_group(layout: &Layout, obj_idx: usize, _weighted: bool) -> bool {
     let obj = &layout.objects[obj_idx];
     walk_ancestors(layout, obj, 16, |o| {
         let choice = o.props.get("CHOICE").map(|s| !s.trim().is_empty()).unwrap_or(false);
-        let themes = o
-            .props
-            .get("ACTIVE THEMES")
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-        choice || themes
+        let nonempty = |k: &str| o.props.get(k).map(|s| !s.trim().is_empty()).unwrap_or(false);
+        choice || nonempty("ACTIVE THEMES") || nonempty("DEACTIVE THEMES")
     })
 }
 
@@ -140,7 +148,16 @@ pub fn link_is_baked_prop(layout: &Layout, obj_idx: usize) -> bool {
         return false;
     }
     let baked_nest = tgt == "SPAWNER_01.LAYOUT" || tgt.starts_with("JACKALBEAST_SPAWNER");
-    if tgt.contains("SPAWNER") && !tgt.contains("FLYER") && !is_timeline && !baked_nest {
+    // "NOSPAWNER" = a structural building/cabin variant with the spawner REMOVED
+    // (PB_CEM_BUILDING_3B_NOSPAWNER / CABIN_0x_NOSPAWNER); it only CONTAINS "SPAWNER".
+    // The DLL bakes it as static geometry (frida under-wall trace of ACT3_PASS2 PASS2_LM_A:
+    // 4 PB_CEM_BUILDING_3B_NOSPAWNER pieces baked at their link origins). Except it like FLYER.
+    if tgt.contains("SPAWNER")
+        && !tgt.contains("FLYER")
+        && !tgt.contains("NOSPAWNER")
+        && !is_timeline
+        && !baked_nest
+    {
         return false;
     }
     if link_under_feature_tagged_group(layout, obj_idx) {
