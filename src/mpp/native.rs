@@ -141,7 +141,11 @@ pub fn link_is_baked_prop(layout: &Layout, obj_idx: usize) -> bool {
             return false;
         }
     }
-    if RUNTIME_LINK_SUBSTR.iter().any(|s| tgt.contains(s)) {
+    // "RAISED_CHEST" = a structural raised platform (Layout Link Timeline, walkable-floor +
+    // wall pieces); only the chest ON it is runtime. It merely CONTAINS "CHEST". Frida trace
+    // (CATACOMB 1X1_NEW_JT_A): the DLL bakes its floor pieces, so offline voided the footprint.
+    // A/B: w2V -1956, everything else flat, 5 tiles / 0 regressions. Except like NOSPAWNER.
+    if RUNTIME_LINK_SUBSTR.iter().any(|s| tgt.contains(s)) && !tgt.contains("RAISED_CHEST") {
         return false;
     }
     // "WRANDOMDECO" (DESK02_WRANDOMDECO) = a structural desk with random DECO on top; the desk
