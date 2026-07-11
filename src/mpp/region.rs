@@ -129,7 +129,19 @@ const STRUCT_EXIT_LAYOUTS: [&str; 9] = [
 ];
 
 /// Resolve a Layout Link's `LAYOUT FILE` to an absolute path.
-pub fn resolve_link_layout(media_dir: &Path, link_file: &str) -> Option<PathBuf> {
+///
+/// mod-over-base VFS overlay: try `media_dir` (the mod) first, then `fallback_dir`
+/// (the base install), EXACTLY as the collision-mesh resolver already does. A mod
+/// tile whose Layout Link targets a BASE-game prop layout (e.g. CABIN_01_NOSPAWNER,
+/// which lives only in the install, not the mod) must resolve against the install
+/// or its collision never enters the bake -> W2w under-block of the whole prop
+/// footprint. The editor loads the mod over the base install, so this is the
+/// faithful resolution order, not a heuristic. No-op for vanilla (media == base).
+pub fn resolve_link_layout(
+    media_dir: &Path,
+    link_file: &str,
+    fallback_dir: Option<&Path>,
+) -> Option<PathBuf> {
     if link_file.is_empty() {
         return None;
     }
@@ -144,12 +156,14 @@ pub fn resolve_link_layout(media_dir: &Path, link_file: &str) -> Option<PathBuf>
     } else {
         norm.clone()
     };
-    let cand = media_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-    if cand.exists() {
-        Some(cand)
-    } else {
-        None
+    let rel_os = rel.replace('/', std::path::MAIN_SEPARATOR_STR);
+    for root in [Some(media_dir), fallback_dir].into_iter().flatten() {
+        let cand = root.join(&rel_os);
+        if cand.exists() {
+            return Some(cand);
+        }
     }
+    None
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -238,7 +252,7 @@ fn merge_baked_links(
             continue;
         }
         let lf = obj.props.get("LAYOUT FILE").map(String::as_str).unwrap_or("");
-        let sub_path = match resolve_link_layout(&ctx.media_dir, lf) {
+        let sub_path = match resolve_link_layout(&ctx.media_dir, lf, ctx.fallback_dir.as_deref()) {
             Some(p) => p,
             None => continue,
         };

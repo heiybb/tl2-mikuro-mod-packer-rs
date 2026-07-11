@@ -427,7 +427,7 @@ fn emit_prop_links(
             continue;
         }
         let lf = o.props.get("LAYOUT FILE").map(String::as_str).unwrap_or("");
-        let sub_path = match resolve_link_layout(&ctx.media_dir, lf) {
+        let sub_path = match resolve_link_layout(&ctx.media_dir, lf, ctx.fallback_dir.as_deref()) {
             Some(p) => p,
             None => continue,
         };
@@ -473,7 +473,7 @@ fn follow_tile_links(
             continue;
         }
         let lf = o.props.get("LAYOUT FILE").map(String::as_str).unwrap_or("");
-        let sp = match resolve_link_layout(&ctx.media_dir, lf) {
+        let sp = match resolve_link_layout(&ctx.media_dir, lf, ctx.fallback_dir.as_deref()) {
             Some(p) => p,
             None => continue,
         };

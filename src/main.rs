@@ -98,15 +98,26 @@ fn main() -> ExitCode {
         }
         Some("compile-mpp") if argv.len() >= 3 => {
             let mut media = packer::tl2_media_dir();
+            let mut fallback: Option<PathBuf> = None;
             let mut rest = argv[3..].iter();
             while let Some(a) = rest.next() {
                 if a == "--media" {
                     if let Some(m) = rest.next() {
                         media = PathBuf::from(m);
                     }
+                } else if a == "--fallback" {
+                    // base-install MEDIA for the mod-over-base VFS overlay, so a
+                    // single mod tile resolves base-game link/mesh targets exactly
+                    // as a full mod build does (Context in generate_mpp_files).
+                    if let Some(m) = rest.next() {
+                        fallback = Some(PathBuf::from(m));
+                    }
                 }
             }
-            let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(&media, None);
+            let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(
+                &media,
+                fallback.as_deref(),
+            );
             return match tl2_mikuro_mod_packer_rs::mpp::compile_mpp(Path::new(&argv[1]), &ctx) {
                 Ok(data) => {
                     std::fs::write(&argv[2], &data).expect("write output");

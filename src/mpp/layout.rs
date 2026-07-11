@@ -269,14 +269,23 @@ pub fn parse_layout(data: &[u8]) -> Layout {
         }
         let local = objects[i].local_matrix();
         let w = match by_id.get(&objects[i].parent_id) {
-            // GUTS editor: a PARENTID pointing at a Room Piece is clone
-            // bookkeeping, NOT a transform parent — the child's LOCAL matrix
-            // IS its world matrix (verified 18/18 against author-baked mpp
-            // headers, 2026-07-12; NATIVE-PROVEN: fresh EditorGuts.dll bakes
-            // of the current layouts reproduce the same headers — DANK CAVES
-            // 400x675 where full inheritance predicts 1400x975). All other
-            // parents (Group, Logic Group, ...) inherit as usual.
-            Some(&p) if p != i && objects[p].descriptor == "Room Piece" => local,
+            // GUTS editor: a PARENTID pointing at a placement object (Room Piece
+            // OR Layout Link*) is CLONE bookkeeping, NOT a transform parent — the
+            // child's LOCAL matrix IS its world matrix. Only structural FOLDER nodes
+            // (Group / Logic Group) transmit transform.
+            //   Room Piece: verified 18/18 vs author-baked mpp headers + fresh
+            //     EditorGuts.dll bakes (DANK CAVES 400x675 where full inheritance
+            //     predicts 1400x975), 2026-07-12.
+            //   Layout Link: NATIVE-PROVEN by DARKWOODS — Layout-Link-under-Layout-
+            //     Link clone chains (local scale 2~3 each, ×72); native's bake box is
+            //     1100x1626, which REQUIRES not inheriting through the link parents
+            //     (full inheritance -> 1776x2050). 2026-07-12.
+            // Corpus-safe: byte-identical to the "inherit only through Group/Logic
+            // Group" form on all 1293 vanilla + 230 mod tiles; never changes a
+            // vanilla .mpp (vanilla RP parents are 100% Group).
+            Some(&p) if p != i
+                && (objects[p].descriptor.starts_with("Room Piece")
+                    || objects[p].descriptor.starts_with("Layout Link")) => local,
             Some(&p) if p != i && depth < 64 => {
                 compute_world(p, objects, by_id, world, depth + 1).matmul(&local)
             }
