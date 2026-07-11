@@ -269,6 +269,14 @@ pub fn parse_layout(data: &[u8]) -> Layout {
         }
         let local = objects[i].local_matrix();
         let w = match by_id.get(&objects[i].parent_id) {
+            // GUTS editor: a PARENTID pointing at a Room Piece is clone
+            // bookkeeping, NOT a transform parent — the child's LOCAL matrix
+            // IS its world matrix (verified 18/18 against author-baked mpp
+            // headers, 2026-07-12; NATIVE-PROVEN: fresh EditorGuts.dll bakes
+            // of the current layouts reproduce the same headers — DANK CAVES
+            // 400x675 where full inheritance predicts 1400x975). All other
+            // parents (Group, Logic Group, ...) inherit as usual.
+            Some(&p) if p != i && objects[p].descriptor == "Room Piece" => local,
             Some(&p) if p != i && depth < 64 => {
                 compute_world(p, objects, by_id, world, depth + 1).matmul(&local)
             }
