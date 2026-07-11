@@ -141,32 +141,32 @@ pub fn link_is_baked_prop(layout: &Layout, obj_idx: usize) -> bool {
             return false;
         }
     }
-    // "RAISED_CHEST" = a structural raised platform (Layout Link Timeline, walkable-floor +
-    // wall pieces); only the chest ON it is runtime. It merely CONTAINS "CHEST". Frida trace
-    // (CATACOMB 1X1_NEW_JT_A): the DLL bakes its floor pieces, so offline voided the footprint.
-    // A/B: w2V -1956, everything else flat, 5 tiles / 0 regressions. Except like NOSPAWNER.
-    if RUNTIME_LINK_SUBSTR.iter().any(|s| tgt.contains(s)) && !tgt.contains("RAISED_CHEST") {
-        return false;
-    }
-    // "WRANDOMDECO" (DESK02_WRANDOMDECO) = a structural desk with random DECO on top; the desk
-    // base is baked collision, only the deco is random. Frida under-wall trace (VAULT 1X1_S/NS):
-    // the DLL bakes it at the link origin. Other RANDOM furniture (TABLE_WITH_RANDOMPROPS,
-    // WALL_RANDOM_01, FIREPLACE_RANDOM) traced NOT baked, so they stay rejected. Except like FLYER.
-    if tgt.contains("RANDOM") && !tgt.contains("RANDOMIZED") && !tgt.contains("WRANDOMDECO") {
-        return false;
-    }
-    let baked_nest = tgt == "SPAWNER_01.LAYOUT" || tgt.starts_with("JACKALBEAST_SPAWNER");
-    // "NOSPAWNER" = a structural building/cabin variant with the spawner REMOVED
-    // (PB_CEM_BUILDING_3B_NOSPAWNER / CABIN_0x_NOSPAWNER); it only CONTAINS "SPAWNER".
-    // The DLL bakes it as static geometry (frida under-wall trace of ACT3_PASS2 PASS2_LM_A:
-    // 4 PB_CEM_BUILDING_3B_NOSPAWNER pieces baked at their link origins). Except it like FLYER.
-    if tgt.contains("SPAWNER")
-        && !tgt.contains("FLYER")
-        && !tgt.contains("NOSPAWNER")
-        && !is_timeline
-        && !baked_nest
-    {
-        return false;
+    if follow_all_links() {
+        // ROBUST (default): rely on the DLL's real per-piece backdrop(CHOICE/theme)+BAKE+CE gate
+        // instead of the fragile name-substring list. The DLL never name-matches links; frida
+        // proved the distinguisher is the per-piece CHOICE group (TABLE_WITH_RANDOMPROPS is under
+        // CHOICE -> backdrop-excluded; RAISED_CHEST's floor is not -> baked). A/B: -5869, 0 regr.
+        // Residual: FISHINGHOLE (runtime-interactive well collision, no static discriminator).
+        if tgt.contains("FISHINGHOLE") {
+            return false;
+        }
+    } else {
+        // LEGACY name-substring heuristics (env MPP_FOLLOW_ALL_LINKS=0), kept for A/B.
+        if RUNTIME_LINK_SUBSTR.iter().any(|s| tgt.contains(s)) && !tgt.contains("RAISED_CHEST") {
+            return false;
+        }
+        if tgt.contains("RANDOM") && !tgt.contains("RANDOMIZED") && !tgt.contains("WRANDOMDECO") {
+            return false;
+        }
+        let baked_nest = tgt == "SPAWNER_01.LAYOUT" || tgt.starts_with("JACKALBEAST_SPAWNER");
+        if tgt.contains("SPAWNER")
+            && !tgt.contains("FLYER")
+            && !tgt.contains("NOSPAWNER")
+            && !is_timeline
+            && !baked_nest
+        {
+            return false;
+        }
     }
     if link_under_feature_tagged_group(layout, obj_idx) {
         return false;
@@ -400,6 +400,12 @@ fn emit_piece(piece: &LayoutObject, m: &Mat4, ctx: &Context, tris: &mut Vec<Tri>
 /// DEFAULT ON (env MPP_NESTED_LINKS=0 to disable) — mirrors Python native._NESTED_PROP_LINKS.
 fn nested_prop_links() -> bool {
     std::env::var("MPP_NESTED_LINKS").map(|v| v == "1").unwrap_or(true)
+}
+
+/// Follow all links and gate per-piece by the DLL's real backdrop/BAKE/CE criterion instead of
+/// the name-substring list. DEFAULT ON (env MPP_FOLLOW_ALL_LINKS=0 restores the legacy names).
+fn follow_all_links() -> bool {
+    std::env::var("MPP_FOLLOW_ALL_LINKS").map(|v| v == "1").unwrap_or(true)
 }
 
 /// Follow `lay`'s non-tile baked-prop Layout Links (ONE level) and emit their sub-pieces,
