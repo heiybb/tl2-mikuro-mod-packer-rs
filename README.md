@@ -1,9 +1,11 @@
 # tl2-mikuro-mod-packer-rs
 
-Torchlight 2 `.MOD` 构建器 — `mikuro_mod_packer`(Python 版,位于
-`D:\WizardProject\TL2\TL2-RE`)的 **Rust 移植**,目标是更快的构建速度与单文件可分发的
+Torchlight 2 `.MOD` 构建器 — `mikuro_mod_packer`(Python 参考实现,已归档于
+GitHub `heiybb/TL2-RE`;本地 `D:\WizardProject\TL2\TL2-RE` 已于 2026-07-12 删除,
+本仓库是唯一在用的实现)的 **Rust 移植**,目标是更快的构建速度与单文件可分发的
 二进制。三种二进制格式(BINDAT / BINLAYOUT / MPP)都是真正的从零编译器:解析文本 →
-序列化二进制,不读取任何已有二进制,因此文本改动总能正确编译。
+序列化二进制,不读取任何已有二进制,因此文本改动总能正确编译。本仓库自包含,不依赖
+TL2-RE(RE 规格/A-B 基准/frida 探针工具链需查 Python 时 `git clone` GitHub 仓)。
 
 ## 验证状态(2026-07-04,与 Python 参考实现 A/B 对比)
 
