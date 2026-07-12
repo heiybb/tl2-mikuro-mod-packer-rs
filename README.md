@@ -86,10 +86,43 @@ cells: 95,773,940   diff: 276,839   accuracy: 99.7109%
 ```
 
 **diff 计数与 Python/numba 版的存档数字(276839 / 95.7M)逐 cell 一致** — f64 内核
-逐操作对齐的移植在全语料尺度上 cell-for-cell 等价。残差是已被实验封闭的信息论下限
-(原生烘焙自身在 cliff/multichunk 上不确定 + per-instance 运行时 nocollide 收录,
-蒙特卡洛证明 95-100% 残差 cell 对浮点扰动鲁棒),换语言/换精度都不会移动它;
-字节精确唯一途径是 `--mpp dll`。
+逐操作对齐的移植在全语料尺度上 cell-for-cell 等价。此 **vanilla 语料**数字不受下述
+mod 修复影响(vanilla 无 Layout-Link-to-base / 克隆链,下面两处修复在全 1293 tile 上
+逐字节零改动)。
+
+### mod 瓦片 A/B + Layout-Link 修复(2026-07-12)
+
+vanilla shipped `.mpp` 是多年前烘的、且原生本身非确定(见下),故对 **mod** 瓦片改用
+**新鲜原生 bake 做 oracle**(`TL2-Mikuro-Console --clean --twice`),对 17 张挑战者
+「通用素材01」ACT5 瓦片逐格 A/B。发现并按原生逻辑修复了两条 **MPP+LAYOUT 强相关链路**:
+
+1. **Layout-Link 解析回退基础安装**(`resolve_link_layout` 加 `fallback_dir`,mod-over-base
+   VFS,与碰撞 mesh 解析同款)。打 mod 时指向基础游戏 prop 布局的 link(如
+   `CABIN_01_NOSPAWNER.LAYOUT`,只在安装里、不在 mod)此前解析失败 → 其碰撞不进烘焙
+   → 整片 prop footprint W2w under-block(DARKWOODS 一处 2475-cell 空洞)。
+2. **变换继承:Layout-Link 父不传变换**(`compute_world` 把已有的 Room-Piece 克隆记账
+   规则扩展到 `Layout Link*`)。DARKWOODS 有 Layout-Link-under-Layout-Link 克隆链
+   (每层 local scale 2~3,×72),原生烘焙 box=1100×1626 **要求**不继承(全继承会
+   撑到 1776×2050)= 原生硬输出验证,非经验式。
+
+结果(17 瓦片 vs 新鲜原生,aggregate):**99.7232% → 99.7718%**,12 张改善 0 张回归
+(DARKWOODS −3171、DARKWOODS111 −3167、NETHER −2426);vanilla 全语料逐字节不变;
+`compile-mpp` Rust 产物与 Python 参考实现在这 17 张 + 8 张 vanilla 上 **byte-exact**。
+
+**原生非确定性 = 真实浮点天花板(实测)。** 同一 mod 瓦片连烘两次:DARKWOODS 的 region
+box 会在 **1100 vs 1125** 之间抖动(±25 cell = 一个 10-unit snap-tile;某碰撞 bound 正好
+卡在 snap 阈值上,float 噪声令部分 run 多进/少进一个 tile);同 box 的两次 bake 还有
+~0.1–0.6% cell 抖动(cliff-oscillation)。**⇒ 对一个自身非确定的 oracle,byte-exact
+本质不可能;native-vs-native diff 才是正确的地板标尺,不是 byte-exact-vs-单次-bake。**
+
+**实际可走性已达浮点地板。** cell 语义:`0=可走 / 1=墙 / 0xFF=void`;寻路上 1 与 255
+均不可走。按此「de-cosmetic」口径(1≡255)复测:aggregate **99.8934%**,THECROSSING
+**99.8938% ≈ 其浮点地板 0.0965%**。raw-byte 残差里约一半是树簇内部的 255↔1 void/wall
+标注差(单 tile 可走性无影响、仅 tile 缝隙处相关)+ 余为不可约浮点。**换言之:寻路网格
+的实际可走性已与原生匹配到浮点地板;字节精确唯一途径仍是 `--mpp dll`。**
+
+前述 vanilla 语料残差(276839 cell)同属该信息论下限(原生 cliff/multichunk 不确定 +
+per-instance 运行时 nocollide),换语言/精度都不移动它。
 
 ## 用法
 
@@ -100,7 +133,7 @@ cargo build --release
 # 单文件工具:
 .\target\release\tl2-mikuro-mod-packer.exe compile-dat    <in.DAT>    <out.BINDAT>
 .\target\release\tl2-mikuro-mod-packer.exe compile-layout <in.LAYOUT> <out.BINLAYOUT>
-.\target\release\tl2-mikuro-mod-packer.exe compile-mpp    <in.LAYOUT> <out.mpp> [--media <MEDIA>]
+.\target\release\tl2-mikuro-mod-packer.exe compile-mpp    <in.LAYOUT> <out.mpp> [--media <MEDIA>] [--fallback <base MEDIA>]
 # 语料验证:
 .\target\release\verify.exe binlayout|bindat|raw|mpp <media_dir> ...
 ```
@@ -108,9 +141,12 @@ cargo build --release
 - 默认(不加 flag):内存内转换 + 直接打包,不写源目录(等价 Python 默认 overrides 模式)。
 - `--deploy`:输出 `<MOD_FILE_NAME>.MOD` 到 `%Documents%\My Games\Runic Games\Torchlight 2\mods`
   (注册表 Shell Folders 解析,OneDrive 重定向安全)。
-- `--mpp re`(默认)离线寻路网格(≈99.7% cell 精确,已知天花板);`--mpp dll` 走
-  `TL2-Mikuro-Console.exe` 驱动真实 EditorGuts.dll(字节精确,需可用的编辑器环境);
-  `--mpp none` 保留源目录已有 .mpp。
+- `--mpp re`(默认)离线寻路网格(≈99.7% cell 精确,已知天花板 — 见下「原生非确定性」);
+  `--mpp dll` 走 `TL2-Mikuro-Console.exe` 驱动真实 EditorGuts.dll(字节精确,需可用的编辑器
+  环境);`--mpp none` 保留源目录已有 .mpp。
+- `compile-mpp --fallback <base MEDIA>`:单瓦片编译时启用 **mod-over-base VFS overlay**
+  (先查 `--media` 的 mod,再查 `--fallback` 的基础安装),用于把单个 mod 瓦片按整包
+  构建的口径解析基础游戏 link/mesh 目标。整包构建(主命令)已自动带此 overlay。
 - 环境变量:`TL2_MEDIA_DIR`(基础游戏 MEDIA,默认 `E:\Torchlight 2\MEDIA`)、
   `TL2_INSTALL_DIR`(dll 后端)、`TL2_MOD_GAMEVER`(覆写 header gamever)。
 
