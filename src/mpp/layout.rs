@@ -186,9 +186,22 @@ fn build_object(props: HashMap<String, String>) -> LayoutObject {
         fget(&props, "RIGHTY"),
         fget(&props, "RIGHTZ"),
     );
+    let u = (fget(&props, "UPX"), fget(&props, "UPY"), fget(&props, "UPZ"));
     if let ((Some(fx), Some(fy), Some(fz)), (Some(rx), Some(ry), Some(rz))) = (f, r) {
         o.fwd = Some(Vec3::new(fx, fy, fz));
         o.right = Some(Vec3::new(rx, ry, rz));
+    } else if let ((Some(fx), Some(fy), Some(fz)), (Some(ux), Some(uy), Some(uz))) = (f, u) {
+        // RIGHT absent but UP present (pitched bandit_wall_01 / berm props): reconstruct
+        // RIGHT from the TL2 convention UP = FORWARD x RIGHT => RIGHT = UP x FORWARD.
+        // Without this the frame collapsed to identity rotation, standing pitched
+        // walls/berms upright and dropping their sloped NOPATH collision out of the
+        // grid (MPP under-wall). Mirrors mpp/layout.py.
+        o.fwd = Some(Vec3::new(fx, fy, fz));
+        o.right = Some(Vec3::new(
+            uy * fz - uz * fy,
+            uz * fx - ux * fz,
+            ux * fy - uy * fx,
+        ));
     }
     if o.fwd.is_none() {
         o.yaw = fget(&props, "YAW");

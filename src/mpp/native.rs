@@ -5,11 +5,13 @@
 //! per-cell classification is embarrassingly parallel and rayon-parallelized
 //! per row (the enclosure pass stays sequential — it cascades).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use rayon::prelude::*;
 
-use super::geom::Mat4;
+use super::geom::{Mat4, Vec3};
 use super::layout::{Layout, LayoutObject};
 use super::pipeline::Context;
 use super::region::{
@@ -41,6 +43,48 @@ const RUNTIME_LINK_SUBSTR: [&str; 8] = [
 ];
 
 type P3 = [f64; 3];
+
+// ── phase-timing probes (CPU-seconds across threads; report via timing_report) ──
+static T_GATHER: AtomicU64 = AtomicU64::new(0);
+static T_INDEX: AtomicU64 = AtomicU64::new(0);
+static T_CLASSIFY: AtomicU64 = AtomicU64::new(0);
+static T_ENCLOSURE: AtomicU64 = AtomicU64::new(0);
+pub static T_RECONNECT: AtomicU64 = AtomicU64::new(0);
+
+pub fn add_nanos(counter: &AtomicU64, t0: std::time::Instant) {
+    counter.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn timing_report() -> String {
+    let s = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e9;
+    format!(
+        "phase cpu-seconds: gather={:.2} index={:.2} classify={:.2} enclosure={:.2} reconnect={:.2}",
+        s(&T_GATHER), s(&T_INDEX), s(&T_CLASSIFY), s(&T_ENCLOSURE), s(&T_RECONNECT)
+    )
+}
+
+/// R38 NEVERBAKE-floor gate (mirrors Python _NEVERBAKE_FLOOR, default ON,
+/// kill-switch MPP_NEVERBAKE_FLOOR=0): a BAKE:false piece whose descriptor is
+/// NEVERBAKE is still force-baked by the editor (SetMesh @0x1023116b sets the
+/// effective-BAKE byte piece[+0x191]=1) — but its nocollide submeshes never wall,
+/// so emitting ONLY the non-nop (real-collision) submeshes reproduces the grid.
+fn neverbake_floor_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MPP_NEVERBAKE_FLOOR").map(|v| v == "1").unwrap_or(true)
+    })
+}
+
+/// R41 Layout Link Controller DATA-field placement (mirrors Python
+/// _CONTROLLER_DATA, default ON, kill-switch MPP_CONTROLLER_DATA=0): the editor
+/// places controller sub-layout objects by the controller's DATA field (per-object
+/// runtime transform relative to the controller), not their authored locals.
+fn controller_data_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MPP_CONTROLLER_DATA").map(|v| v == "1").unwrap_or(true)
+    })
+}
 
 #[derive(Clone)]
 pub struct Tri {
@@ -314,6 +358,138 @@ pub fn swept_tri(s: P3, e: P3, radius: f64, a: P3, b: P3, c: P3) -> Option<(P3, 
     None
 }
 
+/// The clearance leaf's side-test gate (sub_100672B0 via sub_10293B50, R19):
+/// with s(p) = side of p vs the tri plane {0 back / 1 front / 2 on} (sign of
+/// dot(vertA - p, n), n = raw cross(b-a,c-a)), a probe blocks iff
+///   s(origin) != s(e)  AND  s(origin) != 1 (front)
+/// i.e. the segment straddles the wall plane with its START on the non-front
+/// side. The vertical down-ray leaf has NO such gate — clearance only.
+#[inline]
+fn clearance_hit(origin: P3, e: P3, radius: f64, a: P3, b: P3, c: P3) -> bool {
+    if swept_tri(origin, e, radius, a, b, c).is_none() {
+        return false;
+    }
+    let n = cross(sub(b, a), sub(c, a));
+    let d0 = n[0] * (a[0] - origin[0]) + n[1] * (a[1] - origin[1]) + n[2] * (a[2] - origin[2]);
+    if d0 > SIDE_EPS {
+        return false; // s(origin) == 1 (front) -> gate rejects
+    }
+    let s0 = if d0 < -SIDE_EPS { 0u8 } else { 2u8 };
+    let de = n[0] * (a[0] - e[0]) + n[1] * (a[1] - e[1]) + n[2] * (a[2] - e[2]);
+    let se = if de < -SIDE_EPS {
+        0u8
+    } else if de > SIDE_EPS {
+        1u8
+    } else {
+        2u8
+    };
+    s0 != se // straddle: s(origin) != s(e)
+}
+
+// ── Layout Link Controller DATA-field placement (R41) ─────────────────────
+
+/// Row-major rotation matrix for `ang` radians about axis (ax,ay,az).
+fn axis_angle_matrix(ang: f64, ax: f64, ay: f64, az: f64) -> Mat4 {
+    let n = (ax * ax + ay * ay + az * az).sqrt();
+    if n < 1e-9 || ang.abs() < 1e-12 {
+        return Mat4::identity();
+    }
+    let (ax, ay, az) = (ax / n, ay / n, az / n);
+    let (c, s) = (ang.cos(), ang.sin());
+    let t = 1.0 - c;
+    let mut m = Mat4::identity();
+    m.m[0][0] = c + ax * ax * t;
+    m.m[0][1] = ax * ay * t - az * s;
+    m.m[0][2] = ax * az * t + ay * s;
+    m.m[1][0] = ay * ax * t + az * s;
+    m.m[1][1] = c + ay * ay * t;
+    m.m[1][2] = ay * az * t - ax * s;
+    m.m[2][0] = az * ax * t - ay * s;
+    m.m[2][1] = az * ay * t + ax * s;
+    m.m[2][2] = c + az * az * t;
+    m
+}
+
+/// Parse a Layout Link Controller's DATA field
+/// ("<ver>,<count>,{objectID,posX,posY,posZ,angle,axisX,axisY,axisZ}*count")
+/// -> {object_id: translation @ rotation} relative to the controller's world.
+fn parse_controller_data(ctrl: &LayoutObject) -> HashMap<String, Mat4> {
+    let mut out = HashMap::new();
+    let raw = match ctrl.props.get("DATA") {
+        Some(r) if !r.is_empty() => r,
+        _ => return out,
+    };
+    let parts: Vec<&str> = raw.split(',').filter(|p| !p.trim().is_empty()).collect();
+    if parts.len() < 2 {
+        return out;
+    }
+    let count: usize = match parts[1].trim().parse() {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    let mut i = 2usize;
+    for _ in 0..count {
+        if i + 8 > parts.len() {
+            break;
+        }
+        let oid = parts[i].to_string();
+        let mut vals = [0.0f64; 7];
+        let mut ok = true;
+        for (k, v) in vals.iter_mut().enumerate() {
+            match parts[i + 1 + k].trim().parse::<f64>() {
+                Ok(f) => *v = f,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            break;
+        }
+        let [x, y, z, ang, axx, axy, axz] = vals;
+        out.insert(
+            oid,
+            Mat4::translation(Vec3::new(x, y, z)).matmul(&axis_angle_matrix(ang, axx, axy, axz)),
+        );
+        i += 8;
+    }
+    out
+}
+
+/// Recompute a sub-layout piece's transform relative to the controller: walk its
+/// PARENTID chain and substitute a DATA-field local for any ancestor listed in
+/// `data_map`, else the authored local. == piece.world when no DATA ancestor.
+fn data_override_world(piece_idx: usize, sub: &Layout, data_map: &HashMap<String, Mat4>) -> Mat4 {
+    let mut chain: Vec<usize> = vec![piece_idx];
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pid = sub.objects[piece_idx].props.get("PARENTID").cloned();
+    while let Some(p) = pid {
+        if p.is_empty() || seen.contains(&p) {
+            break;
+        }
+        let anc = match sub.by_id.get(&p) {
+            Some(&i) => i,
+            None => break,
+        };
+        seen.insert(p);
+        chain.push(anc);
+        pid = sub.objects[anc].props.get("PARENTID").cloned();
+    }
+    let mut m = Mat4::identity();
+    for &oi in chain.iter().rev() {
+        let obj = &sub.objects[oi];
+        let local = obj
+            .props
+            .get("ID")
+            .and_then(|id| data_map.get(id))
+            .copied()
+            .unwrap_or_else(|| obj.local_matrix());
+        m = m.matmul(&local);
+    }
+    m
+}
+
 // ── collision gather (mirrors native.gather) ──────────────────────────────
 
 fn emit_piece(piece: &LayoutObject, m: &Mat4, ctx: &Context, tris: &mut Vec<Tri>) {
@@ -325,10 +501,16 @@ fn emit_piece(piece: &LayoutObject, m: &Mat4, ctx: &Context, tris: &mut Vec<Tri>
         None => return,
     };
     // Master-collision add gate: excluded when <BOOL>BAKE:false unless the
-    // descriptor is ALWAYSBAKECOLLISION (NEVERBAKE does NOT rescue it).
+    // descriptor is ALWAYSBAKECOLLISION — or (R38) NEVERBAKE, which SetMesh
+    // force-bakes; for those emit only the non-nop submeshes (see below).
+    let mut neverbake_floor = false;
     if let Some(bake) = piece.props.get("BAKE") {
         if bake.trim().to_lowercase() == "false" && !pd.alwaysbakecollision {
-            return;
+            if neverbake_floor_enabled() && pd.neverbake {
+                neverbake_floor = true;
+            } else {
+                return;
+            }
         }
     }
     let coll = select_collision_file(pd, piece.visual);
@@ -352,9 +534,15 @@ fn emit_piece(piece: &LayoutObject, m: &Mat4, ctx: &Context, tris: &mut Vec<Tri>
             _ => continue,
         };
         let nop = pnop || sm.material.to_lowercase().contains(NOCOLLIDE_MAT);
+        if neverbake_floor && nop {
+            continue; // NEVERBAKE-rescued piece: skip nocollide submeshes (never wall)
+        }
         let idx = &sm.indices;
         let vc = geo.vertex_count;
         let pos = &geo.positions;
+        // (Measured: pre-transforming the whole vertex buffer per submesh/piece is a
+        // NET LOSS here — allocation + scattered re-reads beat the ~6x redundant
+        // per-corner multiplies. Keep the per-corner transform.)
         let w = |vi: usize| -> P3 {
             let p = pos[vi];
             [
@@ -412,13 +600,7 @@ fn follow_all_links() -> bool {
 /// transformed by the accumulated `world0`. Runs on the top layout AND (when nested is on)
 /// inside tile-alias sub-layouts. Deliberately NOT prop->prop recursive: full recursion
 /// pulls in decoration the DLL does not bake (A/B: +191 over-wall for -41 under-wall).
-fn emit_prop_links(
-    lay: &Layout,
-    world0: Option<&Mat4>,
-    ctx: &Context,
-    sub_cache: &mut HashMap<String, Option<Layout>>,
-    tris: &mut Vec<Tri>,
-) {
+fn emit_prop_links(lay: &Layout, world0: Option<&Mat4>, ctx: &Context, tris: &mut Vec<Tri>) {
     for (oi, o) in lay.objects.iter().enumerate() {
         if link_target_kind(o) == LinkKind::Tile {
             continue;
@@ -431,25 +613,36 @@ fn emit_prop_links(
             Some(p) => p,
             None => continue,
         };
-        let key = sub_path.to_string_lossy().to_string();
-        let sub = sub_cache
-            .entry(key)
-            .or_insert_with(|| super::layout::load_layout_file(&sub_path).ok());
-        let sub = match sub {
+        let sub_arc = match ctx.get_layout(&sub_path) {
             Some(s) => s,
             None => continue,
         };
+        let sub: &Layout = sub_arc.as_ref();
         let lw = o.world; // NOT scale-stripped here (mirrors Python)
         let link_world = match world0 {
             None => lw,
             Some(w) => w.matmul(&lw),
+        };
+        // Layout Link Controller: the editor places sub-layout objects by the
+        // controller's DATA field (per-object runtime transform relative to the
+        // controller), NOT their authored sub-layout locals (R41). Empty map
+        // (no DATA / non-controller) -> authored piece.world, no change.
+        let data_map = if controller_data_enabled() && o.descriptor == "Layout Link Controller" {
+            parse_controller_data(o)
+        } else {
+            HashMap::new()
         };
         for pi in sub.room_piece_indices() {
             if in_backdrop_group(sub, pi, true) {
                 continue;
             }
             let piece = &sub.objects[pi];
-            let world = link_world.matmul(&piece.world);
+            let pw = if !data_map.is_empty() {
+                data_override_world(pi, sub, &data_map)
+            } else {
+                piece.world
+            };
+            let world = link_world.matmul(&pw);
             emit_piece(piece, &world, ctx, tris);
         }
     }
@@ -462,7 +655,6 @@ fn follow_tile_links(
     depth: usize,
     ctx: &Context,
     assemble_links: bool,
-    sub_cache: &mut HashMap<String, Option<Layout>>,
     tris: &mut Vec<Tri>,
 ) {
     if depth > 6 {
@@ -481,17 +673,18 @@ fn follow_tile_links(
         if visited.contains(&key) {
             continue;
         }
-        let sub = match super::layout::load_layout_file(&sp) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let sub_arc = match ctx.get_layout(&sp) {
+            Some(s) => s,
+            None => continue,
         };
+        let sub: &Layout = sub_arc.as_ref();
         let lw = strip_link_scale(&o.world);
         let w0 = match world0 {
             None => lw,
             Some(w) => w.matmul(&lw),
         };
         for pi in sub.room_piece_indices() {
-            if in_backdrop_group(&sub, pi, true) || link_under_feature_tagged_group(&sub, pi) {
+            if in_backdrop_group(sub, pi, true) || link_under_feature_tagged_group(sub, pi) {
                 continue;
             }
             let piece = &sub.objects[pi];
@@ -501,11 +694,11 @@ fn follow_tile_links(
         // The DLL loads the whole nested level, so a prop-link INSIDE this tile-alias sub
         // (e.g. PASS corridors: 1X1_ALPHAZONE_LM_A -> ECHOINN/TREE_03) is baked too.
         if assemble_links && nested_prop_links() {
-            emit_prop_links(&sub, Some(&w0), ctx, sub_cache, tris);
+            emit_prop_links(sub, Some(&w0), ctx, tris);
         }
         let mut v2 = visited.clone();
         v2.insert(key);
-        follow_tile_links(&sub, Some(&w0), &v2, depth + 1, ctx, assemble_links, sub_cache, tris);
+        follow_tile_links(sub, Some(&w0), &v2, depth + 1, ctx, assemble_links, tris);
     }
 }
 
@@ -523,24 +716,12 @@ pub fn gather(layout: &Layout, ctx: &Context, assemble_links: bool) -> Vec<Tri> 
         emit_piece(piece, &world, ctx, &mut tris);
     }
 
-    // Shared across the tile-alias follow (for nested prop-links) and the top-level
-    // prop-link pass, mirroring Python gather's single sub_cache closure.
-    let mut sub_cache: HashMap<String, Option<Layout>> = HashMap::new();
-
     // ALWAYS follow tile-geometry ALIAS links (and, default-on, their nested prop-links).
-    follow_tile_links(
-        layout,
-        None,
-        &HashSet::new(),
-        0,
-        ctx,
-        assemble_links,
-        &mut sub_cache,
-        &mut tris,
-    );
+    // Sub-layout parses are shared cross-tile via ctx.get_layout.
+    follow_tile_links(layout, None, &HashSet::new(), 0, ctx, assemble_links, &mut tris);
 
     if assemble_links {
-        emit_prop_links(layout, None, ctx, &mut sub_cache, &mut tris);
+        emit_prop_links(layout, None, ctx, &mut tris);
     }
 
     tris
@@ -573,28 +754,210 @@ pub fn enclosure_pass(grid: &mut [u8], gw: i32, gh: i32) {
     }
 }
 
-// ── production grid builder (bucket-culled == build_grid_fast) ─────────────
+// ── SAFETY post-process (R36/R37): reconnect trapped walkable regions ──────
 
-type BucketIdx = HashMap<(i64, i64), Vec<u32>>;
+/// NOT part of native's algorithm — a gameplay-safety guard for the SHIPPED grid
+/// (mirrors Python native.reconnect_walkable, byte-exact same unblock choices).
+/// Unblocks the MINIMAL wall-barrier (<= max_barrier cells) separating any large
+/// (>= min_region) disconnected walkable component from the main region. Only
+/// wall(1) cells are unblocked; void(0xFF) is impassable. Returns cells unblocked.
+pub fn reconnect_walkable(g: &mut [u8], gw: i32, gh: i32, min_region: usize, max_barrier: u32) -> usize {
+    let (gw, gh) = (gw.max(0) as usize, gh.max(0) as usize);
+    let n = gw * gh;
+    if n == 0 || g.len() < n {
+        return 0;
+    }
+    // 4-neighbour walkable components, in the Python discovery order
+    // (scan order starts, BFS popleft, neighbour order (-z,+z,-x,+x)).
+    let components = |g: &[u8]| -> Vec<Vec<usize>> {
+        let mut lab = vec![0u32; n];
+        let mut comps: Vec<Vec<usize>> = Vec::new();
+        let mut q: VecDeque<usize> = VecDeque::new();
+        for st in 0..n {
+            if g[st] != 0 || lab[st] != 0 {
+                continue;
+            }
+            let cur = comps.len() as u32 + 1;
+            lab[st] = cur;
+            q.push_back(st);
+            let mut cells = vec![st];
+            while let Some(p) = q.pop_front() {
+                let (z, x) = (p / gw, p % gw);
+                for (dz, dx) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                    let (zz, xx) = (z as i64 + dz, x as i64 + dx);
+                    if zz < 0 || xx < 0 || zz >= gh as i64 || xx >= gw as i64 {
+                        continue;
+                    }
+                    let ni = zz as usize * gw + xx as usize;
+                    if g[ni] == 0 && lab[ni] == 0 {
+                        lab[ni] = cur;
+                        q.push_back(ni);
+                        cells.push(ni);
+                    }
+                }
+            }
+            comps.push(cells);
+        }
+        comps
+    };
+
+    const INF: u32 = 1 << 30;
+    let mut total = 0usize;
+    for _ in 0..30 {
+        let comps = components(g);
+        if comps.is_empty() {
+            break;
+        }
+        // main = largest component (first max, mirroring Python max())
+        let mut main = 0usize;
+        for (ci, c) in comps.iter().enumerate() {
+            if c.len() > comps[main].len() {
+                main = ci;
+            }
+        }
+        let targets: Vec<usize> = (0..comps.len())
+            .filter(|&c| c != main && comps[c].len() >= min_region)
+            .collect();
+        if targets.is_empty() {
+            break;
+        }
+        // 0-1 BFS from every main cell: walkable free, wall costs 1, void impassable.
+        let mut dist = vec![INF; n];
+        let mut par = vec![usize::MAX; n];
+        let mut dq: VecDeque<usize> = VecDeque::new();
+        for &p in &comps[main] {
+            dist[p] = 0;
+            dq.push_back(p);
+        }
+        while let Some(p) = dq.pop_front() {
+            let (z, x) = (p / gw, p % gw);
+            let dp = dist[p];
+            for (dz, dx) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                let (zz, xx) = (z as i64 + dz, x as i64 + dx);
+                if zz < 0 || xx < 0 || zz >= gh as i64 || xx >= gw as i64 {
+                    continue;
+                }
+                let ni = zz as usize * gw + xx as usize;
+                if g[ni] == 0xFF {
+                    continue;
+                }
+                let w: u32 = if g[ni] == 0 { 0 } else { 1 };
+                if dp + w < dist[ni] {
+                    dist[ni] = dp + w;
+                    par[ni] = p;
+                    if w == 0 {
+                        dq.push_front(ni);
+                    } else {
+                        dq.push_back(ni);
+                    }
+                }
+            }
+        }
+        let mut reconnected = false;
+        for &c in &targets {
+            // first-min in cell order (mirrors Python min())
+            let mut best = comps[c][0];
+            for &p in &comps[c] {
+                if dist[p] < dist[best] {
+                    best = p;
+                }
+            }
+            if dist[best] <= max_barrier {
+                let mut p = best;
+                while p != usize::MAX && dist[p] > 0 {
+                    if g[p] == 1 {
+                        g[p] = 0;
+                        total += 1;
+                    }
+                    p = par[p];
+                }
+                reconnected = true;
+            }
+        }
+        if !reconnected {
+            break;
+        }
+    }
+    total
+}
+
+// ── production grid builder (bucket-culled == build_grid_fast) ─────────────
 
 fn bucket_of(v: f64) -> i64 {
     (v / BUCKET).floor() as i64
 }
 
-fn build_index<'a, I: Iterator<Item = (usize, &'a Tri)>>(iter: I, pad: f64) -> BucketIdx {
-    let mut idx: BucketIdx = HashMap::new();
-    for (ti, t) in iter {
-        let minx = t.a[0].min(t.b[0]).min(t.c[0]) - pad;
-        let maxx = t.a[0].max(t.b[0]).max(t.c[0]) + pad;
-        let minz = t.a[2].min(t.b[2]).min(t.c[2]) - pad;
-        let maxz = t.a[2].max(t.b[2]).max(t.c[2]) + pad;
-        for gx in bucket_of(minx)..=bucket_of(maxx) {
-            for gz in bucket_of(minz)..=bucket_of(maxz) {
-                idx.entry((gx, gz)).or_default().push(ti as u32);
+/// Dense CSR bucket grid over the tris' bucket-coordinate range: zero hashing on
+/// the per-cell lookup (the HashMap cost was ~2 SipHash lookups x 99M cells).
+/// Per-bucket candidate ORDER is ascending tri index, identical to the HashMap
+/// build's push order — the classify first-min tie-break depends on it.
+struct BucketIdx {
+    gx0: i64,
+    gz0: i64,
+    nx: i64,
+    nz: i64,
+    offsets: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl BucketIdx {
+    #[inline]
+    fn get(&self, gx: i64, gz: i64) -> &[u32] {
+        if gx < self.gx0 || gz < self.gz0 || gx >= self.gx0 + self.nx || gz >= self.gz0 + self.nz {
+            return &[];
+        }
+        let cell = ((gz - self.gz0) * self.nx + (gx - self.gx0)) as usize;
+        &self.items[self.offsets[cell] as usize..self.offsets[cell + 1] as usize]
+    }
+}
+
+fn build_index<'a, I: Iterator<Item = (usize, &'a Tri)> + Clone>(iter: I, pad: f64) -> BucketIdx {
+    // bucket span per tri (same formulas as the HashMap build)
+    let spans: Vec<(i64, i64, i64, i64)> = iter
+        .clone()
+        .map(|(_ti, t)| {
+            let minx = t.a[0].min(t.b[0]).min(t.c[0]) - pad;
+            let maxx = t.a[0].max(t.b[0]).max(t.c[0]) + pad;
+            let minz = t.a[2].min(t.b[2]).min(t.c[2]) - pad;
+            let maxz = t.a[2].max(t.b[2]).max(t.c[2]) + pad;
+            (bucket_of(minx), bucket_of(maxx), bucket_of(minz), bucket_of(maxz))
+        })
+        .collect();
+    if spans.is_empty() {
+        return BucketIdx { gx0: 0, gz0: 0, nx: 0, nz: 0, offsets: vec![0], items: Vec::new() };
+    }
+    let gx0 = spans.iter().map(|s| s.0).min().unwrap();
+    let gx1 = spans.iter().map(|s| s.1).max().unwrap();
+    let gz0 = spans.iter().map(|s| s.2).min().unwrap();
+    let gz1 = spans.iter().map(|s| s.3).max().unwrap();
+    let nx = gx1 - gx0 + 1;
+    let nz = gz1 - gz0 + 1;
+    let ncell = (nx * nz) as usize;
+    // pass 1: counts; pass 2: fill in ascending tri order (per-bucket order preserved)
+    let mut counts = vec![0u32; ncell];
+    for s in &spans {
+        for gz in s.2..=s.3 {
+            for gx in s.0..=s.1 {
+                counts[((gz - gz0) * nx + (gx - gx0)) as usize] += 1;
             }
         }
     }
-    idx
+    let mut offsets = vec![0u32; ncell + 1];
+    for i in 0..ncell {
+        offsets[i + 1] = offsets[i] + counts[i];
+    }
+    let mut cursor = offsets[..ncell].to_vec();
+    let mut items = vec![0u32; offsets[ncell] as usize];
+    for ((ti, _t), s) in iter.zip(&spans) {
+        for gz in s.2..=s.3 {
+            for gx in s.0..=s.1 {
+                let cell = ((gz - gz0) * nx + (gx - gx0)) as usize;
+                items[cursor[cell] as usize] = ti as u32;
+                cursor[cell] += 1;
+            }
+        }
+    }
+    BucketIdx { gx0, gz0, nx, nz, offsets, items }
 }
 
 /// BYTE-IDENTICAL to the Python build_grid / build_grid_fast. Returns the grid
@@ -612,18 +975,57 @@ pub fn build_grid_fast(
     let i0 = ((box_min.x - origin_x) / CELL).floor() as i64;
     let j0 = ((box_min.z - origin_z) / CELL).floor() as i64;
 
+    let t0 = std::time::Instant::now();
     let tris = gather(layout, ctx, assemble_links);
+    add_nanos(&T_GATHER, t0);
+    let t0 = std::time::Instant::now();
     let nopath_tris: Vec<&Tri> = tris.iter().filter(|t| t.nop).collect();
     let all_idx = build_index(tris.iter().enumerate(), RADIUS + 1e-4);
     let nop_idx = build_index(
         nopath_tris.iter().enumerate().map(|(i, t)| (i, *t)),
         CLEARANCE_LEN,
     );
+    // Per-tri AABB pre-filters (pure rejection of tris that CANNOT hit — the
+    // accepted paths run the identical float ops, so the grid is bit-exact).
+    // Down-ray: a swept hit implies XZ distance from the vertical line <= RADIUS
+    // (in-tri: (cx,cz) inside the tri's XZ projection; capsule-edge: closest
+    // point within RADIUS of it). Pad RADIUS also swallows point_in_tri's 1e-6
+    // barycentric slop (~2e-4 world units on the largest collision tris).
+    let aabb_xz: Vec<[f64; 4]> = tris
+        .iter()
+        .map(|t| {
+            [
+                t.a[0].min(t.b[0]).min(t.c[0]) - RADIUS,
+                t.a[0].max(t.b[0]).max(t.c[0]) + RADIUS,
+                t.a[2].min(t.b[2]).min(t.c[2]) - RADIUS,
+                t.a[2].max(t.b[2]).max(t.c[2]) + RADIUS,
+            ]
+        })
+        .collect();
+    // Clearance probes (radius 0): a hit lies ON the 0.3 segment AND on the tri
+    // (within the same barycentric slop) -> 3D AABB overlap, padded 1e-3 (10x
+    // the worst-case slop) so the filter can never drop a would-be hit.
+    const CPAD: f64 = 1e-3;
+    let nop_aabb: Vec<[f64; 6]> = nopath_tris
+        .iter()
+        .map(|t| {
+            [
+                t.a[0].min(t.b[0]).min(t.c[0]) - CPAD,
+                t.a[0].max(t.b[0]).max(t.c[0]) + CPAD,
+                t.a[1].min(t.b[1]).min(t.c[1]) - CPAD,
+                t.a[1].max(t.b[1]).max(t.c[1]) + CPAD,
+                t.a[2].min(t.b[2]).min(t.c[2]) - CPAD,
+                t.a[2].max(t.b[2]).max(t.c[2]) + CPAD,
+            ]
+        })
+        .collect();
+    add_nanos(&T_INDEX, t0);
 
     let gw_us = gw.max(0) as usize;
     let gh_us = gh.max(0) as usize;
     let mut grid = vec![0xFFu8; gw_us * gh_us];
 
+    let t0 = std::time::Instant::now();
     grid.par_chunks_mut(gw_us).enumerate().for_each(|(jj, row)| {
         let cz = (j0 + jj as i64) as f64 * CELL + HALF + origin_z;
         let gz = bucket_of(cz);
@@ -632,19 +1034,21 @@ pub fn build_grid_fast(
             let gx = bucket_of(cx);
             let s: P3 = [cx, 200.0, cz];
             let e: P3 = [cx, -200.0, cz];
-            let cand = match all_idx.get(&(gx, gz)) {
-                Some(c) if !c.is_empty() => c,
-                _ => {
-                    *cell = 0xFF;
-                    continue;
-                }
-            };
+            let cand = all_idx.get(gx, gz);
+            if cand.is_empty() {
+                *cell = 0xFF;
+                continue;
+            }
             // nearest-by-distance over candidates, strict < (first-min tie-break)
             let mut best_d = f64::INFINITY;
             let mut best_hp: P3 = [0.0; 3];
             let mut best_nop = false;
             let mut any = false;
             for &ti in cand {
+                let bb = &aabb_xz[ti as usize];
+                if cx < bb[0] || cx > bb[1] || cz < bb[2] || cz > bb[3] {
+                    continue; // vertical capsule cannot reach this tri
+                }
                 let t = &tris[ti as usize];
                 if let Some((hp, d)) = swept_tri(s, e, RADIUS, t.a, t.b, t.c) {
                     if !any || d < best_d {
@@ -666,7 +1070,8 @@ pub fn build_grid_fast(
             }
             let origin: P3 = [hp[0], hp[1] + CLEARANCE_LIFT, hp[2]];
             let mut blocked = false;
-            if let Some(ncand) = nop_idx.get(&(gx, gz)) {
+            let ncand = nop_idx.get(gx, gz);
+            if !ncand.is_empty() {
                 'probes: for (ox, oz) in [
                     (CLEARANCE_LEN, 0.0),
                     (-CLEARANCE_LEN, 0.0),
@@ -674,9 +1079,19 @@ pub fn build_grid_fast(
                     (0.0, -CLEARANCE_LEN),
                 ] {
                     let ee: P3 = [origin[0] + ox, origin[1], origin[2] + oz];
+                    let (sx0, sx1) = if ee[0] < origin[0] { (ee[0], origin[0]) } else { (origin[0], ee[0]) };
+                    let (sz0, sz1) = if ee[2] < origin[2] { (ee[2], origin[2]) } else { (origin[2], ee[2]) };
+                    let sy = origin[1];
                     for &ti in ncand {
+                        let bb = &nop_aabb[ti as usize];
+                        if sx1 < bb[0] || sx0 > bb[1] || sy < bb[2] || sy > bb[3] || sz1 < bb[4] || sz0 > bb[5] {
+                            continue; // probe segment cannot touch this tri
+                        }
                         let t = nopath_tris[ti as usize];
-                        if swept_tri(origin, ee, CLEARANCE_RADIUS, t.a, t.b, t.c).is_some() {
+                        // R19: the clearance leaf's side-test gate (clearance_hit),
+                        // NOT a bare swept_tri — else nocollide walls the probe exits
+                        // front-first over-block (canyon_footer_* etc.).
+                        if clearance_hit(origin, ee, CLEARANCE_RADIUS, t.a, t.b, t.c) {
                             blocked = true;
                             break 'probes;
                         }
@@ -687,6 +1102,10 @@ pub fn build_grid_fast(
         }
     });
 
+    add_nanos(&T_CLASSIFY, t0);
+
+    let t0 = std::time::Instant::now();
     enclosure_pass(&mut grid, gw, gh);
+    add_nanos(&T_ENCLOSURE, t0);
     grid
 }

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use super::dat::{load_all_levelsets, PieceDef};
 use super::geom::{Aabb, Vec3};
@@ -10,7 +10,7 @@ use super::layout::{load_layout_file, Layout};
 use super::ogre_mesh::{load_mesh_file, Mesh};
 use super::region::{
     compute_region_aabb_collision, grid_dims, grid_origin, header_floats, pack_header,
-    resolve_mesh_path, snap_box_outward, RegionResult, SNAP,
+    pbe_origin_min, resolve_mesh_path, snap_box_outward, RegionResult, SNAP,
 };
 
 /// Files with no room pieces default to a 20x20 box.
@@ -22,8 +22,9 @@ pub struct Context {
     pub media_dir: PathBuf,
     pub fallback_dir: Option<PathBuf>,
     pub guid: HashMap<String, PieceDef>,
-    bounds_cache: Mutex<HashMap<String, Option<Aabb>>>,
-    geom_cache: Mutex<HashMap<String, Option<Arc<Mesh>>>>,
+    bounds_cache: RwLock<HashMap<String, Option<Aabb>>>,
+    geom_cache: RwLock<HashMap<String, Option<Arc<Mesh>>>>,
+    layout_cache: RwLock<HashMap<String, Option<Arc<Layout>>>>,
 }
 
 impl Context {
@@ -42,33 +43,48 @@ impl Context {
             media_dir: media_dir.to_path_buf(),
             fallback_dir: fallback_dir.map(|p| p.to_path_buf()),
             guid,
-            bounds_cache: Mutex::new(HashMap::new()),
-            geom_cache: Mutex::new(HashMap::new()),
+            bounds_cache: RwLock::new(HashMap::new()),
+            geom_cache: RwLock::new(HashMap::new()),
+            layout_cache: RwLock::new(HashMap::new()),
         }
     }
 
     /// Collision-mesh M_MESH_BOUNDS (shared across tiles; pure per-file).
     pub fn get_bounds(&self, rel: &str) -> Option<Aabb> {
-        if let Some(v) = self.bounds_cache.lock().unwrap().get(rel) {
+        if let Some(v) = self.bounds_cache.read().unwrap().get(rel) {
             return *v;
         }
         let b = resolve_mesh_path(&self.media_dir, rel, self.fallback_dir.as_deref())
             .and_then(|p| load_mesh_file(&p).ok())
             .and_then(|m| if m.bounds.null { None } else { Some(m.bounds) });
-        self.bounds_cache.lock().unwrap().insert(rel.to_string(), b);
+        self.bounds_cache.write().unwrap().insert(rel.to_string(), b);
         b
     }
 
     /// Full collision-mesh geometry (shared, read-only).
     pub fn get_mesh(&self, rel: &str) -> Option<Arc<Mesh>> {
-        if let Some(v) = self.geom_cache.lock().unwrap().get(rel) {
+        if let Some(v) = self.geom_cache.read().unwrap().get(rel) {
             return v.clone();
         }
         let m = resolve_mesh_path(&self.media_dir, rel, self.fallback_dir.as_deref())
             .and_then(|p| load_mesh_file(&p).ok())
             .map(Arc::new);
-        self.geom_cache.lock().unwrap().insert(rel.to_string(), m.clone());
+        self.geom_cache.write().unwrap().insert(rel.to_string(), m.clone());
         m
+    }
+
+    /// Parsed sub-layout (Layout Link targets), shared across tiles — the same
+    /// prop/corridor sub-layouts are linked by hundreds of tiles; re-parsing them
+    /// per tile (and per pass: region box + gather) dominated the profile. A
+    /// parsed Layout is immutable, so cross-tile Arc sharing changes nothing.
+    pub fn get_layout(&self, path: &Path) -> Option<Arc<Layout>> {
+        let key = path.to_string_lossy().to_lowercase();
+        if let Some(v) = self.layout_cache.read().unwrap().get(&key) {
+            return v.clone();
+        }
+        let l = load_layout_file(path).ok().map(Arc::new);
+        self.layout_cache.write().unwrap().insert(key, l.clone());
+        l
     }
 }
 
@@ -103,8 +119,25 @@ pub fn compute_region(layout: &Layout, ctx: &Context, snap: f32) -> (Aabb, Regio
 pub fn generate_header(layout: &Layout, ctx: &Context) -> HeaderInfo {
     let (bx, region) = compute_region(layout, ctx, SNAP);
     let we = Vec3::new(0.0, 0.0, 0.0);
-    let (ox, oz) = grid_origin(bx.min);
-    let (gw, gh) = grid_dims(bx.min, bx.max, ox, oz);
+    let (mut ox, mut oz) = grid_origin(bx.min);
+    let (mut gw, mut gh) = grid_dims(bx.min, bx.max, ox, oz);
+    // R44: a type-19 "Path Bounds Extender" reaching past the collision-box min
+    // corner sets the grid ORIGIN. GATE: adopt the PBE-extended origin ONLY when
+    // it CHANGES gridW/gridH (a genuine +-1 float32 straddle at the min corner);
+    // otherwise the shipped grid keeps the collision origin (mirrors pipeline.py).
+    if let Some((px, pz)) = pbe_origin_min(layout) {
+        if px < bx.min.x || pz < bx.min.z {
+            let omin = Vec3::new(bx.min.x.min(px), bx.min.y, bx.min.z.min(pz));
+            let (oxp, ozp) = grid_origin(omin);
+            let (gwp, ghp) = grid_dims(bx.min, bx.max, oxp, ozp);
+            if (gwp, ghp) != (gw, gh) {
+                ox = oxp;
+                oz = ozp;
+                gw = gwp;
+                gh = ghp;
+            }
+        }
+    }
     let (ww, wd, bw, bd) = header_floats(bx.min, bx.max, we);
     HeaderInfo {
         grid_w: gw,
@@ -142,7 +175,7 @@ pub fn generate_mpp_bytes(layout_path: &Path, ctx: &Context) -> Result<Vec<u8>, 
         ));
     }
     // assemble_links defaults ON (matches pipeline._generate_mpp).
-    let grid = super::native::build_grid_fast(
+    let mut grid = super::native::build_grid_fast(
         &layout,
         ctx,
         hdr.bx.min,
@@ -152,6 +185,14 @@ pub fn generate_mpp_bytes(layout_path: &Path, ctx: &Context) -> Result<Vec<u8>, 
         hdr.grid_h,
         true,
     );
+    // SAFETY post-process — DEFAULT ON (disable with MPP_RECONNECT=0): reconnect
+    // any large walkable region our over-barriers trap off the main component
+    // (R36/R37; mirrors pipeline.py). Byte-exact faithful reproduction => set 0.
+    if std::env::var("MPP_RECONNECT").map(|v| v == "1").unwrap_or(true) {
+        let t0 = std::time::Instant::now();
+        super::native::reconnect_walkable(&mut grid, hdr.grid_w, hdr.grid_h, 100, 15);
+        super::native::add_nanos(&super::native::T_RECONNECT, t0);
+    }
     let mut out = pack_header(
         hdr.grid_w,
         hdr.grid_h,

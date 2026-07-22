@@ -10,6 +10,7 @@ name = "tl2-mikuro-mod-packer"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 rayon = "1.10"
 regex = "1"
 indexmap = "2"

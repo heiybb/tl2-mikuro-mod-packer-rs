@@ -120,7 +120,7 @@ fn read_geometry(r: &R, mut off: usize, hard_end: usize) -> Res<(Geometry, usize
         if cid == M_GEOMETRY_VERTEX_DECLARATION {
             let mut inner = cur + 6;
             while inner + 6 <= hard_end {
-                let (eid, _elen) = r.chunk_hdr(inner)?;
+                let (eid, elen) = r.chunk_hdr(inner)?;
                 if eid != M_GEOMETRY_VERTEX_ELEMENT {
                     break;
                 }
@@ -132,11 +132,12 @@ fn read_geometry(r: &R, mut off: usize, hard_end: usize) -> Res<(Geometry, usize
                     pos_source = Some(source);
                     pos_offset = voffset as usize;
                 }
-                // Faithful to the Python reference: it advances 14 (not 16), so
-                // the next header read lands mid-element and the loop breaks
-                // after the FIRST element (POSITION is element 0 in every TL2
-                // mesh). Bug-for-bug for byte parity with the reference.
-                inner += 8 + 6;
+                // element chunk = 6-byte hdr + 10-byte body (5x u16: source,type,
+                // semantic,offset,index) = 16. (The old `+= 8+6` dropped the index
+                // u16, misaligning every element after POSITION.) Mirrors the fixed
+                // Python reference: advance by the chunk's own length when plausible.
+                let elen = elen as usize;
+                inner += if (6..=64).contains(&elen) { elen } else { 16 };
             }
             let clen = clen as usize;
             cur = if clen >= 6 && clen <= hard_end.saturating_sub(cur) {

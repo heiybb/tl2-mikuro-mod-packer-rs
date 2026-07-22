@@ -322,6 +322,9 @@ fn verify_mpp_corpus(media: &Path, corpus: &Path) {
         "cells (dim-matched): {cells}   diff: {diff}   accuracy: {:.4}%",
         100.0 * (cells - diff) as f64 / cells.max(1) as f64
     );
+    if std::env::var("MPP_TIMING").map(|v| v == "1").unwrap_or(false) {
+        println!("{}", tl2_mikuro_mod_packer_rs::mpp::native::timing_report());
+    }
 }
 
 fn verify_mpp(args: &[String]) {

@@ -13,6 +13,12 @@
 //!   packer     .MOD container writer + orchestration (convert_all / pack_mod)
 //!   mpp        .MPP pathing grids: offline classifier + byte-exact DLL driver
 
+// mimalloc as the global allocator: the pipelines are rayon-parallel and
+// allocation-heavy (parser strings, per-tile buffers); Windows' default heap
+// serializes those allocations across threads.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod bindat;
 pub mod binlayout;
 pub mod mpp;

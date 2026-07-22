@@ -260,10 +260,11 @@ fn merge_baked_links(
         if visited.contains(&key) {
             continue;
         }
-        let sub = match super::layout::load_layout_file(&sub_path) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let sub_arc = match ctx.get_layout(&sub_path) {
+            Some(s) => s,
+            None => continue,
         };
+        let sub: &Layout = sub_arc.as_ref();
         let link_world = strip_link_scale(&obj.world);
         let world0 = match world {
             None => link_world,
@@ -278,7 +279,7 @@ fn merge_baked_links(
                 Some(pd) => pd,
                 None => continue,
             };
-            if !registers_for_pathing(&sub, pi, true) {
+            if !registers_for_pathing(sub, pi, true) {
                 continue;
             }
             let coll = select_collision_file(pd, piece.visual);
@@ -299,7 +300,7 @@ fn merge_baked_links(
         }
         let mut v2 = visited.clone();
         v2.insert(key);
-        merge_baked_links(&sub, ctx, ext, Some(&world0), &v2, depth + 1);
+        merge_baked_links(sub, ctx, ext, Some(&world0), &v2, depth + 1);
     }
 }
 
@@ -384,6 +385,49 @@ pub fn snap_box_outward(bx: &Aabb, quantum: f32) -> Aabb {
         Vec3::new(lo(bx.min.x), bx.min.y, lo(bx.min.z)),
         Vec3::new(hi(bx.max.x), bx.max.y, hi(bx.max.z)),
     )
+}
+
+/// Type-19 "Path Bounds Extender" Property Nodes' merged world-box MIN (x, z),
+/// or None if the tile has none (R44). GenPathing's master-AABB loop merges each
+/// type-19 Property Node's +-0.5*(BOX WIDTH, BOX LENGTH) X/Z box (at its world
+/// transform) into the box the grid ORIGIN comes from (@0x10204702 -> 0x10204FD0);
+/// the writer box (worldExt/bounds) stays the pure-collision hull, and a PBE
+/// contributes NO collision triangles. Mirrors mpp/region.py pbe_origin_min.
+pub fn pbe_origin_min(layout: &Layout) -> Option<(f64, f64)> {
+    let mut mn: Option<(f64, f64)> = None;
+    for o in &layout.objects {
+        if o.descriptor != "Property Node" {
+            continue;
+        }
+        if o.props.get("TYPE").map(|s| s.trim()) != Some("Path Bounds Extender") {
+            continue;
+        }
+        let m = &o.world.m;
+        // missing/empty prop -> 0.0; a present-but-unparseable value zeroes BOTH
+        // (mirrors the Python try/except around the pair).
+        let fval = |k: &str| -> Result<f64, ()> {
+            match o.props.get(k) {
+                None => Ok(0.0),
+                Some(s) if s.trim().is_empty() => Ok(0.0),
+                Some(s) => s.trim().parse::<f64>().map_err(|_| ()),
+            }
+        };
+        let (hw, hl) = match (fval("BOX WIDTH"), fval("BOX LENGTH")) {
+            (Ok(w), Ok(l)) => (0.5 * w, 0.5 * l),
+            _ => (0.0, 0.0),
+        };
+        for lx in [-hw, hw] {
+            for lz in [-hl, hl] {
+                let wx = m[0][0] * lx + m[0][2] * lz + m[0][3];
+                let wz = m[2][0] * lx + m[2][2] * lz + m[2][3];
+                mn = Some(match mn {
+                    None => (wx, wz),
+                    Some((ax, az)) => (ax.min(wx), az.min(wz)),
+                });
+            }
+        }
+    }
+    mn
 }
 
 /// CLevel grid origin: float32((floor((f32(min) - 0.2)/0.4) - 1.0) * 0.4).
