@@ -36,8 +36,9 @@ fn main() {
         Some("raw") => verify_raw(Path::new(&args[1])),
         Some("mpp") => verify_mpp(&args[1..]),
         Some("mpp-corpus") => verify_mpp_corpus(Path::new(&args[1]), Path::new(&args[2])),
+        Some("mpp-gen") => mpp_gen(&args[1..]),
         _ => {
-            eprintln!("usage: verify binlayout|bindat|bindat-corpus|raw|mpp <media_dir> ...");
+            eprintln!("usage: verify binlayout|bindat|bindat-corpus|raw|mpp|mpp-gen <media_dir> ...");
             std::process::exit(1);
         }
     }
@@ -324,6 +325,59 @@ fn verify_mpp_corpus(media: &Path, corpus: &Path) {
     );
     if std::env::var("MPP_TIMING").map(|v| v == "1").unwrap_or(false) {
         println!("{}", tl2_mikuro_mod_packer_rs::mpp::native::timing_report());
+    }
+}
+
+/// mpp-gen <mod_media> <base_media> <out_dir> [--reconnect 0]
+/// Context built ONCE (mod-over-base overlay: mod_media wins, base_media fallback);
+/// walk mod_media/LAYOUTS, compile every .LAYOUT, write out_dir/<rel>.MPP. Parallel.
+fn mpp_gen(args: &[String]) {
+    let mod_media = PathBuf::from(&args[0]);
+    let base_media = PathBuf::from(&args[1]);
+    let out_dir = PathBuf::from(&args[2]);
+    let t0 = std::time::Instant::now();
+    let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(&mod_media, Some(&base_media));
+    let layouts_root = mod_media.join("LAYOUTS");
+    let mut files = Vec::new();
+    walk(&layouts_root, &mut files);
+    let layouts: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_uppercase().ends_with(".LAYOUT"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let ctx_s = t0.elapsed().as_secs_f64();
+    let t1 = std::time::Instant::now();
+    let (ok, fail): (Vec<_>, Vec<_>) = layouts
+        .par_iter()
+        .map(|lp| {
+            let rel = lp.strip_prefix(&layouts_root).unwrap_or(lp);
+            let rels = rel.to_string_lossy();
+            let out = out_dir.join(format!("{}.MPP", &rels[..rels.len() - ".LAYOUT".len()]));
+            match tl2_mikuro_mod_packer_rs::mpp::compile_mpp(lp, &ctx) {
+                Ok(data) => {
+                    if let Some(d) = out.parent() {
+                        std::fs::create_dir_all(d).ok();
+                    }
+                    std::fs::write(&out, &data).ok();
+                    Ok(())
+                }
+                Err(e) => Err(format!("{}: {e}", rels)),
+            }
+        })
+        .partition(Result::is_ok);
+    println!(
+        "mpp-gen: {} layouts, ctx {:.1}s, compile {:.1}s, ok={} fail={}",
+        layouts.len(),
+        ctx_s,
+        t1.elapsed().as_secs_f64(),
+        ok.len(),
+        fail.len()
+    );
+    for e in fail.iter().filter_map(|r| r.as_ref().err()).take(20) {
+        println!("  FAIL {e}");
     }
 }
 
