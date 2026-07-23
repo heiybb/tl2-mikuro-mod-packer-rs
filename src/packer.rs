@@ -463,6 +463,37 @@ fn filetime_of(md: &std::fs::Metadata) -> u64 {
     }
 }
 
+/// Suffixes EditorGuts strips from a .MOD (editor / tool / intermediate
+/// artifacts). GUTS' pack keep-drop predicate `sub_103F4340` walks a 13-entry
+/// suffix table built at `sub_11D44D40` (@unk_13E51C50): a name ending in any
+/// entry is dropped from the pack list.
+///
+/// Four of the 13 are the compile sources (`.DAT` `.LAYOUT` `.ANIMATION`
+/// `.HIE`) and a fifth is `.LAYOUT` + `.BINDAT`; we do not replicate those
+/// here — GUTS drops the source and carries `<source>.BINDAT`, renaming it back
+/// to the source name at manifest-write, whereas we keep the source name as the
+/// manifest key and pull the compiled bytes through `content_for`. Same output,
+/// mirrored mechanism (verified against a real GUTS `EDITORMOD.MOD`: manifest
+/// holds source names, zero `.BINDAT`/`.BINLAYOUT` names). `.LAYOUT.BINDAT` is
+/// already covered by the `.BINDAT` skip below. That leaves these eight.
+const PACK_EXCLUDE_SUFFIXES: [&str; 8] = [
+    ".CMP",
+    ".THUMBNAIL.PNG",
+    ".XLS",
+    ".XML",
+    ".MAX",
+    ".MPD",
+    ".LNK",
+    ".LOG",
+];
+
+/// True when an UPPER file name is one GUTS would strip from the pack.
+fn is_pack_excluded(name_upper: &str) -> bool {
+    PACK_EXCLUDE_SUFFIXES
+        .iter()
+        .any(|s| name_upper.ends_with(s))
+}
+
 /// (rel_upper_with_MEDIA, manifest_name, type, ftime) in name-interleaved DFS
 /// order, with the PNG→DDS dedup, unioned with in-memory overrides.
 fn collect_media_files(
@@ -500,6 +531,11 @@ fn collect_media_files(
             if nmu.ends_with(".BINDAT") || nmu.ends_with(".BINLAYOUT") {
                 continue;
             }
+            // Editor / tool / intermediate artifacts GUTS strips (sub_103F4340).
+            // Checked before the PNG rule so .THUMBNAIL.PNG is dropped outright.
+            if is_pack_excluded(&nmu) {
+                continue;
+            }
             // PNG→DDS dedup (same dir OR in overrides).
             if nmu.ends_with(".PNG") {
                 let dds_sib = format!("{}.DDS", &nmu[..nmu.len() - 4]);
@@ -522,7 +558,7 @@ fn collect_media_files(
     if let Some(ov) = overrides {
         for key in ov.keys() {
             let ku = key.to_uppercase();
-            if ku.ends_with(".BINDAT") || ku.ends_with(".BINLAYOUT") {
+            if ku.ends_with(".BINDAT") || ku.ends_with(".BINLAYOUT") || is_pack_excluded(&ku) {
                 continue;
             }
             let relu = format!("MEDIA/{ku}");
@@ -1203,4 +1239,74 @@ pub fn tl2_mods_dir() -> PathBuf {
         .join("Runic Games")
         .join("Torchlight 2")
         .join("mods")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_exclude_suffixes() {
+        // GUTS sub_103F4340 blacklist (table built at sub_11D44D40).
+        for n in [
+            "FOO.CMP",
+            "FOO.THUMBNAIL.PNG",
+            "SHEET.XLS",
+            "DATA.XML",
+            "SCENE.MAX",
+            "X.MPD",
+            "SHORTCUT.LNK",
+            "OGRE.LOG",
+        ] {
+            assert!(is_pack_excluded(n), "{n} should be excluded");
+        }
+        // Shipping files must survive — including the .PNG that is not a thumbnail.
+        for n in [
+            "TEX.PNG",
+            "TEX.DDS",
+            "MODEL.MESH",
+            "UNIT.DAT",
+            "TOWN.LAYOUT",
+            "SND.OGG",
+            "M.MATERIAL",
+            "UI.IMAGESET",
+        ] {
+            assert!(!is_pack_excluded(n), "{n} must not be excluded");
+        }
+    }
+
+    #[test]
+    fn collect_media_files_drops_tool_artifacts() {
+        let root = std::env::temp_dir().join(format!("tl2pack_excl_{}", std::process::id()));
+        let media = root.join("MEDIA");
+        let sub = media.join("UNITS");
+        std::fs::create_dir_all(&sub).unwrap();
+        for (name, body) in [
+            ("KEEP.DAT", "x"),
+            ("KEEP.PNG", "x"),
+            ("DROP.XLS", "x"),
+            ("DROP.LOG", "x"),
+            ("DROP.THUMBNAIL.PNG", "x"),
+            ("DROP.MAX", "x"),
+            ("DROP.CMP", "x"),
+            ("DROP.MPD", "x"),
+            ("DROP.LNK", "x"),
+            ("DROP.XML", "x"),
+        ] {
+            std::fs::write(sub.join(name), body).unwrap();
+        }
+
+        let got: Vec<String> = collect_media_files(&media, None)
+            .into_iter()
+            .map(|(_, name, _, _)| name)
+            .collect();
+
+        assert!(got.contains(&"KEEP.DAT".to_string()), "got {got:?}");
+        assert!(got.contains(&"KEEP.PNG".to_string()), "got {got:?}");
+        for dropped in got.iter().filter(|n| n.starts_with("DROP")) {
+            panic!("tool artifact leaked into the pack list: {dropped}");
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
