@@ -337,13 +337,113 @@ pub fn build_header(mod_dir: &Path, gamever: Option<u64>) -> Header {
         download: fields.get("DOWNLOAD_URL").cloned().unwrap_or_default(),
         modid: get_i("MOD_ID") as u64,
         flags: MOD_FLAGS,
-        req_hash: 0, // 0 when no REQUIRED_MODS (all our mods); documented gap otherwise
+        req_hash: req_hash(&reqs),
         reqs,
         dels,
         mhash: 0,
         root: "MEDIA/".to_string(),
         fc: 0,
     }
+}
+
+// ── REQUIRED_MODS hash (header req_hash) ───────────────────────────────────
+
+/// MurmurHash64B — EditorGuts `sub_10285330`, verified instruction by
+/// instruction (m = 0x5BD1E995, r = 24, twin 32-bit lanes, 8 bytes per round,
+/// 3/2/1 tail into h2, four-step avalanche). GUTS declares the seed as a single
+/// dword, so the canonical `h2 = seed >> 32` term is always zero here. The
+/// function returns the full 64-bit value in EDX:EAX, i.e. `(h1 << 32) | h2`.
+fn murmur64b(data: &[u8], seed: u32) -> u64 {
+    const M: u32 = 0x5BD1_E995;
+    const R: u32 = 24;
+
+    let mut h1: u32 = seed ^ (data.len() as u32);
+    let mut h2: u32 = 0;
+
+    let mut d = data;
+    while d.len() >= 8 {
+        let mut k1 = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+        k1 = k1.wrapping_mul(M);
+        k1 ^= k1 >> R;
+        k1 = k1.wrapping_mul(M);
+        h1 = h1.wrapping_mul(M);
+        h1 ^= k1;
+
+        let mut k2 = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
+        k2 = k2.wrapping_mul(M);
+        k2 ^= k2 >> R;
+        k2 = k2.wrapping_mul(M);
+        h2 = h2.wrapping_mul(M);
+        h2 ^= k2;
+
+        d = &d[8..];
+    }
+    if d.len() >= 4 {
+        let mut k1 = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+        k1 = k1.wrapping_mul(M);
+        k1 ^= k1 >> R;
+        k1 = k1.wrapping_mul(M);
+        h1 = h1.wrapping_mul(M);
+        h1 ^= k1;
+        d = &d[4..];
+    }
+    // Tail bytes fall through 3 → 2 → 1, then one multiply (h2 lane only).
+    if !d.is_empty() {
+        if d.len() == 3 {
+            h2 ^= (d[2] as u32) << 16;
+        }
+        if d.len() >= 2 {
+            h2 ^= (d[1] as u32) << 8;
+        }
+        h2 ^= d[0] as u32;
+        h2 = h2.wrapping_mul(M);
+    }
+
+    h1 ^= h2 >> 18;
+    h1 = h1.wrapping_mul(M);
+    h2 ^= h1 >> 22;
+    h2 = h2.wrapping_mul(M);
+    h1 ^= h2 >> 17;
+    h1 = h1.wrapping_mul(M);
+    h2 ^= h1 >> 19;
+    h2 = h2.wrapping_mul(M);
+
+    ((h1 as u64) << 32) | (h2 as u64)
+}
+
+/// Header `req_hash` over REQUIRED_MODS — EditorGuts `sub_103F5500`.
+///
+/// Per entry (the 40-byte record is `guid:u64`, `ver:u16`, `name:wstring@+12`;
+/// the name is not hashed):
+///
+/// ```text
+/// t1  = murmur64b(guid_le, 0x22D0)
+/// t2  = murmur64b(ver_le,  low32(t1))
+/// acc = murmur64b(t2_le,   low32(acc))      // acc seeded 34832 (0x8810)
+/// ```
+///
+/// Chaining feeds only the low dword of each result back as the next seed while
+/// hashing the full 64-bit value — that asymmetry is in the disassembly (the
+/// seed is pushed as one dword; EDX is stored beside EAX and the pair is hashed
+/// as 8 bytes). No REQUIRED_MODS → 0, matching the DLL's early-out.
+///
+/// **Offline limit.** When GUTS resolves a dependency it hashes the *installed*
+/// mod's version and folds in that mod's own `req_hash` recursively. We cannot
+/// see the installed set, so we hash the version declared in MOD.DAT and do not
+/// recurse. The two agree whenever the declared version matches the installed
+/// one and the dependency declares no REQUIRED_MODS of its own — the flat case.
+/// Deeper dependency graphs are not reproducible offline by construction.
+pub fn req_hash(reqs: &[(String, u64, u16)]) -> u64 {
+    if reqs.is_empty() {
+        return 0;
+    }
+    let mut acc: u64 = 34832;
+    for (_name, guid, ver) in reqs {
+        let t1 = murmur64b(&guid.to_le_bytes(), 0x22D0);
+        let t2 = murmur64b(&ver.to_le_bytes(), t1 as u32);
+        acc = murmur64b(&t2.to_le_bytes(), acc as u32);
+    }
+    acc
 }
 
 // ── byte writers ───────────────────────────────────────────────────────────
@@ -1244,6 +1344,53 @@ pub fn tl2_mods_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn murmur64b_matches_reference() {
+        // Vectors from an independently written MurmurHash64B reference
+        // (published algorithm, h2 seeded 0 to match GUTS' dword seed).
+        for (data, seed, want) in [
+            (&b""[..], 0u32, 0x0000_0000_0000_0000u64),
+            (&b"A"[..], 0, 0x1579_D371_5812_5E2A),
+            (&b"AB"[..], 1, 0xF379_0A5B_8A57_176F),
+            (&b"ABC"[..], 0x22D0, 0xFC98_F3DA_7FBF_4574),
+            (&b"ABCD"[..], 0x8810, 0x8242_8989_757C_335E),
+            (&b"ABCDE"[..], 7, 0xB98B_BEF6_4DE9_61A7),
+            (&b"ABCDEFGH"[..], 0x22D0, 0xF2B8_C64C_3166_2B70),
+            (&b"ABCDEFGHI"[..], 0x8810, 0x9B7F_FB8C_BECF_C439),
+            (&[0, 1, 2, 3, 4, 5, 6, 7][..], 0x22D0, 0x8895_E368_A565_7C88),
+        ] {
+            assert_eq!(
+                murmur64b(data, seed),
+                want,
+                "murmur64b({data:?}, {seed:#X})"
+            );
+        }
+    }
+
+    #[test]
+    fn req_hash_chain() {
+        let r = |v: &[(u64, u16)]| -> u64 {
+            let owned: Vec<(String, u64, u16)> =
+                v.iter().map(|(g, ve)| (String::new(), *g, *ve)).collect();
+            req_hash(&owned)
+        };
+        // Empty REQUIRED_MODS → 0, the DLL's early-out (sub_103F5500 line 1).
+        assert_eq!(r(&[]), 0);
+        assert_eq!(r(&[(0x0123_4567_89AB_CDEF, 1)]), 0xA20A_F901_F06F_605A);
+        assert_eq!(
+            r(&[(0x0123_4567_89AB_CDEF, 1), (0xFEDC_BA98_7654_3210, 42)]),
+            0x42E3_B278_9860_8F92
+        );
+        assert_eq!(
+            r(&[
+                (0x1111_1111_1111_1111, 0),
+                (0x2222_2222_2222_2222, 65535),
+                (0x3333_3333_3333_3333, 7)
+            ]),
+            0xD6E6_934F_4CF0_8084
+        );
+    }
 
     #[test]
     fn pack_exclude_suffixes() {
