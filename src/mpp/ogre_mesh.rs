@@ -164,8 +164,18 @@ fn read_geometry(r: &R, mut off: usize, hard_end: usize) -> Res<(Geometry, usize
 
     if let Some(src) = pos_source {
         if let Some(&(stride, raw)) = buffers.get(&src) {
-            let mut positions = Vec::with_capacity(geo.vertex_count);
-            for i in 0..geo.vertex_count {
+            // `vertex_count` is a raw u32 from the file; a corrupt or hostile
+            // mesh can declare a bogus count (up to ~4.29e9). Bound BOTH the
+            // pre-allocation and the loop by what the buffer can actually hold —
+            // otherwise `with_capacity` requests ~100 GB (allocator abort) and
+            // the loop spins billions of no-op iterations, either way bypassing
+            // this reader's "a bad mesh -> Err -> caller skips it" contract. For
+            // a well-formed mesh `vertex_count <= raw.len()/stride`, so the cap
+            // is a no-op and the parsed positions are byte-identical; the inner
+            // bounds check still filters the (leniently short) tail vertex.
+            let max_verts = geo.vertex_count.min(raw.len() / stride.max(1));
+            let mut positions = Vec::with_capacity(max_verts);
+            for i in 0..max_verts {
                 let base = i * stride + pos_offset;
                 if base + 12 <= raw.len() {
                     let x = f32::from_le_bytes(raw[base..base + 4].try_into().unwrap());
@@ -348,4 +358,46 @@ pub fn parse_mesh(data: &[u8]) -> Res<Mesh> {
 pub fn load_mesh_file(path: &std::path::Path) -> Res<Mesh> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     parse_mesh(&data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A malformed M_GEOMETRY body that declares vertex_count = 0xFFFFFFFF but
+    /// ships only two vertices. Before the cap this both requested a ~100 GB
+    /// `Vec` and spun ~4.29e9 loop iterations; now it must return promptly with
+    /// exactly the two parsable vertices.
+    #[test]
+    fn geometry_bogus_vertex_count_is_bounded() {
+        let mut d: Vec<u8> = Vec::new();
+        d.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // vertex_count (bogus)
+        // M_GEOMETRY_VERTEX_DECLARATION chunk (hdr 6 + one element 16 = 22).
+        d.extend_from_slice(&M_GEOMETRY_VERTEX_DECLARATION.to_le_bytes());
+        d.extend_from_slice(&22u32.to_le_bytes());
+        d.extend_from_slice(&M_GEOMETRY_VERTEX_ELEMENT.to_le_bytes());
+        d.extend_from_slice(&16u32.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes()); // source
+        d.extend_from_slice(&0u16.to_le_bytes()); // vtype
+        d.extend_from_slice(&VES_POSITION.to_le_bytes()); // semantic
+        d.extend_from_slice(&0u16.to_le_bytes()); // voffset
+        d.extend_from_slice(&0u16.to_le_bytes()); // index
+        // M_GEOMETRY_VERTEX_BUFFER chunk: bind=0, stride=12, data sub-hdr, then
+        // 24 bytes = two 3xf32 vertices.
+        d.extend_from_slice(&M_GEOMETRY_VERTEX_BUFFER.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes()); // clen (unused in this branch)
+        d.extend_from_slice(&0u16.to_le_bytes()); // bind
+        d.extend_from_slice(&12u16.to_le_bytes()); // stride
+        d.extend_from_slice(&M_GEOMETRY_VERTEX_BUFFER_DATA.to_le_bytes()); // data did
+        d.extend_from_slice(&24u32.to_le_bytes()); // data dlen
+        for k in 0..6u32 {
+            d.extend_from_slice(&(k as f32).to_le_bytes()); // 2 verts x (x,y,z)
+        }
+
+        let r = R { d: &d };
+        let (geo, _cur) = read_geometry(&r, 0, d.len()).expect("parse");
+        assert_eq!(geo.positions.len(), 2, "must bound to the 2 real vertices");
+        assert_eq!(geo.positions[0], [0.0, 1.0, 2.0]);
+        assert_eq!(geo.positions[1], [3.0, 4.0, 5.0]);
+    }
 }

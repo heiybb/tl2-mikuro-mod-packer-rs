@@ -233,6 +233,23 @@ pub struct Header {
     pub fc: u32,
 }
 
+// MOD.DAT regexes — constant patterns, so compile each once for the process
+// rather than on every parse_mod_dat call.
+static MODDAT_FIELD_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"<[^>]+>([A-Za-z0-9_]+)\s*:([^\r\n]*)").unwrap());
+static MODDAT_REQ_BLOCK_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?is)\[REQUIRED_MODS\](.*?)\[/REQUIRED_MODS\]").unwrap());
+static MODDAT_REQ_NAME_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?i)<[^>]+>NAME\s*:([^\r\n]*)").unwrap());
+static MODDAT_REQ_GID_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?i)<[^>]+>(?:MOD_ID|GUID|ID)\s*:\s*(-?\d+)").unwrap());
+static MODDAT_REQ_VER_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?i)<[^>]+>VERSION\s*:\s*(-?\d+)").unwrap());
+static MODDAT_REMOVE_BLOCK_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?is)\[REMOVE_FILES\](.*?)\[/REMOVE_FILES\]").unwrap());
+static MODDAT_REMOVE_ITEM_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"<STRING>[^:]*:([^\r\n]*)").unwrap());
+
 fn parse_mod_dat(mod_dir: &Path) -> (BTreeMap<String, String>, Vec<(String, u64, u16)>, Vec<String>) {
     let path = mod_dir.join("MOD.DAT");
     let mut fields: BTreeMap<String, String> = BTreeMap::new();
@@ -244,27 +261,22 @@ fn parse_mod_dat(mod_dir: &Path) -> (BTreeMap<String, String>, Vec<(String, u64,
     let text = read_mod_dat_text(&path);
 
     // Top-level scalar fields (first occurrence wins; case-insensitive key).
-    let field_re = Regex::new(r"<[^>]+>([A-Za-z0-9_]+)\s*:([^\r\n]*)").unwrap();
-    for c in field_re.captures_iter(&text) {
+    for c in MODDAT_FIELD_RE.captures_iter(&text) {
         let key = c[1].to_uppercase();
         fields.entry(key).or_insert_with(|| c[2].trim().to_string());
     }
 
     // REQUIRED_MODS block.
-    let rm_re = Regex::new(r"(?is)\[REQUIRED_MODS\](.*?)\[/REQUIRED_MODS\]").unwrap();
-    if let Some(rm) = rm_re.captures(&text) {
+    if let Some(rm) = MODDAT_REQ_BLOCK_RE.captures(&text) {
         let body = &rm[1];
-        let nm_re = Regex::new(r"(?i)<[^>]+>NAME\s*:([^\r\n]*)").unwrap();
-        let gid_re = Regex::new(r"(?i)<[^>]+>(?:MOD_ID|GUID|ID)\s*:\s*(-?\d+)").unwrap();
-        let ver_re = Regex::new(r"(?i)<[^>]+>VERSION\s*:\s*(-?\d+)").unwrap();
         for blk in split_before_tag(body) {
-            if let Some(g) = gid_re.captures(blk) {
-                let name = nm_re
+            if let Some(g) = MODDAT_REQ_GID_RE.captures(blk) {
+                let name = MODDAT_REQ_NAME_RE
                     .captures(blk)
                     .map(|c| c[1].trim().to_string())
                     .unwrap_or_default();
                 let gid = g[1].parse::<i64>().unwrap_or(0) as u64;
-                let ver = ver_re
+                let ver = MODDAT_REQ_VER_RE
                     .captures(blk)
                     .and_then(|c| c[1].parse::<i64>().ok())
                     .unwrap_or(0) as u64 as u16;
@@ -274,10 +286,8 @@ fn parse_mod_dat(mod_dir: &Path) -> (BTreeMap<String, String>, Vec<(String, u64,
     }
 
     // REMOVE_FILES block.
-    let rf_re = Regex::new(r"(?is)\[REMOVE_FILES\](.*?)\[/REMOVE_FILES\]").unwrap();
-    if let Some(rf) = rf_re.captures(&text) {
-        let item_re = Regex::new(r"<STRING>[^:]*:([^\r\n]*)").unwrap();
-        for c in item_re.captures_iter(&rf[1]) {
+    if let Some(rf) = MODDAT_REMOVE_BLOCK_RE.captures(&text) {
+        for c in MODDAT_REMOVE_ITEM_RE.captures_iter(&rf[1]) {
             let v = c[1].trim();
             if !v.is_empty() {
                 dels.push(v.to_string());
@@ -759,10 +769,10 @@ fn content_for(rel_upper: &str, media_dir: &Path, overrides: Option<&Overrides>)
     }
     for c in &cands {
         let disk = media_dir.join(c.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if disk.is_file() {
-            if let Ok(data) = std::fs::read(&disk) {
-                return Some(data);
-            }
+        // read() already errors on a missing path or a directory, so try it
+        // directly rather than paying a separate is_file() stat per candidate.
+        if let Ok(data) = std::fs::read(&disk) {
+            return Some(data);
         }
     }
     None
@@ -929,18 +939,42 @@ pub fn pack_mod(
 
     drop(ph);
     let ph = Phase::start("pack: hash+manifest+write");
-    let off_data = w_header(&h, 0, 0).len() as u32;
-    let off_man = off_data + data.len() as u32;
+    use std::io::Write;
+    let header_len = w_header(&h, 0, 0).len();
+    // The .MOD stores off_data / off_man / per-record data offsets as u32. A
+    // data section past 4 GiB would silently wrap them into a corrupt archive.
+    // Real mods are orders of magnitude under this, so the guard never fires —
+    // it just turns an undebuggable bad .MOD into a clear error. off_man
+    // (header + data) is the largest u32 offset, so bounding it covers all.
+    let off_man_usize = header_len
+        .checked_add(data.len())
+        .filter(|&t| t <= u32::MAX as usize)
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "data section too large for the .MOD u32 offset table \
+                 ({} bytes, max {})",
+                header_len as u64 + data.len() as u64,
+                u32::MAX
+            ))
+        })?;
+    let off_data = header_len as u32;
+    let off_man = off_man_usize as u32;
     let mut manifest = w_manifest(&h, &new_dirs);
     let mh = pak_manifest_hash(&manifest);
     manifest[2..6].copy_from_slice(&mh.to_le_bytes());
 
-    let mut out = w_header(&h, off_data, off_man);
-    out.extend_from_slice(&data);
-    out.extend_from_slice(&manifest);
-    std::fs::write(output_path, &out)?;
+    // Stream header ++ data ++ manifest straight to a BufWriter. Concatenating
+    // into one `out` Vec first would hold the whole data section twice (peak
+    // ~2x output size); writing the three parts in order keeps one copy live.
+    let header = w_header(&h, off_data, off_man);
+    let f = std::fs::File::create(output_path)?;
+    let mut w = std::io::BufWriter::new(f);
+    w.write_all(&header)?;
+    w.write_all(&data)?;
+    w.write_all(&manifest)?;
+    w.flush()?;
     drop(ph);
-    Ok(out.len())
+    Ok(header.len() + data.len() + manifest.len())
 }
 
 // ── conversion pipeline ────────────────────────────────────────────────────
@@ -1053,18 +1087,43 @@ pub fn convert_all(
         },
         _ => None,
     };
-    eprintln!("  Converting DAT→BINDAT... ({} files)", dat_jobs.len());
-    let ph = Phase::start("convert: bindat");
-    let bindat_out: Vec<(PathBuf, Result<Vec<u8>, String>)> = dat_jobs
-        .par_iter()
-        .map(|(dp, bp)| {
-            let res = match &corpus_dict {
-                Some(d) => crate::bindat::compile_dat_file_corpus(dp, d),
-                None => compile_dat_file(dp),
-            };
-            (bp.clone(), res.map_err(|e| format!("{}: {e}", dp.display())))
-        })
-        .collect();
+    eprintln!(
+        "  Converting DAT→BINDAT ({}) + LAYOUT→BINLAYOUT ({})...",
+        dat_jobs.len(),
+        layout_jobs.len()
+    );
+    let ph = Phase::start("convert: bindat+binlayout");
+    // Compile the DAT and LAYOUT jobs in one work-stealing wave: rayon::join lets
+    // the two par_iters share the pool, so a lopsided mix (few DAT + many LAYOUT,
+    // or the reverse) still saturates every core instead of draining one kind to
+    // a barrier before the other starts. Both collects stay order-preserving; the
+    // emit order (all BINDAT, then all BINLAYOUT) is unchanged.
+    type CompileOut = Vec<(PathBuf, Result<Vec<u8>, String>)>;
+    let (bindat_out, layout_out): (CompileOut, CompileOut) = rayon::join(
+        || {
+            dat_jobs
+                .par_iter()
+                .map(|(dp, bp)| {
+                    let res = match &corpus_dict {
+                        Some(d) => crate::bindat::compile_dat_file_corpus(dp, d),
+                        None => compile_dat_file(dp),
+                    };
+                    (bp.clone(), res.map_err(|e| format!("{}: {e}", dp.display())))
+                })
+                .collect()
+        },
+        || {
+            layout_jobs
+                .par_iter()
+                .map(|(lp, bp)| {
+                    (
+                        bp.clone(),
+                        compile_layout_file(lp).map_err(|e| format!("{}: {e}", lp.display())),
+                    )
+                })
+                .collect()
+        },
+    );
     for (bp, res) in bindat_out {
         match res {
             Ok(gen) => {
@@ -1075,20 +1134,6 @@ pub fn convert_all(
             Err(e) => results.errors.push(format!("BINDAT {e}")),
         }
     }
-
-    drop(ph);
-    // 2. LAYOUT → BINLAYOUT (parallel).
-    let ph = Phase::start("convert: binlayout");
-    eprintln!("  Converting LAYOUT→BINLAYOUT... ({} files)", layout_jobs.len());
-    let layout_out: Vec<(PathBuf, Result<Vec<u8>, String>)> = layout_jobs
-        .par_iter()
-        .map(|(lp, bp)| {
-            (
-                bp.clone(),
-                compile_layout_file(lp).map_err(|e| format!("{}: {e}", lp.display())),
-            )
-        })
-        .collect();
     for (bp, res) in layout_out {
         match res {
             Ok(gen) => {
