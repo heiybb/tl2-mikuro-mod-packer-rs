@@ -21,6 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+use tl2_mikuro_mod_packer_rs::pak::PakReader;
 use tl2_mikuro_mod_packer_rs::packer::{
     convert_all, pack_mod, read_mod_metadata, tl2_mods_dir, Overrides,
 };
@@ -224,11 +225,39 @@ pub fn run() -> ExitCode {
     }
     println!("Output folder: {}\n", mods_out.display());
 
+    // If any selected mod has custom levels, resolve a base MEDIA directory so
+    // pathing (MPP) can regenerate. Extract it from DATA.PAK once if needed.
+    let any_level = picks.iter().any(|&i| mods[i].has_layouts);
+    let base_media: Option<PathBuf> = if any_level {
+        resolve_base_media(&root, &base)
+    } else {
+        None
+    };
+    if any_level {
+        match &base_media {
+            Some(p) => {
+                std::env::set_var("TL2_MEDIA_DIR", p);
+                println!("Pathing base: {}\n", p.display());
+            }
+            None => println!(
+                "No base game data available — level pathing (.mpp) will be left \
+                 as-is (--mpp none).\n"
+            ),
+        }
+    }
+
     let mut failures = 0;
     for &i in &picks {
         let m = &mods[i];
-        println!("═══ Packing: {} ═══", m.title);
-        match pack_one(m, &mods_out) {
+        // Level mods regenerate pathing when a base is available; content mods
+        // (and level mods with no base) skip MPP.
+        let mpp = if m.has_layouts && base_media.is_some() {
+            "re"
+        } else {
+            "none"
+        };
+        println!("═══ Packing: {}  (mpp={mpp}) ═══", m.title);
+        match pack_one(m, &mods_out, mpp) {
             Ok((path, size)) => {
                 println!("  ✔ {}  ({:.1} MB)\n", path.display(), size as f64 / 1.0e6);
             }
@@ -252,17 +281,16 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// Convert + pack a single mod into `mods_out/<FILE_NAME>.MOD`. Mirrors the
-/// in-memory (non-mutating) path of the CLI, with MPP skipped for now — level
-/// pathing regen (which needs base data) arrives with Phase 2.
-fn pack_one(m: &ModEntry, mods_out: &Path) -> Result<(PathBuf, usize), String> {
+/// Convert + pack a single mod into `mods_out/<FILE_NAME>.MOD`, mirroring the
+/// in-memory (non-mutating) CLI path. `mpp` is "re" for level mods when a base
+/// is available (`TL2_MEDIA_DIR` is set by the caller), else "none".
+fn pack_one(m: &ModEntry, mods_out: &Path, mpp: &str) -> Result<(PathBuf, usize), String> {
     let media_dir = m.dir.join("MEDIA");
     if !media_dir.is_dir() {
         return Err(format!("no MEDIA/ in {}", m.dir.display()));
     }
     let mut ov = Overrides::new();
-    // --mpp none: content mods need no base data; keeps any existing .mpp.
-    let results = convert_all(&media_dir, Some(&mut ov), "none", "auto");
+    let results = convert_all(&media_dir, Some(&mut ov), mpp, "auto");
     for e in results.errors.iter().take(3) {
         eprintln!("    warn: {e}");
     }
@@ -270,6 +298,33 @@ fn pack_one(m: &ModEntry, mods_out: &Path) -> Result<(PathBuf, usize), String> {
     let size = pack_mod(&media_dir, &out_path, Some(&m.dir), Some(&ov))
         .map_err(|e| format!("pack: {e}"))?;
     Ok((out_path, size))
+}
+
+/// Resolve a base MEDIA directory for MPP regeneration. Loose MEDIA is used
+/// directly; a DATA.PAK is decompiled/extracted into a persistent cache next to
+/// the exe on first use (~15 MB, reused thereafter). None = no base available.
+fn resolve_base_media(root: &Path, base: &BaseSource) -> Option<PathBuf> {
+    match base {
+        BaseSource::LooseMedia(p) => Some(p.clone()),
+        BaseSource::DataPak(pak) => {
+            let cache = root.join(".tl2packer_base");
+            if cache.join("LEVELSETS").is_dir() {
+                return Some(cache); // reuse — the base game rarely changes
+            }
+            println!("Extracting base data from DATA.PAK (first run)...");
+            match PakReader::open_pak(pak).and_then(|mut r| r.extract_base(&cache)) {
+                Ok((d, mesh)) => {
+                    println!("  base ready: {d} levelset DATs + {mesh} collision meshes");
+                    Some(cache)
+                }
+                Err(e) => {
+                    eprintln!("  base extract failed: {e}");
+                    None
+                }
+            }
+        }
+        BaseSource::Bundled | BaseSource::None => None, // Bundled arrives in Phase 3
+    }
 }
 
 // ── ratatui selection screen ───────────────────────────────────────────────

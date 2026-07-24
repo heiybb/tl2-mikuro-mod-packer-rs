@@ -111,6 +111,22 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Some("extract-base") if argv.len() >= 3 => {
+            // extract-base <DATA.PAK> <out_dir> — decompile base LEVELSETS DATs +
+            // extract their collision meshes for offline MPP (TL2_MEDIA_DIR).
+            return match tl2_mikuro_mod_packer_rs::pak::PakReader::open_pak(Path::new(&argv[1]))
+                .and_then(|mut r| r.extract_base(Path::new(&argv[2])))
+            {
+                Ok((d, m)) => {
+                    println!("extracted {d} base DATs + {m} collision meshes → {}", argv[2]);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Some("compile-mpp") if argv.len() >= 3 => {
             let mut media = packer::tl2_media_dir();
             let mut fallback: Option<PathBuf> = None;

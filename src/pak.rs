@@ -18,6 +18,7 @@
 //! Powers the interactive packer's targeted base extraction from `DATA.PAK`,
 //! and is the basis for a future unpack-a-`.MOD` feature.
 
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -197,6 +198,76 @@ impl PakReader {
         }
     }
 
+    /// Provision the base data a full mod pack needs into `cache_dir` (used as
+    /// `TL2_MEDIA_DIR`): the compiled base DATs the pipeline reads as TEXT —
+    /// `LEVELSETS/*.DAT` (MPP piece tables + ROOMPIECES.RAW) and `UNITS/*.DAT`
+    /// (UNITDATA.RAW BASEFILE inheritance) — decompiled back to source, plus the
+    /// collision meshes the levelset pieces reference, extracted raw. Returns
+    /// `(dats_written, meshes_written)`.
+    pub fn extract_base(&mut self, cache_dir: &Path) -> Result<(usize, usize), String> {
+        let root = self.manifest.root.clone();
+        // Case-insensitive MEDIA-relative path -> entry, for mesh resolution.
+        let by_rel: HashMap<String, Entry> = self
+            .manifest
+            .files
+            .iter()
+            .map(|e| {
+                let rel = e.path.strip_prefix(&root).unwrap_or(&e.path).to_uppercase();
+                (rel, e.clone())
+            })
+            .collect();
+
+        // Base DATs the RAW/MPP builders resolve against, as TEXT.
+        let dats: Vec<Entry> = self
+            .manifest
+            .files
+            .iter()
+            .filter(|e| {
+                let p = e.path.to_uppercase();
+                p.ends_with(".DAT") && (p.contains("LEVELSETS/") || p.contains("UNITS/"))
+            })
+            .cloned()
+            .collect();
+
+        let mut wanted_meshes: BTreeSet<String> = BTreeSet::new();
+        let mut n_dat = 0;
+        for e in &dats {
+            let bindat = self.read_entry(e)?;
+            let text = crate::bindat_decompile::decompile_bindat(&bindat)?;
+            let dat_bytes = crate::bindat_decompile::to_dat_bytes(&text);
+
+            // Levelset pieces reference collision meshes MPP will load.
+            if e.path.to_uppercase().contains("LEVELSETS/") {
+                let mut pieces = HashMap::new();
+                crate::mpp::dat::parse_dat(&dat_bytes, &mut pieces);
+                for pd in pieces.values() {
+                    for cf in &pd.collision_files {
+                        let up = cf.replace('\\', "/").to_uppercase();
+                        let rel = up.strip_prefix("MEDIA/").unwrap_or(&up).to_string();
+                        if !rel.is_empty() {
+                            wanted_meshes.insert(rel);
+                        }
+                    }
+                }
+            }
+
+            let rel = e.path.strip_prefix(&root).unwrap_or(&e.path);
+            write_cache(cache_dir, rel, &dat_bytes)?;
+            n_dat += 1;
+        }
+
+        let mut n_mesh = 0;
+        for rel in &wanted_meshes {
+            if let Some(e) = by_rel.get(rel) {
+                let data = self.read_entry(e)?;
+                let e_rel = e.path.strip_prefix(&root).unwrap_or(&e.path);
+                write_cache(cache_dir, e_rel, &data)?;
+                n_mesh += 1;
+            }
+        }
+        Ok((n_dat, n_mesh))
+    }
+
     /// Extract every file whose manifest path satisfies `want` into `out_root`,
     /// laying it out under the manifest root (so `MEDIA/UNITS/X.DAT` lands at
     /// `out_root/UNITS/X.DAT`). Returns the number of files written.
@@ -225,6 +296,15 @@ impl PakReader {
         }
         Ok(n)
     }
+}
+
+/// Write `data` to `cache_dir/<media-relative path>`, creating parents.
+fn write_cache(cache_dir: &Path, rel: &str, data: &[u8]) -> Result<(), String> {
+    let dst = cache_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    std::fs::write(&dst, data).map_err(|e| format!("{}: {e}", dst.display()))
 }
 
 #[cfg(test)]
@@ -262,5 +342,42 @@ mod tests {
         if let Ok(disk) = std::fs::read(compiled) {
             assert_eq!(data, disk, "PAK entry == extracted .BINLAYOUT");
         }
+    }
+
+    #[test]
+    fn extract_base_from_real_pak_if_present() {
+        let pak = Path::new(r"E:\Torchlight 2\PAKS\DATA.PAK");
+        if !pak.is_file() {
+            eprintln!("skip: no DATA.PAK");
+            return;
+        }
+        let cache = std::env::temp_dir().join(format!("tl2base_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let mut r = PakReader::open_pak(pak).expect("open");
+        let (dats, meshes) = r.extract_base(&cache).expect("extract");
+        eprintln!("extracted {dats} base DATs + {meshes} collision meshes");
+        assert!(dats > 0 && meshes > 0);
+
+        // The decompiled DATs must be parseable text with pieces.
+        let ls = cache.join("LEVELSETS");
+        assert!(ls.is_dir(), "LEVELSETS written to cache");
+
+        let mut total: u64 = 0;
+        fn du(p: &Path, t: &mut u64) {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    let path = e.path();
+                    if path.is_dir() {
+                        du(&path, t);
+                    } else {
+                        *t += e.metadata().map(|m| m.len()).unwrap_or(0);
+                    }
+                }
+            }
+        }
+        du(&cache, &mut total);
+        eprintln!("base cache footprint: {:.1} MB", total as f64 / 1.0e6);
+
+        std::fs::remove_dir_all(&cache).ok();
     }
 }
