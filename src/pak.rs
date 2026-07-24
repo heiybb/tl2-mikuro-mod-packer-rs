@@ -22,6 +22,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::packer::TYPE_DIR;
 
 /// One file record from a manifest (subdirectory markers are dropped).
@@ -229,42 +231,59 @@ impl PakReader {
             .cloned()
             .collect();
 
-        let mut wanted_meshes: BTreeSet<String> = BTreeSet::new();
-        let mut n_dat = 0;
+        // Read (inflate) the DAT blocks serially — one shared file handle — then
+        // decompile in parallel (the writes below dominate; on Windows, 10k small
+        // file creates + Defender scans are the real cost, so they run parallel).
+        let mut dat_blocks: Vec<(String, bool, Vec<u8>)> = Vec::with_capacity(dats.len());
         for e in &dats {
             let bindat = self.read_entry(e)?;
-            let text = crate::bindat_decompile::decompile_bindat(&bindat)?;
-            let dat_bytes = crate::bindat_decompile::to_dat_bytes(&text);
-
-            // Levelset pieces reference collision meshes MPP will load.
-            if e.path.to_uppercase().contains("LEVELSETS/") {
-                let mut pieces = HashMap::new();
-                crate::mpp::dat::parse_dat(&dat_bytes, &mut pieces);
-                for pd in pieces.values() {
-                    for cf in &pd.collision_files {
-                        let up = cf.replace('\\', "/").to_uppercase();
-                        let rel = up.strip_prefix("MEDIA/").unwrap_or(&up).to_string();
-                        if !rel.is_empty() {
-                            wanted_meshes.insert(rel);
+            let rel = e.path.strip_prefix(&root).unwrap_or(&e.path).to_string();
+            let is_ls = e.path.to_uppercase().contains("LEVELSETS/");
+            dat_blocks.push((rel, is_ls, bindat));
+        }
+        let decompiled: Vec<(String, Vec<u8>, Vec<String>)> = dat_blocks
+            .par_iter()
+            .map(|(rel, is_ls, bindat)| {
+                let text = crate::bindat_decompile::decompile_bindat(bindat)?;
+                let dat_bytes = crate::bindat_decompile::to_dat_bytes(&text);
+                let mut meshes = Vec::new();
+                if *is_ls {
+                    let mut pieces = HashMap::new();
+                    crate::mpp::dat::parse_dat(&dat_bytes, &mut pieces);
+                    for pd in pieces.values() {
+                        for cf in &pd.collision_files {
+                            let up = cf.replace('\\', "/").to_uppercase();
+                            let m = up.strip_prefix("MEDIA/").unwrap_or(&up).to_string();
+                            if !m.is_empty() {
+                                meshes.push(m);
+                            }
                         }
                     }
                 }
-            }
+                Ok::<_, String>((rel.clone(), dat_bytes, meshes))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-            let rel = e.path.strip_prefix(&root).unwrap_or(&e.path);
-            write_cache(cache_dir, rel, &dat_bytes)?;
-            n_dat += 1;
-        }
-
-        let mut n_mesh = 0;
-        for rel in &wanted_meshes {
+        // Read the referenced collision meshes serially (shared handle).
+        let wanted: BTreeSet<String> =
+            decompiled.iter().flat_map(|(_, _, m)| m.iter().cloned()).collect();
+        let mut mesh_files: Vec<(String, Vec<u8>)> = Vec::with_capacity(wanted.len());
+        for rel in &wanted {
             if let Some(e) = by_rel.get(rel) {
                 let data = self.read_entry(e)?;
-                let e_rel = e.path.strip_prefix(&root).unwrap_or(&e.path);
-                write_cache(cache_dir, e_rel, &data)?;
-                n_mesh += 1;
+                let e_rel = e.path.strip_prefix(&root).unwrap_or(&e.path).to_string();
+                mesh_files.push((e_rel, data));
             }
         }
+
+        // One parallel write pass for every file (the I/O-bound bottleneck).
+        let n_dat = decompiled.len();
+        let n_mesh = mesh_files.len();
+        decompiled
+            .par_iter()
+            .map(|(rel, bytes, _)| (rel, bytes))
+            .chain(mesh_files.par_iter().map(|(rel, bytes)| (rel, bytes)))
+            .try_for_each(|(rel, bytes)| write_cache(cache_dir, rel, bytes))?;
         Ok((n_dat, n_mesh))
     }
 

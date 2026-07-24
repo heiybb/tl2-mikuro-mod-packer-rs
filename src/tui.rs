@@ -10,9 +10,13 @@
 //! Binary-only: this module is never part of the library the wasm front-end
 //! reuses via `#[path]`, so its ratatui dependency stays off the wasm target.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -22,9 +26,16 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use ratatui::{DefaultTerminal, Frame};
 
 use tl2_mikuro_mod_packer_rs::pak::PakReader;
-use tl2_mikuro_mod_packer_rs::packer::{
-    convert_all, pack_mod, read_mod_metadata, tl2_mods_dir, Overrides,
-};
+use tl2_mikuro_mod_packer_rs::packer::read_mod_metadata;
+
+/// Shared, worker-appended log rendered live in the Output tab.
+type Log = Arc<Mutex<Vec<String>>>;
+
+fn logln(log: &Log, msg: impl Into<String>) {
+    if let Ok(mut v) = log.lock() {
+        v.push(msg.into());
+    }
+}
 
 /// A packable mod source: a folder with MOD.DAT (and a MEDIA/ tree).
 struct ModEntry {
@@ -40,6 +51,7 @@ struct ModEntry {
 }
 
 /// Where the base game MEDIA can come from, in priority order.
+#[derive(Clone)]
 enum BaseSource {
     /// A loose `MEDIA/` folder next to the exe (already extracted).
     LooseMedia(PathBuf),
@@ -199,139 +211,52 @@ pub fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Selection UI (restores the terminal on the way out).
-    let picks = match select_mods(&mods, &base) {
-        Ok(p) => p,
+    // Interactive app: pick mods, pack them in-app (output streams to the
+    // Output tab, the app stays open on it when done).
+    match run_app(mods, base, root) {
+        Ok(code) => code,
         Err(e) => {
             eprintln!("TUI error: {e}");
-            return ExitCode::FAILURE;
+            ExitCode::FAILURE
         }
-    };
-    if picks.is_empty() {
-        println!("Nothing selected.");
-        return ExitCode::SUCCESS;
-    }
-
-    // Pack each selected mod with the normal console output.
-    let mods_out = tl2_mods_dir();
-    if let Err(e) = std::fs::create_dir_all(&mods_out) {
-        eprintln!("Cannot create output dir {}: {e}", mods_out.display());
-        pause();
-        return ExitCode::FAILURE;
-    }
-    println!("Output folder: {}\n", mods_out.display());
-
-    // If any selected mod has custom levels, resolve a base MEDIA directory so
-    // pathing (MPP) can regenerate. Extract it from DATA.PAK once if needed.
-    let any_level = picks.iter().any(|&i| mods[i].has_layouts);
-    let base_media: Option<PathBuf> = if any_level {
-        resolve_base_media(&root, &base)
-    } else {
-        None
-    };
-    if any_level {
-        match &base_media {
-            Some(p) => {
-                std::env::set_var("TL2_MEDIA_DIR", p);
-                println!("Pathing base: {}\n", p.display());
-            }
-            None => println!(
-                "No base game data available — level pathing (.mpp) will be left \
-                 as-is (--mpp none).\n"
-            ),
-        }
-    }
-
-    let mut failures = 0;
-    for &i in &picks {
-        let m = &mods[i];
-        // Level mods regenerate pathing when a base is available; content mods
-        // (and level mods with no base) skip MPP.
-        let mpp = if m.has_layouts && base_media.is_some() {
-            "re"
-        } else {
-            "none"
-        };
-        println!("═══ Packing: {}  (mpp={mpp}) ═══", m.title);
-        match pack_one(m, &mods_out, mpp) {
-            Ok((path, size)) => {
-                println!("  ✔ {}  ({:.1} MB)\n", path.display(), size as f64 / 1.0e6);
-            }
-            Err(e) => {
-                failures += 1;
-                eprintln!("  x FAILED: {e}\n");
-            }
-        }
-    }
-
-    println!(
-        "Done — {} packed, {} failed.",
-        picks.len() - failures,
-        failures
-    );
-    pause();
-    if failures == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
     }
 }
 
-/// Convert + pack a single mod into `mods_out/<FILE_NAME>.MOD`, mirroring the
-/// in-memory (non-mutating) CLI path. `mpp` is "re" for level mods when a base
-/// is available (`TL2_MEDIA_DIR` is set by the caller), else "none".
-fn pack_one(m: &ModEntry, mods_out: &Path, mpp: &str) -> Result<(PathBuf, usize), String> {
-    let media_dir = m.dir.join("MEDIA");
-    if !media_dir.is_dir() {
-        return Err(format!("no MEDIA/ in {}", m.dir.display()));
-    }
-    let mut ov = Overrides::new();
-    let results = convert_all(&media_dir, Some(&mut ov), mpp, "auto");
-    for e in results.errors.iter().take(3) {
-        eprintln!("    warn: {e}");
-    }
-    let out_path = mods_out.join(format!("{}.MOD", m.file_name));
-    let size = pack_mod(&media_dir, &out_path, Some(&m.dir), Some(&ov))
-        .map_err(|e| format!("pack: {e}"))?;
-    Ok((out_path, size))
-}
-
-/// Resolve a base MEDIA directory for MPP regeneration. Loose MEDIA is used
-/// directly; a DATA.PAK is decompiled/extracted into a persistent cache next to
-/// the exe on first use (~15 MB, reused thereafter). None = no base available.
-fn resolve_base_media(root: &Path, base: &BaseSource) -> Option<PathBuf> {
+/// Resolve a base MEDIA directory for MPP regeneration, logging progress to the
+/// Output tab. Loose MEDIA is used directly; DATA.PAK / the embedded bundle are
+/// unpacked into a persistent cache next to the exe on first use (reused after).
+fn resolve_base_media(root: &Path, base: &BaseSource, log: &Log) -> Option<PathBuf> {
+    let cache = root.join(".tl2packer_base");
     match base {
         BaseSource::LooseMedia(p) => Some(p.clone()),
         BaseSource::DataPak(pak) => {
-            let cache = root.join(".tl2packer_base");
             if cache.join("LEVELSETS").is_dir() {
-                return Some(cache); // reuse — the base game rarely changes
+                return Some(cache);
             }
-            println!("Extracting base data from DATA.PAK (first run)...");
+            logln(log, "Extracting base data from DATA.PAK (first run)…");
             match PakReader::open_pak(pak).and_then(|mut r| r.extract_base(&cache)) {
                 Ok((d, mesh)) => {
-                    println!("  base ready: {d} levelset DATs + {mesh} collision meshes");
+                    logln(log, format!("  base ready: {d} DATs + {mesh} collision meshes"));
                     Some(cache)
                 }
                 Err(e) => {
-                    eprintln!("  base extract failed: {e}");
+                    logln(log, format!("  base extract failed: {e}"));
                     None
                 }
             }
         }
         BaseSource::Bundled => {
-            let cache = root.join(".tl2packer_base");
             if cache.join("LEVELSETS").is_dir() {
                 return Some(cache);
             }
-            println!("Unpacking embedded base data (first run)...");
+            logln(log, "Unpacking embedded base data (first run)…");
             match crate::base_bundle::ensure_extracted(&cache) {
                 Ok(()) => {
-                    println!("  base ready (bundled)");
+                    logln(log, "  base ready (bundled)");
                     Some(cache)
                 }
                 Err(e) => {
-                    eprintln!("  bundled base failed: {e}");
+                    logln(log, format!("  bundled base failed: {e}"));
                     None
                 }
             }
@@ -339,32 +264,140 @@ fn resolve_base_media(root: &Path, base: &BaseSource) -> Option<PathBuf> {
     }
 }
 
-// ── ratatui selection screen ───────────────────────────────────────────────
+/// The packing worker: resolve the base once, then pack each selected mod by
+/// invoking THIS exe in CLI mode with piped output, streaming every line into
+/// the shared log. Running the proven CLI as a child keeps the packing core and
+/// its detailed, timed output exactly as-is.
+fn pack_worker(jobs: Vec<(String, PathBuf, bool)>, base: BaseSource, root: PathBuf, log: Log) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let any_level = jobs.iter().any(|(_, _, lvl)| *lvl);
+    let base_media = if any_level {
+        resolve_base_media(&root, &base, &log)
+    } else {
+        None
+    };
+    if any_level {
+        match &base_media {
+            Some(p) => logln(&log, format!("Pathing base: {}", p.display())),
+            None => logln(&log, "No base data — level pathing left as-is (--mpp none)."),
+        }
+    }
+    logln(&log, "");
 
-struct App<'a> {
-    mods: &'a [ModEntry],
-    base: &'a BaseSource,
-    picked: Vec<bool>,
-    state: ListState,
+    let mut ok = 0;
+    let mut fail = 0;
+    for (title, dir, has_layouts) in &jobs {
+        let mpp = if *has_layouts && base_media.is_some() {
+            "re"
+        } else {
+            "none"
+        };
+        logln(&log, format!("═══════ {title}  (mpp={mpp}) ═══════"));
+        match run_child(&exe, dir, mpp, base_media.as_deref(), &log) {
+            true => ok += 1,
+            false => fail += 1,
+        }
+        logln(&log, "");
+    }
+    logln(&log, format!("── Done: {ok} packed, {fail} failed.  [q] to quit ──"));
 }
 
-impl<'a> App<'a> {
-    fn new(mods: &'a [ModEntry], base: &'a BaseSource) -> Self {
+/// Pack one mod via a child `<exe> <dir> --deploy --mpp <mpp>`, streaming its
+/// stdout+stderr into the log. Returns whether it succeeded.
+fn run_child(exe: &Path, dir: &Path, mpp: &str, base_media: Option<&Path>, log: &Log) -> bool {
+    let mut cmd = Command::new(exe);
+    cmd.arg(dir)
+        .arg("--deploy")
+        .arg("--mpp")
+        .arg(mpp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(b) = base_media {
+        cmd.env("TL2_MEDIA_DIR", b);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console flash
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            logln(log, format!("  spawn failed: {e}"));
+            return false;
+        }
+    };
+    let h_out = child.stdout.take().map(|s| {
+        let l = log.clone();
+        thread::spawn(move || stream_lines(s, &l))
+    });
+    let h_err = child.stderr.take().map(|s| {
+        let l = log.clone();
+        thread::spawn(move || stream_lines(s, &l))
+    });
+    let status = child.wait();
+    if let Some(h) = h_out {
+        let _ = h.join();
+    }
+    if let Some(h) = h_err {
+        let _ = h.join();
+    }
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
+fn stream_lines(r: impl Read, log: &Log) {
+    for line in BufReader::new(r).lines().map_while(Result::ok) {
+        logln(log, line);
+    }
+}
+
+// ── ratatui selection screen ───────────────────────────────────────────────
+
+struct App {
+    mods: Vec<ModEntry>,
+    base: BaseSource,
+    root: PathBuf,
+    picked: Vec<bool>,
+    state: ListState,
+    tab: usize, // 0 = Mods, 1 = Output
+    log: Log,
+    packing: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    follow: bool, // Output tab auto-scroll to tail
+    out_scroll: u16,
+}
+
+impl App {
+    fn new(mods: Vec<ModEntry>, base: BaseSource, root: PathBuf) -> Self {
         let mut state = ListState::default();
         state.select(Some(0));
+        let n = mods.len();
         App {
             mods,
             base,
-            picked: vec![false; mods.len()],
+            root,
+            picked: vec![false; n],
             state,
+            tab: 0,
+            log: Arc::new(Mutex::new(Vec::new())),
+            packing: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+            follow: true,
+            out_scroll: 0,
         }
+    }
+
+    fn is_packing(&self) -> bool {
+        self.packing.load(Ordering::Relaxed)
     }
 
     fn move_by(&mut self, delta: isize) {
         let n = self.mods.len() as isize;
+        if n == 0 {
+            return;
+        }
         let cur = self.state.selected().unwrap_or(0) as isize;
-        let next = (cur + delta).rem_euclid(n);
-        self.state.select(Some(next as usize));
+        self.state.select(Some((cur + delta).rem_euclid(n) as usize));
     }
 
     fn toggle_current(&mut self) {
@@ -394,66 +427,137 @@ impl<'a> App<'a> {
         }
         self.state.selected().into_iter().collect()
     }
+
+    /// Spawn the packing worker and switch to the Output tab.
+    fn start_packing(&mut self) {
+        let picks = self.resolved();
+        if picks.is_empty() {
+            return;
+        }
+        let jobs: Vec<(String, PathBuf, bool)> = picks
+            .iter()
+            .map(|&i| {
+                let m = &self.mods[i];
+                (m.title.clone(), m.dir.clone(), m.has_layouts)
+            })
+            .collect();
+        self.tab = 1;
+        self.follow = true;
+        self.packing.store(true, Ordering::Relaxed);
+        let (base, root, log) = (self.base.clone(), self.root.clone(), self.log.clone());
+        let (packing, finished) = (self.packing.clone(), self.finished.clone());
+        thread::spawn(move || {
+            pack_worker(jobs, base, root, log);
+            packing.store(false, Ordering::Relaxed);
+            finished.store(true, Ordering::Relaxed);
+        });
+    }
 }
 
-/// Run the picker; returns the chosen mod indices (empty = user quit).
-fn select_mods(mods: &[ModEntry], base: &BaseSource) -> std::io::Result<Vec<usize>> {
+fn run_app(mods: Vec<ModEntry>, base: BaseSource, root: PathBuf) -> std::io::Result<ExitCode> {
     let mut terminal = ratatui::init();
-    let mut app = App::new(mods, base);
-    let result = event_loop(&mut terminal, &mut app);
+    let mut app = App::new(mods, base, root);
+    let res = app_loop(&mut terminal, &mut app);
     ratatui::restore();
-    result
+    res
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Vec<usize>> {
+fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<ExitCode> {
     loop {
         terminal.draw(|f| draw(f, app))?;
-        if let Event::Key(k) = event::read()? {
-            if k.kind != KeyEventKind::Press {
-                continue;
+        // Poll (don't block) so the Output tab keeps refreshing while the worker
+        // streams new lines even without keypresses.
+        if !event::poll(Duration::from_millis(120))? {
+            continue;
+        }
+        let Event::Key(k) = event::read()? else {
+            continue;
+        };
+        if k.kind != KeyEventKind::Press {
+            continue;
+        }
+        match k.code {
+            KeyCode::Tab | KeyCode::BackTab => app.tab = 1 - app.tab,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                // Ignore quit while a pack is running (the child would orphan).
+                if !app.is_packing() {
+                    return Ok(ExitCode::SUCCESS);
+                }
             }
-            match k.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(Vec::new()),
+            _ if app.tab == 1 => match k.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.follow = false;
+                    app.out_scroll = app.out_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.follow = false;
+                    app.out_scroll = app.out_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    app.follow = false;
+                    app.out_scroll = app.out_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => app.out_scroll = app.out_scroll.saturating_add(10),
+                KeyCode::End | KeyCode::Char('G') => app.follow = true,
+                _ => {}
+            },
+            _ if !app.is_packing() => match k.code {
                 KeyCode::Up | KeyCode::Char('k') => app.move_by(-1),
                 KeyCode::Down | KeyCode::Char('j') => app.move_by(1),
                 KeyCode::Char(' ') => app.toggle_current(),
                 KeyCode::Char('a') => app.toggle_all(),
-                KeyCode::Enter => return Ok(app.resolved()),
+                KeyCode::Enter => app.start_packing(),
                 _ => {}
-            }
+            },
+            _ => {}
         }
     }
 }
 
 fn draw(f: &mut Frame, app: &App) {
     let areas = Layout::vertical([
-        Constraint::Length(4), // header
-        Constraint::Min(3),    // list
+        Constraint::Length(3), // header / tabs
+        Constraint::Min(3),    // body (mods list or output)
         Constraint::Length(3), // footer
     ])
     .split(f.area());
 
     draw_header(f, areas[0], app);
-    draw_list(f, areas[1], app);
-    draw_footer(f, areas[2]);
+    match app.tab {
+        1 => draw_output(f, areas[1], app),
+        _ => draw_list(f, areas[1], app),
+    }
+    draw_footer(f, areas[2], app);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+    let tab = |on: bool, label: &'static str| {
+        let style = if on {
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Span::styled(format!(" {label} "), style)
+    };
     let picked = app.picked.iter().filter(|&&b| b).count();
-    let lines = vec![
-        Line::from(vec![Span::styled(
-            "Torchlight II Mod Packer",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![
-            Span::styled("base: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.base.label()),
-            Span::styled("   selected: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{picked}/{}", app.mods.len())),
-        ]),
-    ];
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL))
+    let status = if app.is_packing() {
+        "packing…".to_string()
+    } else if app.finished.load(Ordering::Relaxed) {
+        "done".to_string()
+    } else {
+        format!("selected: {picked}/{}", app.mods.len())
+    };
+    let line = Line::from(vec![
+        tab(app.tab == 0, "Mods"),
+        Span::raw(" "),
+        tab(app.tab == 1, "Output"),
+        Span::styled("    base: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(app.base.label()),
+        Span::styled("    ", Style::default()),
+        Span::styled(status, Style::default().fg(Color::Cyan)),
+    ]);
+    let p = Paragraph::new(line)
+        .block(Block::default().borders(Borders::ALL).title(" Torchlight II Mod Packer "))
         .wrap(Wrap { trim: true });
     f.render_widget(p, area);
 }
@@ -501,19 +605,56 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
-    let hint = Line::from(vec![
-        Span::styled("↑↓/jk", Style::default().fg(Color::Cyan)),
-        Span::raw(" move   "),
-        Span::styled("Space", Style::default().fg(Color::Cyan)),
-        Span::raw(" select   "),
-        Span::styled("a", Style::default().fg(Color::Cyan)),
-        Span::raw(" all   "),
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::raw(" pack   "),
-        Span::styled("q", Style::default().fg(Color::Cyan)),
-        Span::raw(" quit"),
-    ]);
+fn draw_output(f: &mut Frame, area: Rect, app: &App) {
+    let log = app.log.lock().map(|v| v.clone()).unwrap_or_default();
+    let total = log.len() as u16;
+    let inner_h = area.height.saturating_sub(2); // minus the border
+    let max_scroll = total.saturating_sub(inner_h);
+    let scroll = if app.follow {
+        max_scroll
+    } else {
+        app.out_scroll.min(max_scroll)
+    };
+    let title = if app.follow {
+        " Output (following) ".to_string()
+    } else {
+        format!(" Output ({}/{}) ", scroll.min(total), total)
+    };
+    let p = Paragraph::new(log.join("\n"))
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((scroll, 0));
+    f.render_widget(p, area);
+}
+
+fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    let key = |s: &'static str| Span::styled(s, Style::default().fg(Color::Cyan));
+    let hint = if app.tab == 1 {
+        Line::from(vec![
+            key("↑↓"),
+            Span::raw(" scroll   "),
+            key("End"),
+            Span::raw(" follow   "),
+            key("Tab"),
+            Span::raw(" mods   "),
+            key("q"),
+            Span::raw(if app.is_packing() { " (packing…)" } else { " quit" }),
+        ])
+    } else {
+        Line::from(vec![
+            key("↑↓"),
+            Span::raw(" move   "),
+            key("Space"),
+            Span::raw(" select   "),
+            key("a"),
+            Span::raw(" all   "),
+            key("Enter"),
+            Span::raw(" pack   "),
+            key("Tab"),
+            Span::raw(" output   "),
+            key("q"),
+            Span::raw(" quit"),
+        ])
+    };
     let p = Paragraph::new(hint).block(Block::default().borders(Borders::ALL));
     f.render_widget(p, area);
 }
@@ -582,21 +723,29 @@ mod tests {
                 has_layouts: true,
             },
         ];
-        let base = BaseSource::Bundled;
-        let mut app = App::new(&mods, &base);
-        app.toggle_current(); // pick Alpha
+        let mut app = App::new(mods, BaseSource::Bundled, PathBuf::from("/x"));
+        app.toggle_current(); // pick Alpha (row under cursor)
 
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        // Mods tab.
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
-
         assert!(text.contains("Torchlight II Mod Packer"), "header");
+        assert!(text.contains("Mods") && text.contains("Output"), "tab bar");
         assert!(text.contains("Alpha Content"), "mod row");
         assert!(text.contains("Beta Level"), "mod row");
         assert!(text.contains("(level mod)"), "level tag");
         assert!(text.contains("[x]"), "selected mark");
         assert!(text.contains("selected: 1/2"), "count");
         assert!(text.contains("Enter"), "footer hint");
+
+        // Output tab renders the (empty) log pane.
+        app.tab = 1;
+        logln(&app.log, "hello from worker");
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let out = buffer_text(terminal.backend().buffer());
+        assert!(out.contains("Output"), "output tab title");
+        assert!(out.contains("hello from worker"), "log line rendered");
     }
 
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {

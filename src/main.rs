@@ -263,6 +263,8 @@ fn main() -> ExitCode {
             println!("      {e}");
         }
     }
+    let convert_secs = t0.elapsed().as_secs_f64();
+    println!("    (convert took {convert_secs:.1}s)");
 
     let output_path = if deploy {
         let mods_dir = tl2_mods_dir();
@@ -276,16 +278,21 @@ fn main() -> ExitCode {
         mod_dir.join(format!("{}_{}.MOD", meta.name, timestamp_local(now)))
     };
 
-    println!("\n[2/3] Packing MOD...");
+    println!("\n[2/3] Packing container...");
+    let t_pack = std::time::Instant::now();
     let mod_size = pack_mod(&work_media, &output_path, Some(&mod_dir), overrides.as_ref())
         .expect("pack .MOD");
+    let pack_secs = t_pack.elapsed().as_secs_f64();
 
     if temp_copy {
         let _ = std::fs::remove_dir_all(&work_media);
     }
-    println!("\n[3/3] Done! ({:.1}s)", t0.elapsed().as_secs_f64());
+    println!(
+        "\n[3/3] Done in {:.1}s  (convert {convert_secs:.1}s + pack {pack_secs:.1}s)",
+        t0.elapsed().as_secs_f64()
+    );
     println!("  Output: {}", output_path.display());
-    println!("  Size:   {mod_size} bytes");
+    println!("  Size:   {:.2} MB  ({mod_size} bytes)", mod_size as f64 / 1.0e6);
     ExitCode::SUCCESS
 }
 

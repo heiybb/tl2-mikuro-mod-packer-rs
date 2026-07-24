@@ -45,7 +45,12 @@ pub fn ensure_extracted(cache_dir: &Path) -> Result<(), String> {
         *o += 2;
         Ok(u16::from_le_bytes([s[0], s[1]]))
     };
+    // Parse the container into (dst, data) pairs first, then write in parallel:
+    // the writes (10k small file creates + Windows Defender scans) dominate, so
+    // overlapping their I/O waits is the win — decompression itself is trivial.
+    use rayon::prelude::*;
     let count = rd_u32(&raw, &mut o)?;
+    let mut jobs: Vec<(std::path::PathBuf, &[u8])> = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let pl = rd_u16(&raw, &mut o)? as usize;
         let pb = raw.get(o..o + pl).ok_or("base bundle: eof path")?;
@@ -54,12 +59,12 @@ pub fn ensure_extracted(cache_dir: &Path) -> Result<(), String> {
         let len = rd_u32(&raw, &mut o)? as usize;
         let data = raw.get(o..o + len).ok_or("base bundle: eof data")?;
         o += len;
-
-        let dst = cache_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        jobs.push((cache_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)), data));
+    }
+    jobs.par_iter().try_for_each(|(dst, data)| {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
-        std::fs::write(&dst, data).map_err(|e| format!("{}: {e}", dst.display()))?;
-    }
-    Ok(())
+        std::fs::write(dst, data).map_err(|e| format!("{}: {e}", dst.display()))
+    })
 }
