@@ -15,6 +15,8 @@ use tl2_mikuro_mod_packer_rs::packer::{
     self, convert_all, pack_mod, read_mod_metadata, tl2_mods_dir, Overrides,
 };
 
+mod tui;
+
 fn usage() -> ExitCode {
     eprintln!("Usage: tl2-mikuro-mod-packer [--in-place|--temp-copy] [--mpp {{re,dll,none}}] [--raw {{auto,none}}] [--deploy] <mod_directory>");
     eprintln!("  (default)    Convert in memory, pack without copying MEDIA (fastest, non-mutating)");
@@ -50,6 +52,19 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // No arguments (double-clicked / dropped into a folder and run) → interactive
+    // TUI. Any argument keeps the existing scriptable CLI untouched. Guard on a
+    // real terminal so a bare run under a pipe / CI prints usage instead of
+    // hanging in the event loop (the diagnostic list dump is still allowed).
+    if argv.is_empty() {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+        if interactive || std::env::var_os("TL2_MODPACK_LIST").is_some() {
+            return tui::run();
+        }
+        return usage();
+    }
 
     // single-file subcommands
     match argv.first().map(String::as_str) {
