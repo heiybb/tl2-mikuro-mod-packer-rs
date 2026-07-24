@@ -15,6 +15,7 @@ use tl2_mikuro_mod_packer_rs::packer::{
     self, convert_all, pack_mod, read_mod_metadata, tl2_mods_dir, Overrides,
 };
 
+mod base_bundle;
 mod tui;
 
 fn usage() -> ExitCode {
@@ -103,6 +104,20 @@ fn main() -> ExitCode {
                 Ok(data) => {
                     std::fs::write(&argv[2], &data).expect("write output");
                     println!("wrote {} bytes", data.len());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some("unpack-base") if argv.len() >= 2 => {
+            // unpack-base <out_dir> — unpack the embedded base bundle (no game
+            // install needed).
+            return match base_bundle::ensure_extracted(Path::new(&argv[1])) {
+                Ok(()) => {
+                    println!("unpacked embedded base bundle → {}", argv[1]);
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

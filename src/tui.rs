@@ -45,10 +45,9 @@ enum BaseSource {
     LooseMedia(PathBuf),
     /// `PAKS/DATA.PAK` next to the exe — targeted extraction (Phase 2).
     DataPak(PathBuf),
-    /// Embedded base bundle (Phase 3), for running with no game present.
+    /// Embedded base bundle — always available (baked into the exe), the base
+    /// tier used when neither loose MEDIA nor DATA.PAK is present.
     Bundled,
-    /// Nothing found — MPP regeneration is unavailable.
-    None,
 }
 
 impl BaseSource {
@@ -56,8 +55,7 @@ impl BaseSource {
         match self {
             BaseSource::LooseMedia(p) => format!("loose MEDIA ({})", p.display()),
             BaseSource::DataPak(p) => format!("DATA.PAK ({})", p.display()),
-            BaseSource::Bundled => "bundled base".to_string(),
-            BaseSource::None => "none — pathing regen unavailable".to_string(),
+            BaseSource::Bundled => "bundled base (embedded)".to_string(),
         }
     }
 }
@@ -84,10 +82,8 @@ fn detect_base(root: &Path) -> BaseSource {
             return BaseSource::DataPak(cand);
         }
     }
-    if cfg!(feature = "bundled-base") {
-        return BaseSource::Bundled;
-    }
-    BaseSource::None
+    // The base bundle is always embedded, so this tier is always available.
+    BaseSource::Bundled
 }
 
 /// A subdir with MOD.DAT is a mod source. Reads its metadata and level status.
@@ -323,7 +319,23 @@ fn resolve_base_media(root: &Path, base: &BaseSource) -> Option<PathBuf> {
                 }
             }
         }
-        BaseSource::Bundled | BaseSource::None => None, // Bundled arrives in Phase 3
+        BaseSource::Bundled => {
+            let cache = root.join(".tl2packer_base");
+            if cache.join("LEVELSETS").is_dir() {
+                return Some(cache);
+            }
+            println!("Unpacking embedded base data (first run)...");
+            match crate::base_bundle::ensure_extracted(&cache) {
+                Ok(()) => {
+                    println!("  base ready (bundled)");
+                    Some(cache)
+                }
+                Err(e) => {
+                    eprintln!("  bundled base failed: {e}");
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -542,8 +554,8 @@ mod tests {
         let alpha = mods.iter().find(|m| m.title == "AlphaContent").unwrap();
         assert!(!alpha.has_layouts, "AlphaContent has no layouts");
 
-        // No loose MEDIA and no DATA.PAK next to the root → base None.
-        assert!(matches!(detect_base(&root), BaseSource::None));
+        // No loose MEDIA and no DATA.PAK → the always-embedded bundle tier.
+        assert!(matches!(detect_base(&root), BaseSource::Bundled));
         // A loose MEDIA folder wins.
         std::fs::create_dir_all(root.join("MEDIA")).unwrap();
         assert!(matches!(detect_base(&root), BaseSource::LooseMedia(_)));
@@ -570,7 +582,7 @@ mod tests {
                 has_layouts: true,
             },
         ];
-        let base = BaseSource::None;
+        let base = BaseSource::Bundled;
         let mut app = App::new(&mods, &base);
         app.toggle_current(); // pick Alpha
 

@@ -31,12 +31,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
 ] }
 
-[features]
-# Embed a base-data bundle so the TUI can pack level mods with no game install
-# present (Phase 3). Off by default: the artifact is only baked in when built
-# with `--features bundled-base` and the bundle file exists.
-bundled-base = []
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
