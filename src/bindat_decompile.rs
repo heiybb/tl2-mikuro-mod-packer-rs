@@ -13,7 +13,7 @@
 //! can regenerate pathing without a loose MEDIA extraction; and as the basis
 //! for unpacking a `.MOD` back to editable sources.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use crate::rghash::rg_hash_str;
@@ -37,6 +37,16 @@ fn name_of(hash: u32) -> String {
         .get(&hash)
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("UNK_{hash:08X}"))
+}
+
+/// `name_of`, also recording the placeholder when the dictionary cannot name
+/// the hash — so an unpack can tell the user WHICH names it could not recover.
+fn name_of_reported(hash: u32, unknown: &mut BTreeSet<String>) -> String {
+    let n = name_of(hash);
+    if REVERSE.get(&hash).is_none() {
+        unknown.insert(n.clone());
+    }
+    n
 }
 
 struct Cursor<'a> {
@@ -92,10 +102,15 @@ fn fmt_f32(x: f32) -> String {
     }
 }
 
-fn emit_node(c: &mut Cursor, strs: &HashMap<u32, String>, out: &mut String) -> Result<(), String> {
+fn emit_node(
+    c: &mut Cursor,
+    strs: &HashMap<u32, String>,
+    out: &mut String,
+    unknown: &mut BTreeSet<String>,
+) -> Result<(), String> {
     let name_hash = c.u32()?;
     let nprops = c.u32()?;
-    let name = name_of(name_hash);
+    let name = name_of_reported(name_hash, unknown);
     out.push('[');
     out.push_str(&name);
     out.push_str("]\r\n");
@@ -119,14 +134,14 @@ fn emit_node(c: &mut Cursor, strs: &HashMap<u32, String>, out: &mut String) -> R
         out.push('<');
         out.push_str(type_tag(tc));
         out.push('>');
-        out.push_str(&name_of(key_hash));
+        out.push_str(&name_of_reported(key_hash, unknown));
         out.push(':');
         out.push_str(&value);
         out.push_str("\r\n");
     }
     let nchildren = c.u32()?;
     for _ in 0..nchildren {
-        emit_node(c, strs, out)?;
+        emit_node(c, strs, out, unknown)?;
     }
     out.push_str("[/");
     out.push_str(&name);
@@ -134,9 +149,19 @@ fn emit_node(c: &mut Cursor, strs: &HashMap<u32, String>, out: &mut String) -> R
     Ok(())
 }
 
+/// A decompiled BINDAT plus the names the dictionary could not reverse.
+pub struct Decompiled {
+    pub text: String,
+    /// The `UNK_<HEX8>` placeholders emitted, if any. They still compile back to
+    /// the ORIGINAL hash (`bindat::raw_hash_token`), so the data survives — but
+    /// the readable name is gone, which is worth telling the user about.
+    pub unknown_names: BTreeSet<String>,
+}
+
 /// Decompile BINDAT bytes into the text `.DAT` they were compiled from
-/// (keys/section names via the embedded dictionary; values verbatim).
-pub fn decompile_bindat(data: &[u8]) -> Result<String, String> {
+/// (keys/section names via the embedded dictionary; values verbatim), reporting
+/// the unrecoverable names.
+pub fn decompile_bindat_reported(data: &[u8]) -> Result<Decompiled, String> {
     let mut c = Cursor { b: data, p: 0 };
     let _ver = c.u32()?; // 2
     let count = c.u32()? as usize;
@@ -149,10 +174,16 @@ pub fn decompile_bindat(data: &[u8]) -> Result<String, String> {
         strs.insert(sid, s);
     }
     let mut out = String::new();
+    let mut unknown = BTreeSet::new();
     while c.p < data.len() {
-        emit_node(&mut c, &strs, &mut out)?;
+        emit_node(&mut c, &strs, &mut out, &mut unknown)?;
     }
-    Ok(out)
+    Ok(Decompiled { text: out, unknown_names: unknown })
+}
+
+/// Decompile BINDAT bytes into the text `.DAT` they were compiled from.
+pub fn decompile_bindat(data: &[u8]) -> Result<String, String> {
+    decompile_bindat_reported(data).map(|d| d.text)
 }
 
 /// UTF-16LE with BOM — the on-disk `.DAT` encoding the parsers expect.
@@ -177,6 +208,45 @@ mod tests {
         assert_eq!(REVERSE.len(), n, "reverse dict has hash collisions");
         for k in ["PIECE", "TILESET", "NAME", "GUID", "COLLISIONFILE", "NEVERBAKE"] {
             assert_eq!(name_of(rg_hash_str(k)), k, "core key {k} must reverse");
+        }
+    }
+
+    /// A name the dictionary cannot reverse comes out as `UNK_<HEX8>`; compiling
+    /// that text back MUST reproduce the original hash byte-for-byte. Before the
+    /// escape existed the compiler re-hashed the placeholder TEXT, silently
+    /// turning `[LEVEL20]` (unpacked as `UNK_…`) into a key the engine never
+    /// looks up — the whole section's data went dark with no error anywhere.
+    #[test]
+    fn unknown_name_roundtrips_hash_exact() {
+        use crate::bindat::{compile_dat_bytes, compile_dat_bytes_reported};
+
+        // LEVEL20 is beyond every numbered family the shipped data uses, so the
+        // embedded dictionary genuinely cannot name it.
+        assert!(!REVERSE.contains_key(&rg_hash_str("LEVEL20")), "test premise: LEVEL20 unknown");
+        let src = "[SKILL]\r\n<STRING>NAME:T\r\n[LEVEL20]\r\n<FLOAT>DAMAGE:3.5\r\n[/LEVEL20]\r\n[/SKILL]\r\n";
+        let original = compile_dat_bytes(&to_dat_bytes(src)).expect("compile");
+
+        let text = decompile_bindat(&original).expect("decompile");
+        assert!(text.contains("UNK_"), "LEVEL20 should decompile to a placeholder: {text}");
+
+        let out = compile_dat_bytes_reported(&to_dat_bytes(&text), None).expect("recompile");
+        assert_eq!(out.bytes, original, "decompile→compile must be byte-identical");
+        assert_eq!(
+            out.raw_hash_names,
+            vec![format!("UNK_{:08X}", rg_hash_str("LEVEL20"))],
+            "the placeholder must be reported so the packer can warn"
+        );
+
+        // A normal name is untouched, and a look-alike that is not exactly
+        // `UNK_` + 8 uppercase hex digits stays an ordinary (hashed) name.
+        let plain = compile_dat_bytes_reported(&to_dat_bytes(src), None).expect("compile");
+        assert!(plain.raw_hash_names.is_empty());
+        for lookalike in ["UNK_1a2b3c4d", "UNK_1A2B3C4", "UNK_1A2B3C4D5"] {
+            assert!(
+                crate::bindat::raw_hash_token(&lookalike.chars().map(|c| c as u32).collect::<Vec<_>>())
+                    .is_none(),
+                "{lookalike} must NOT be treated as a raw-hash escape"
+            );
         }
     }
 

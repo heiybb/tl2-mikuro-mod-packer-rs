@@ -7,6 +7,10 @@
 //!   verify raw <media_dir>          — rebuild the 7 RAW indices and compare
 //!                                     against the shipped MEDIA/*.RAW
 //!   verify mpp <media_dir> <layout...> — compile .mpp offline, print hash
+//!   verify binlayout-roundtrip <media_dir> — decompile every .BINLAYOUT and
+//!                                     re-compile it; must be byte-identical
+//!   verify unpack <mod.MOD>         — unpack a real .MOD, repack the tree, and
+//!                                     compare the two containers entry by entry
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +35,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("binlayout") => verify_binlayout(Path::new(&args[1])),
+        Some("binlayout-roundtrip") => verify_binlayout_roundtrip(Path::new(&args[1])),
+        Some("unpack") => verify_unpack(Path::new(&args[1])),
         Some("bindat") => verify_bindat_selfparse(Path::new(&args[1])),
         Some("bindat-corpus") => verify_bindat_corpus(Path::new(&args[1]), Path::new(&args[2])),
         Some("raw") => verify_raw(Path::new(&args[1])),
@@ -38,7 +44,8 @@ fn main() {
         Some("mpp-corpus") => verify_mpp_corpus(Path::new(&args[1]), Path::new(&args[2])),
         Some("mpp-gen") => mpp_gen(&args[1..]),
         _ => {
-            eprintln!("usage: verify binlayout|bindat|bindat-corpus|raw|mpp|mpp-gen <media_dir> ...");
+            eprintln!("usage: verify binlayout|binlayout-roundtrip|bindat|bindat-corpus|raw|mpp|mpp-gen <media_dir> ...");
+            eprintln!("       verify unpack <mod.MOD>   — unpack, repack, compare entry contents");
             std::process::exit(1);
         }
     }
@@ -111,6 +118,216 @@ fn verify_binlayout(media: &Path) {
     for m in misses {
         println!("  {m}");
     }
+}
+
+/// UNPACK direction: every .BINLAYOUT in the tree must decompile to text that
+/// re-compiles to the SAME bytes. Two passes, because they answer different
+/// questions:
+///   * shipped  — input is the game's own .BINLAYOUT (also exercises bytes our
+///                compiler would not itself produce);
+///   * selfgen  — input is OUR compile of the .LAYOUT source (the fixed point
+///                that unpack→repack of a mod actually relies on).
+fn verify_binlayout_roundtrip(media: &Path) {
+    use tl2_mikuro_mod_packer_rs::binlayout::compile_layout_bytes;
+    use tl2_mikuro_mod_packer_rs::binlayout_decompile::{decompile_binlayout, to_layout_bytes};
+
+    let t0 = std::time::Instant::now();
+    let mut files = Vec::new();
+    walk(media, &mut files);
+    let bins: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_uppercase().ends_with(".BINLAYOUT"))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    // (shipped_ok, shipped_total, selfgen_ok, selfgen_total, message)
+    let results: Vec<(bool, bool, bool, bool, Option<String>)> = bins
+        .par_iter()
+        .map(|bp| {
+            let shipped = std::fs::read(bp).unwrap_or_default();
+            let roundtrip = |orig: &[u8]| -> Result<Vec<u8>, String> {
+                let text = decompile_binlayout(orig)?;
+                compile_layout_bytes(&to_layout_bytes(&text))
+            };
+            let mut msg = None;
+            let ship_ok = match roundtrip(&shipped) {
+                Ok(re) => {
+                    if re != shipped {
+                        msg = Some(format!(
+                            "SHIPPED MISMATCH {} at byte {} ({} vs {} bytes)",
+                            bp.display(),
+                            first_diff(&re, &shipped),
+                            re.len(),
+                            shipped.len()
+                        ));
+                    }
+                    re == shipped
+                }
+                Err(e) => {
+                    msg = Some(format!("SHIPPED ERR {}: {e}", bp.display()));
+                    false
+                }
+            };
+
+            // The .LAYOUT source next to it, compiled by us, is the fixed point.
+            let s = bp.to_string_lossy();
+            let src = PathBuf::from(&s[..s.len() - ".BINLAYOUT".len()]);
+            let (self_ok, self_has) = match compile_layout_bytes(&std::fs::read(&src).unwrap_or_default()) {
+                Ok(ours) => match roundtrip(&ours) {
+                    Ok(re) => {
+                        if re != ours && msg.is_none() {
+                            msg = Some(format!(
+                                "SELFGEN MISMATCH {} at byte {}",
+                                bp.display(),
+                                first_diff(&re, &ours)
+                            ));
+                        }
+                        (re == ours, true)
+                    }
+                    Err(e) => {
+                        if msg.is_none() {
+                            msg = Some(format!("SELFGEN ERR {}: {e}", bp.display()));
+                        }
+                        (false, true)
+                    }
+                },
+                // No parseable source next to it — not a round-trip failure.
+                Err(_) => (false, false),
+            };
+            (ship_ok, true, self_ok, self_has, msg)
+        })
+        .collect();
+
+    let (mut so, mut st, mut fo, mut ft) = (0, 0, 0, 0);
+    let mut misses = Vec::new();
+    for (ship_ok, ship_has, self_ok, self_has, msg) in results {
+        st += ship_has as usize;
+        so += (ship_has && ship_ok) as usize;
+        ft += self_has as usize;
+        fo += (self_has && self_ok) as usize;
+        if let Some(m) = msg {
+            if misses.len() < 30 {
+                misses.push(m);
+            }
+        }
+    }
+    println!("== BINLAYOUT->LAYOUT round-trip (decompile then recompile) ==");
+    println!("shipped input: {so}/{st} byte-exact");
+    println!("our compile:   {fo}/{ft} byte-exact (fixed point)");
+    println!("({:.1}s)", t0.elapsed().as_secs_f64());
+    for m in misses {
+        println!("  {m}");
+    }
+}
+
+/// UNPACK end-to-end: unpack a real `.MOD`, repack the tree, and compare the
+/// two containers ENTRY BY ENTRY on decompressed content. Content equality is
+/// the criterion rather than raw bytes, because a repack legitimately differs in
+/// the header's gameVersion, in the BINDAT string-id scheme when the input came
+/// from GUTS, and in where the generated `.RAW` records sort (see unpack docs).
+fn verify_unpack(mod_path: &Path) {
+    use tl2_mikuro_mod_packer_rs::packer::{convert_all, pack_mod, Overrides};
+    use tl2_mikuro_mod_packer_rs::pak::PakReader;
+    use tl2_mikuro_mod_packer_rs::unpack::{unpack_mod_with_progress, Options};
+
+    let t0 = std::time::Instant::now();
+    let tmp = std::env::temp_dir().join(format!("tl2verify_unpack_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let tree = tmp.join("tree");
+
+    // Pin the gameVersion to the input's, so the header comparison is about the
+    // unpack rather than about which game build this machine has installed.
+    if let Ok(r) = PakReader::open_mod(mod_path) {
+        if let Some(h) = r.header() {
+            std::env::set_var("TL2_MOD_GAMEVER", format!("0x{:016X}", h.gamever));
+        }
+    }
+    let mut last = std::time::Instant::now();
+    let rep = match unpack_mod_with_progress(mod_path, &tree, &Options::default(), |d, t| {
+        if d == t || last.elapsed().as_millis() >= 500 {
+            last = std::time::Instant::now();
+            print!("\r  unpacking {d}/{t}   ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("\nunpack failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "\n  unpacked {} files ({} DAT, {} LAYOUT, {} verbatim)",
+        rep.files, rep.dats, rep.layouts, rep.copied
+    );
+
+    println!("  repacking…");
+    let media = tree.join("MEDIA");
+    let mut ov = Overrides::new();
+    convert_all(&media, Some(&mut ov), "none", "auto");
+    let out = tmp.join("repacked.MOD");
+    if let Err(e) = pack_mod(&media, &out, Some(&tree), Some(&ov)) {
+        println!("repack failed: {e}");
+        std::process::exit(1);
+    }
+
+    // Compare content per entry.
+    let mut a = PakReader::open_mod(mod_path).expect("reopen input");
+    let mut b = PakReader::open_mod(&out).expect("open repacked");
+    let ea: Vec<_> = a.entries().to_vec();
+    let eb: std::collections::HashMap<String, _> = b
+        .entries()
+        .iter()
+        .map(|e| (e.path.to_uppercase(), e.clone()))
+        .collect();
+    let (mut same, mut diff, mut missing) = (0usize, 0usize, 0usize);
+    let mut msgs = Vec::new();
+    for e in &ea {
+        let Some(f) = eb.get(&e.path.to_uppercase()) else {
+            missing += 1;
+            if msgs.len() < 20 {
+                msgs.push(format!("MISSING {}", e.path));
+            }
+            continue;
+        };
+        let ca = a.read_entry(e).unwrap_or_default();
+        let cb = b.read_entry(f).unwrap_or_default();
+        if ca == cb {
+            same += 1;
+        } else {
+            diff += 1;
+            if msgs.len() < 20 {
+                msgs.push(format!(
+                    "CONTENT {} ({} vs {} bytes, first diff @{})",
+                    e.path,
+                    ca.len(),
+                    cb.len(),
+                    first_diff(&ca, &cb)
+                ));
+            }
+        }
+    }
+    std::env::remove_var("TL2_MOD_GAMEVER");
+    println!("== UNPACK → REPACK ({}) ==", mod_path.display());
+    println!("identical content: {same}/{}", ea.len());
+    println!("differing: {diff}   missing: {missing}   ({:.1}s)", t0.elapsed().as_secs_f64());
+    let raw_a = std::fs::read(mod_path).unwrap_or_default();
+    let raw_b = std::fs::read(&out).unwrap_or_default();
+    println!("raw bytes identical: {}", raw_a == raw_b);
+    for m in msgs {
+        println!("  {m}");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Offset of the first differing byte (or the shorter length).
+fn first_diff(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()))
 }
 
 /// Compile every .DAT and just check it parses + serializes (self-check);

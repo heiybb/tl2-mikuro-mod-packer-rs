@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::packer::TYPE_DIR;
+use crate::packer::{Header, TYPE_DIR};
 
 /// One file record from a manifest (subdirectory markers are dropped).
 #[derive(Clone, Debug)]
@@ -37,12 +37,19 @@ pub struct Entry {
     pub off: u32,
     /// Uncompressed size.
     pub size: u32,
+    /// Windows FILETIME of the source file (100 ns ticks since 1601), as the
+    /// packer recorded it — an unpack restores it onto the written file.
+    pub ftime: u64,
 }
 
 /// A parsed manifest: the archive root (`MEDIA/`) plus every file record.
 pub struct Manifest {
     pub root: String,
     pub files: Vec<Entry>,
+    /// The manifest's own validated hash, as stored (`packer::pak_manifest_hash`).
+    pub mhash: u32,
+    /// Record count as stored — files AND directory markers.
+    pub file_count: u32,
 }
 
 fn rd_u16(b: &[u8], o: &mut usize) -> Result<u16, String> {
@@ -55,12 +62,10 @@ fn rd_u32(b: &[u8], o: &mut usize) -> Result<u32, String> {
     *o += 4;
     Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
-fn skip(b: &[u8], o: &mut usize, n: usize) -> Result<(), String> {
-    if *o + n > b.len() {
-        return Err("manifest: eof (skip)".into());
-    }
-    *o += n;
-    Ok(())
+fn rd_u64(b: &[u8], o: &mut usize) -> Result<u64, String> {
+    let s = b.get(*o..*o + 8).ok_or("manifest: eof (u64)")?;
+    *o += 8;
+    Ok(u64::from_le_bytes(s.try_into().unwrap()))
 }
 /// Short string: `u16` UTF-16LE code-unit count, then that many LE units.
 fn rd_ss(b: &[u8], o: &mut usize) -> Result<String, String> {
@@ -74,13 +79,74 @@ fn rd_ss(b: &[u8], o: &mut usize) -> Result<String, String> {
     Ok(String::from_utf16_lossy(&units))
 }
 
+/// Parse a `.MOD` header — the inverse of `packer::w_header`. Returns the same
+/// `Header` shape `packer::build_header` synthesizes from MOD.DAT (so an unpack
+/// can write MOD.DAT straight back out), plus the two section offsets. `mhash`,
+/// `root` and `fc` stay zero here; they belong to the manifest.
+pub fn parse_mod_header(b: &[u8]) -> Result<(Header, u32, u32), String> {
+    let mut o = 0usize;
+    let ver = rd_u16(b, &mut o)?;
+    let modver = rd_u16(b, &mut o)?;
+    let gamever = rd_u64(b, &mut o)?;
+    let off_data = rd_u32(b, &mut o)?;
+    let off_man = rd_u32(b, &mut o)?;
+    let title = rd_ss(b, &mut o)?;
+    let author = rd_ss(b, &mut o)?;
+    let descr = rd_ss(b, &mut o)?;
+    let website = rd_ss(b, &mut o)?;
+    let download = rd_ss(b, &mut o)?;
+    let modid = rd_u64(b, &mut o)?;
+    let flags = rd_u32(b, &mut o)?;
+    let req_hash = rd_u64(b, &mut o)?;
+    let nreqs = rd_u16(b, &mut o)? as usize;
+    let mut reqs = Vec::with_capacity(nreqs);
+    for _ in 0..nreqs {
+        let name = rd_ss(b, &mut o)?;
+        let id = rd_u64(b, &mut o)?;
+        let v = rd_u16(b, &mut o)?;
+        reqs.push((name, id, v));
+    }
+    let ndels = rd_u16(b, &mut o)? as usize;
+    let mut dels = Vec::with_capacity(ndels);
+    for _ in 0..ndels {
+        dels.push(rd_ss(b, &mut o)?);
+    }
+    if o as u32 != off_data {
+        return Err(format!(
+            "mod header: parsed {o} bytes but the data section starts at {off_data}"
+        ));
+    }
+    Ok((
+        Header {
+            ver,
+            modver,
+            gamever,
+            title,
+            author,
+            descr,
+            website,
+            download,
+            modid,
+            flags,
+            req_hash,
+            reqs,
+            dels,
+            mhash: 0,
+            root: String::new(),
+            fc: 0,
+        },
+        off_data,
+        off_man,
+    ))
+}
+
 /// Parse a manifest blob (a `.PAK.MAN`, or the manifest slice of a `.MOD`).
 pub fn parse_manifest(b: &[u8]) -> Result<Manifest, String> {
     let mut o = 0usize;
     let _tag = rd_u16(b, &mut o)?; // 2
-    let _mhash = rd_u32(b, &mut o)?;
+    let mhash = rd_u32(b, &mut o)?;
     let root = rd_ss(b, &mut o)?;
-    let _file_count = rd_u32(b, &mut o)?;
+    let file_count = rd_u32(b, &mut o)?;
     let dir_count = rd_u32(b, &mut o)?;
 
     let mut files = Vec::new();
@@ -94,7 +160,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<Manifest, String> {
             let name = rd_ss(b, &mut o)?;
             let off = rd_u32(b, &mut o)?;
             let size = rd_u32(b, &mut o)?;
-            skip(b, &mut o, 8)?; // ftime u64
+            let ftime = rd_u64(b, &mut o)?;
             if typ == TYPE_DIR {
                 continue; // subdirectory marker, not a file
             }
@@ -103,10 +169,11 @@ pub fn parse_manifest(b: &[u8]) -> Result<Manifest, String> {
                 typ,
                 off,
                 size,
+                ftime,
             });
         }
     }
-    Ok(Manifest { root, files })
+    Ok(Manifest { root, files, mhash, file_count })
 }
 
 /// An open archive: the data file plus its parsed manifest.
@@ -116,6 +183,8 @@ pub struct PakReader {
     /// `off_data` for a `.MOD`).
     data_base: u64,
     manifest: Manifest,
+    /// The mod header — `Some` only for a `.MOD` (a `.PAK` has none).
+    header: Option<Header>,
     decomp: libdeflater::Decompressor,
 }
 
@@ -134,6 +203,7 @@ impl PakReader {
             file,
             data_base: 0,
             manifest,
+            header: None,
             decomp: libdeflater::Decompressor::new(),
         })
     }
@@ -143,25 +213,51 @@ impl PakReader {
         let mut file = std::fs::File::open(mod_path)
             .map_err(|e| format!("{}: {e}", mod_path.display()))?;
         // Header prefix: ver(2) modver(2) gamever(8) off_data(4) off_man(4).
+        // off_data is where the header ends, so it also sizes the header read.
         let mut head = [0u8; 20];
         file.read_exact(&mut head)
             .map_err(|e| format!("{}: short header: {e}", mod_path.display()))?;
         let off_data = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as u64;
         let off_man = u32::from_le_bytes([head[16], head[17], head[18], head[19]]) as u64;
+        if off_data < 20 || off_man < off_data {
+            return Err(format!(
+                "{}: implausible section offsets (data {off_data}, manifest {off_man})",
+                mod_path.display()
+            ));
+        }
+        file.rewind().map_err(|e| e.to_string())?;
+        let mut head_bytes = vec![0u8; off_data as usize];
+        file.read_exact(&mut head_bytes)
+            .map_err(|e| format!("{}: truncated header: {e}", mod_path.display()))?;
+        let (header, _, _) = parse_mod_header(&head_bytes)?;
+
         file.seek(SeekFrom::Start(off_man)).map_err(|e| e.to_string())?;
         let mut man_bytes = Vec::new();
         file.read_to_end(&mut man_bytes).map_err(|e| e.to_string())?;
-        let manifest = parse_manifest(&man_bytes)?;
+        let mut manifest = parse_manifest(&man_bytes)?;
+        // Carry the manifest-side header fields back onto the header, so it is
+        // the same shape the writer consumed.
+        let mut header = header;
+        header.root = manifest.root.clone();
+        header.mhash = manifest.mhash;
+        header.fc = manifest.file_count;
+        manifest.root = header.root.clone();
         Ok(Self {
             file,
             data_base: off_data,
             manifest,
+            header: Some(header),
             decomp: libdeflater::Decompressor::new(),
         })
     }
 
     pub fn root(&self) -> &str {
         &self.manifest.root
+    }
+
+    /// The parsed `.MOD` header (`None` for a `DATA.PAK`, which has none).
+    pub fn header(&self) -> Option<&Header> {
+        self.header.as_ref()
     }
 
     pub fn entries(&self) -> &[Entry] {

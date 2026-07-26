@@ -20,13 +20,33 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use tl2_mikuro_mod_packer_rs::pak::PakReader;
 use tl2_mikuro_mod_packer_rs::packer::read_mod_metadata;
+
+/// Emberworks palette (余烬工坊) mapped to truecolor terminal colors — the same
+/// tokens the web site uses, so the packer reads as the same brand. Semantics:
+/// ember = primary/new, gold = meta/in-progress, set-green = ok/done,
+/// magic-blue = tagged/level, flame = warning, muted/faint = secondary text.
+mod theme {
+    use ratatui::style::Color;
+    pub const BG: Color = Color::Rgb(0x10, 0x0E, 0x0B); // 炉底黑, frame
+    pub const PANEL: Color = Color::Rgb(0x19, 0x14, 0x10); // panel/card
+    pub const LINE: Color = Color::Rgb(0x2C, 0x24, 0x1B); // border
+    pub const LINE_HI: Color = Color::Rgb(0x45, 0x37, 0x24); // strong border / selection
+    pub const TEXT: Color = Color::Rgb(0xD9, 0xCD, 0xB6);
+    pub const MUTED: Color = Color::Rgb(0x94, 0x85, 0x6D);
+    pub const FAINT: Color = Color::Rgb(0x67, 0x5B, 0x48);
+    pub const EMBER: Color = Color::Rgb(0xFF, 0x9A, 0x3C); // 余烬橙, primary accent
+    pub const EMBER_HI: Color = Color::Rgb(0xFF, 0xC2, 0x6B); // hover / selected text
+    pub const GOLD: Color = Color::Rgb(0xD8, 0xB2, 0x6A); // meta / in-progress
+    pub const MAGIC: Color = Color::Rgb(0x6F, 0xA8, 0xFF); // tagged / level mod
+    pub const SET: Color = Color::Rgb(0x7C, 0xC9, 0x6E); // ok / done / selected mark
+}
 
 /// Shared, worker-appended log rendered live in the Output tab.
 type Log = Arc<Mutex<Vec<String>>>;
@@ -37,17 +57,28 @@ fn logln(log: &Log, msg: impl Into<String>) {
     }
 }
 
-/// A packable mod source: a folder with MOD.DAT (and a MEDIA/ tree).
+/// What the picker will do with a row.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Action {
+    /// A mod SOURCE folder (MOD.DAT + MEDIA/) → pack it into a `.MOD`.
+    Pack,
+    /// A built `.MOD` file → unpack it back into an editable source folder.
+    Unpack,
+}
+
+/// One row of the picker: a mod source to pack, or a `.MOD` file to unpack.
 struct ModEntry {
-    /// Human title (MOD.DAT DISPLAYNAME/MOD_TITLE, else folder name).
+    /// Human title (MOD.DAT DISPLAYNAME/MOD_TITLE, else folder name; for a
+    /// `.MOD` file, the title from its header).
     title: String,
     /// Output base name (MOD.DAT MOD_FILE_NAME, else folder name).
     file_name: String,
-    /// The mod source directory (holds MOD.DAT + MEDIA/).
+    /// The mod source directory (holds MOD.DAT + MEDIA/), or the `.MOD` file.
     dir: PathBuf,
     /// True when MEDIA/LAYOUTS holds at least one *.LAYOUT — a level mod whose
     /// pathing (MPP) would want base collision geometry to regenerate.
     has_layouts: bool,
+    action: Action,
 }
 
 /// Where the base game MEDIA can come from, in priority order.
@@ -112,6 +143,25 @@ fn mod_entry_for(dir: &Path) -> Option<ModEntry> {
         file_name: meta.name,
         dir: dir.to_path_buf(),
         has_layouts,
+        action: Action::Pack,
+    })
+}
+
+/// A built `.MOD` file the picker can unpack. The title comes from the
+/// container header, so the row reads the same as the folder it came from.
+fn mod_file_entry_for(path: &Path) -> Option<ModEntry> {
+    let stem = path.file_stem()?.to_string_lossy().to_string();
+    let title = PakReader::open_mod(path)
+        .ok()
+        .and_then(|r| r.header().map(|h| h.title.clone()))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| stem.clone());
+    Some(ModEntry {
+        title,
+        file_name: stem,
+        dir: path.to_path_buf(),
+        has_layouts: false,
+        action: Action::Unpack,
     })
 }
 
@@ -138,9 +188,10 @@ fn has_layout_file(dir: &Path) -> bool {
     false
 }
 
-/// Discover packable mods under `root`: its immediate subdirs (the "dropped
-/// into the challenger-continent folder" case) plus `root/mods/*` (the "dropped
-/// into the game folder" case). Deduped by path, sorted by title.
+/// Discover work under `root`: its immediate subdirs (the "dropped into the
+/// challenger-continent folder" case) plus `root/mods/*` (the "dropped into the
+/// game folder" case). A subdir with MOD.DAT is a source to PACK; a `.MOD` file
+/// is a container to UNPACK. Deduped by path, packs first, then by title.
 fn discover_mods(root: &Path) -> Vec<ModEntry> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
@@ -148,22 +199,33 @@ fn discover_mods(root: &Path) -> Vec<ModEntry> {
         if let Ok(rd) = std::fs::read_dir(base) {
             for e in rd.flatten() {
                 let p = e.path();
-                if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
                 let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
                 if !seen.insert(key) {
                     continue;
                 }
-                if let Some(m) = mod_entry_for(&p) {
-                    out.push(m);
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    if let Some(m) = mod_entry_for(&p) {
+                        out.push(m);
+                    }
+                } else if p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("MOD"))
+                    .unwrap_or(false)
+                {
+                    if let Some(m) = mod_file_entry_for(&p) {
+                        out.push(m);
+                    }
                 }
             }
         }
     };
     scan(root);
     scan(&root.join("mods"));
-    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    out.sort_by(|a, b| {
+        (a.action == Action::Unpack, a.title.to_lowercase())
+            .cmp(&(b.action == Action::Unpack, b.title.to_lowercase()))
+    });
     out
 }
 
@@ -188,24 +250,32 @@ pub fn run() -> ExitCode {
         println!("base: {}", base.label());
         println!("mods: {}", mods.len());
         for m in &mods {
-            println!(
-                "  - {}  [out={}.MOD]  {}",
-                m.title,
-                m.file_name,
-                if m.has_layouts { "level" } else { "content" }
-            );
+            match m.action {
+                Action::Pack => println!(
+                    "  - pack   {}  [out={}.MOD]  {}",
+                    m.title,
+                    m.file_name,
+                    if m.has_layouts { "level" } else { "content" }
+                ),
+                Action::Unpack => println!(
+                    "  - unpack {}  [src={}]",
+                    m.title,
+                    m.dir.display()
+                ),
+            }
         }
         return ExitCode::SUCCESS;
     }
 
     if mods.is_empty() {
-        println!("Torchlight II Mod Packer");
+        println!("Mikuro Torchlight II Mod Packer");
         println!();
-        println!("No packable mods found under:");
+        println!("Nothing to pack or unpack under:");
         println!("  {}", root.display());
         println!("  {}", root.join("mods").display());
         println!();
-        println!("A mod source is a folder containing MOD.DAT (and a MEDIA/ tree).");
+        println!("A mod source is a folder containing MOD.DAT (and a MEDIA/ tree);");
+        println!("a built .MOD file next to this exe can be unpacked back into one.");
         println!("Put this exe in your game folder, or in a folder of mod sources.");
         pause();
         return ExitCode::FAILURE;
@@ -268,9 +338,11 @@ fn resolve_base_media(root: &Path, base: &BaseSource, log: &Log) -> Option<PathB
 /// invoking THIS exe in CLI mode with piped output, streaming every line into
 /// the shared log. Running the proven CLI as a child keeps the packing core and
 /// its detailed, timed output exactly as-is.
-fn pack_worker(jobs: Vec<(String, PathBuf, bool)>, base: BaseSource, root: PathBuf, log: Log) {
+fn pack_worker(jobs: Vec<Job>, base: BaseSource, root: PathBuf, log: Log) {
     let exe = std::env::current_exe().unwrap_or_default();
-    let any_level = jobs.iter().any(|(_, _, lvl)| *lvl);
+    let any_level = jobs
+        .iter()
+        .any(|j| j.action == Action::Pack && j.has_layouts);
     let base_media = if any_level {
         resolve_base_media(&root, &base, &log)
     } else {
@@ -284,34 +356,56 @@ fn pack_worker(jobs: Vec<(String, PathBuf, bool)>, base: BaseSource, root: PathB
     }
     logln(&log, "");
 
-    let mut ok = 0;
-    let mut fail = 0;
-    for (title, dir, has_layouts) in &jobs {
-        let mpp = if *has_layouts && base_media.is_some() {
-            "re"
-        } else {
-            "none"
+    let (mut ok, mut fail, mut unpacked) = (0, 0, 0);
+    for j in &jobs {
+        let args: Vec<PathBuf> = match j.action {
+            Action::Pack => {
+                let mpp = if j.has_layouts && base_media.is_some() { "re" } else { "none" };
+                logln(&log, format!("═══════ pack {}  (mpp={mpp}) ═══════", j.title));
+                vec![
+                    j.path.clone(),
+                    PathBuf::from("--deploy"),
+                    PathBuf::from("--mpp"),
+                    PathBuf::from(mpp),
+                ]
+            }
+            Action::Unpack => {
+                // Unpack next to the .MOD, under `unpacked/<name>/` — never on
+                // top of an existing source folder.
+                let dst = root.join("unpacked").join(&j.file_name);
+                logln(&log, format!("═══════ unpack {} → {} ═══════", j.title, dst.display()));
+                vec![PathBuf::from("unpack"), j.path.clone(), dst]
+            }
         };
-        logln(&log, format!("═══════ {title}  (mpp={mpp}) ═══════"));
-        match run_child(&exe, dir, mpp, base_media.as_deref(), &log) {
-            true => ok += 1,
-            false => fail += 1,
+        let good = run_child(&exe, &args, base_media.as_deref(), &log);
+        match (j.action, good) {
+            (Action::Pack, true) => ok += 1,
+            (Action::Unpack, true) => unpacked += 1,
+            (_, false) => fail += 1,
         }
         logln(&log, "");
     }
-    logln(&log, format!("── Done: {ok} packed, {fail} failed.  [q] to quit ──"));
+    logln(
+        &log,
+        format!("── Done: {ok} packed, {unpacked} unpacked, {fail} failed.  [q] to quit ──"),
+    );
 }
 
-/// Pack one mod via a child `<exe> <dir> --deploy --mpp <mpp>`, streaming its
-/// stdout+stderr into the log. Returns whether it succeeded.
-fn run_child(exe: &Path, dir: &Path, mpp: &str, base_media: Option<&Path>, log: &Log) -> bool {
+/// One selected row, resolved for the worker.
+struct Job {
+    title: String,
+    file_name: String,
+    /// Source folder (pack) or `.MOD` file (unpack).
+    path: PathBuf,
+    has_layouts: bool,
+    action: Action,
+}
+
+/// Run one child `<exe> <args…>`, streaming its stdout+stderr into the log.
+/// Returns whether it succeeded.
+fn run_child(exe: &Path, args: &[PathBuf], base_media: Option<&Path>, log: &Log) -> bool {
     let mut cmd = Command::new(exe);
-    cmd.arg(dir)
-        .arg("--deploy")
-        .arg("--mpp")
-        .arg(mpp)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(b) = base_media {
         cmd.env("TL2_MEDIA_DIR", b);
     }
@@ -434,11 +528,17 @@ impl App {
         if picks.is_empty() {
             return;
         }
-        let jobs: Vec<(String, PathBuf, bool)> = picks
+        let jobs: Vec<Job> = picks
             .iter()
             .map(|&i| {
                 let m = &self.mods[i];
-                (m.title.clone(), m.dir.clone(), m.has_layouts)
+                Job {
+                    title: m.title.clone(),
+                    file_name: m.file_name.clone(),
+                    path: m.dir.clone(),
+                    has_layouts: m.has_layouts,
+                    action: m.action,
+                }
             })
             .collect();
         self.tab = 1;
@@ -515,11 +615,19 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
 }
 
 fn draw(f: &mut Frame, app: &App) {
+    // Furnace-black base under everything; panels paint their own darker fill.
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::BG)),
+        f.area(),
+    );
+    // 1-cell furnace-black inset so the panels sit inside a thin brand frame
+    // (editorial whitespace) instead of bleeding to the terminal edge.
     let areas = Layout::vertical([
         Constraint::Length(3), // header / tabs
         Constraint::Min(3),    // body (mods list or output)
         Constraint::Length(3), // footer
     ])
+    .margin(1)
     .split(f.area());
 
     draw_header(f, areas[0], app);
@@ -533,31 +641,41 @@ fn draw(f: &mut Frame, app: &App) {
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let tab = |on: bool, label: &'static str| {
         let style = if on {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme::BG).bg(theme::EMBER).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme::FAINT)
         };
         Span::styled(format!(" {label} "), style)
     };
     let picked = app.picked.iter().filter(|&&b| b).count();
-    let status = if app.is_packing() {
-        "packing…".to_string()
+    let (status, status_style) = if app.is_packing() {
+        ("packing…".to_string(), Style::default().fg(theme::GOLD).add_modifier(Modifier::BOLD))
     } else if app.finished.load(Ordering::Relaxed) {
-        "done".to_string()
+        ("done".to_string(), Style::default().fg(theme::SET).add_modifier(Modifier::BOLD))
     } else {
-        format!("selected: {picked}/{}", app.mods.len())
+        (format!("selected: {picked}/{}", app.mods.len()), Style::default().fg(theme::EMBER))
     };
     let line = Line::from(vec![
         tab(app.tab == 0, "Mods"),
         Span::raw(" "),
         tab(app.tab == 1, "Output"),
-        Span::styled("    base: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(app.base.label()),
-        Span::styled("    ", Style::default()),
-        Span::styled(status, Style::default().fg(Color::Cyan)),
+        Span::styled("    base ", Style::default().fg(theme::MUTED)),
+        Span::styled(app.base.label(), Style::default().fg(theme::GOLD)),
+        Span::raw("    "),
+        Span::styled(status, status_style),
     ]);
     let p = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).title(" Torchlight II Mod Packer "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::LINE_HI))
+                .style(Style::default().bg(theme::PANEL))
+                .title(Span::styled(
+                    " Mikuro Torchlight II Mod Packer ",
+                    Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .style(Style::default().fg(theme::TEXT).bg(theme::PANEL))
         .wrap(Wrap { trim: true });
     f.render_widget(p, area);
 }
@@ -569,19 +687,30 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(i, m)| {
             let mark = if app.picked[i] { "[x] " } else { "[ ] " };
-            let tag = if m.has_layouts {
-                Span::styled("  (level mod)", Style::default().fg(Color::Magenta))
-            } else {
-                Span::styled("  (content mod)", Style::default().fg(Color::DarkGray))
+            let tag = match (m.action, m.has_layouts) {
+                (Action::Unpack, _) => {
+                    Span::styled("  (.MOD → unpack)", Style::default().fg(theme::GOLD))
+                }
+                (Action::Pack, true) => {
+                    Span::styled("  (level mod)", Style::default().fg(theme::MAGIC))
+                }
+                (Action::Pack, false) => {
+                    Span::styled("  (content mod)", Style::default().fg(theme::FAINT))
+                }
             };
             let mark_style = if app.picked[i] {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::SET).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme::FAINT)
+            };
+            let title_style = if app.picked[i] {
+                Style::default().fg(theme::TEXT)
+            } else {
+                Style::default().fg(theme::MUTED)
             };
             ListItem::new(Line::from(vec![
                 Span::styled(mark, mark_style),
-                Span::raw(m.title.clone()),
+                Span::styled(m.title.clone(), title_style),
                 tag,
             ]))
         })
@@ -591,12 +720,17 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" mods (Space to select, Enter to pack) "),
+                .border_style(Style::default().fg(theme::LINE))
+                .style(Style::default().bg(theme::PANEL))
+                .title(Span::styled(
+                    " mods · Space select · Enter pack/unpack ",
+                    Style::default().fg(theme::MUTED),
+                )),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
+                .bg(theme::LINE_HI)
+                .fg(theme::EMBER_HI)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
@@ -615,47 +749,67 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
     } else {
         app.out_scroll.min(max_scroll)
     };
-    let title = if app.follow {
-        " Output (following) ".to_string()
+    let (title, tstyle) = if app.follow {
+        (" Output · following ".to_string(), Style::default().fg(theme::SET))
     } else {
-        format!(" Output ({}/{}) ", scroll.min(total), total)
+        (
+            format!(" Output · {}/{} ", scroll.min(total), total),
+            Style::default().fg(theme::MUTED),
+        )
     };
     let p = Paragraph::new(log.join("\n"))
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::LINE))
+                .style(Style::default().bg(theme::PANEL))
+                .title(Span::styled(title, tstyle)),
+        )
+        .style(Style::default().fg(theme::TEXT).bg(theme::PANEL))
         .scroll((scroll, 0));
     f.render_widget(p, area);
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let key = |s: &'static str| Span::styled(s, Style::default().fg(Color::Cyan));
+    let key = |s: &'static str| {
+        Span::styled(s, Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD))
+    };
+    let sep = |s: &'static str| Span::styled(s, Style::default().fg(theme::MUTED));
     let hint = if app.tab == 1 {
         Line::from(vec![
             key("↑↓"),
-            Span::raw(" scroll   "),
+            sep(" scroll   "),
             key("End"),
-            Span::raw(" follow   "),
+            sep(" follow   "),
             key("Tab"),
-            Span::raw(" mods   "),
+            sep(" mods   "),
             key("q"),
-            Span::raw(if app.is_packing() { " (packing…)" } else { " quit" }),
+            sep(if app.is_packing() { " (packing…)" } else { " quit" }),
         ])
     } else {
         Line::from(vec![
             key("↑↓"),
-            Span::raw(" move   "),
+            sep(" move   "),
             key("Space"),
-            Span::raw(" select   "),
+            sep(" select   "),
             key("a"),
-            Span::raw(" all   "),
+            sep(" all   "),
             key("Enter"),
-            Span::raw(" pack   "),
+            sep(" run   "),
             key("Tab"),
-            Span::raw(" output   "),
+            sep(" output   "),
             key("q"),
-            Span::raw(" quit"),
+            sep(" quit"),
         ])
     };
-    let p = Paragraph::new(hint).block(Block::default().borders(Borders::ALL));
+    let p = Paragraph::new(hint)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::LINE))
+                .style(Style::default().bg(theme::PANEL)),
+        )
+        .style(Style::default().bg(theme::PANEL));
     f.render_widget(p, area);
 }
 
@@ -687,9 +841,21 @@ mod tests {
         // A plain folder with no MOD.DAT must be ignored.
         std::fs::create_dir_all(root.join("NotAMod").join("stuff")).unwrap();
 
+        // A built .MOD is discovered too — as an UNPACK row, listed after the
+        // pack sources. (This one is not a readable container, so the title
+        // falls back to the file stem; discovery must still offer it.)
+        std::fs::write(root.join("DeltaBuilt.MOD"), b"not really a container").unwrap();
+
         let mods = discover_mods(&root);
         let titles: Vec<&str> = mods.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(titles, vec!["AlphaContent", "BetaLevel", "GammaNested"]);
+        assert_eq!(
+            titles,
+            vec!["AlphaContent", "BetaLevel", "GammaNested", "DeltaBuilt"],
+            "packs first (by title), then unpacks"
+        );
+        let delta = mods.iter().find(|m| m.title == "DeltaBuilt").unwrap();
+        assert_eq!(delta.action, Action::Unpack);
+        assert!(mods.iter().filter(|m| m.action == Action::Pack).count() == 3);
         let beta = mods.iter().find(|m| m.title == "BetaLevel").unwrap();
         assert!(beta.has_layouts, "BetaLevel has a *.LAYOUT");
         let alpha = mods.iter().find(|m| m.title == "AlphaContent").unwrap();
@@ -715,12 +881,21 @@ mod tests {
                 file_name: "ALPHA".into(),
                 dir: PathBuf::from("/x/Alpha"),
                 has_layouts: false,
+                action: Action::Pack,
             },
             ModEntry {
                 title: "Beta Level".into(),
                 file_name: "BETA".into(),
                 dir: PathBuf::from("/x/Beta"),
                 has_layouts: true,
+                action: Action::Pack,
+            },
+            ModEntry {
+                title: "Gamma Built".into(),
+                file_name: "GAMMA".into(),
+                dir: PathBuf::from("/x/GAMMA.MOD"),
+                has_layouts: false,
+                action: Action::Unpack,
             },
         ];
         let mut app = App::new(mods, BaseSource::Bundled, PathBuf::from("/x"));
@@ -730,13 +905,14 @@ mod tests {
         // Mods tab.
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("Torchlight II Mod Packer"), "header");
+        assert!(text.contains("Mikuro Torchlight II Mod Packer"), "header brand");
         assert!(text.contains("Mods") && text.contains("Output"), "tab bar");
         assert!(text.contains("Alpha Content"), "mod row");
         assert!(text.contains("Beta Level"), "mod row");
         assert!(text.contains("(level mod)"), "level tag");
+        assert!(text.contains("Gamma Built") && text.contains("unpack"), "unpack row + tag");
         assert!(text.contains("[x]"), "selected mark");
-        assert!(text.contains("selected: 1/2"), "count");
+        assert!(text.contains("selected: 1/3"), "count");
         assert!(text.contains("Enter"), "footer hint");
 
         // Output tab renders the (empty) log pane.
@@ -746,6 +922,46 @@ mod tests {
         let out = buffer_text(terminal.backend().buffer());
         assert!(out.contains("Output"), "output tab title");
         assert!(out.contains("hello from worker"), "log line rendered");
+    }
+
+    /// Regression guard: the rendered frame actually uses the Emberworks palette
+    /// (not just that it compiles) — furnace-black frame, panel fill, ember accent
+    /// and the ember-backed active tab all show up in the buffer's styles.
+    #[test]
+    fn renders_with_emberworks_palette() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mods = vec![ModEntry {
+            title: "Alpha".into(),
+            file_name: "A".into(),
+            dir: PathBuf::from("/x/A"),
+            has_layouts: false,
+            action: Action::Pack,
+        }];
+        let app = App::new(mods, BaseSource::Bundled, PathBuf::from("/x"));
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let mut fgs = std::collections::HashSet::new();
+        let mut bgs = std::collections::HashSet::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let s = buf[(x, y)].style();
+                if let Some(c) = s.fg {
+                    fgs.insert(c);
+                }
+                if let Some(c) = s.bg {
+                    bgs.insert(c);
+                }
+            }
+        }
+        assert!(bgs.contains(&theme::BG), "furnace-black frame background");
+        assert!(bgs.contains(&theme::PANEL), "panel fill");
+        assert!(bgs.contains(&theme::EMBER), "ember-backed active tab");
+        assert!(fgs.contains(&theme::EMBER), "ember accent text");
+        assert!(fgs.contains(&theme::TEXT), "primary parchment text");
     }
 
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {

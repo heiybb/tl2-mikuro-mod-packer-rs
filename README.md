@@ -132,12 +132,17 @@ per-instance 运行时 nocollide),换语言/精度都不移动它。
 cargo build --release
 # 与 Python CLI 同参数:
 .\target\release\tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,dll,none}] [--raw {auto,none}] [--deploy] <mod目录>
+# 反向:把 .MOD 解包回可编辑源目录(见下「解包」):
+.\target\release\tl2-mikuro-mod-packer.exe unpack <in.MOD|DATA.PAK> <out目录> [--raw] [--no-times] [--filter <文本>]
 # 单文件工具:
-.\target\release\tl2-mikuro-mod-packer.exe compile-dat    <in.DAT>    <out.BINDAT>
-.\target\release\tl2-mikuro-mod-packer.exe compile-layout <in.LAYOUT> <out.BINLAYOUT>
-.\target\release\tl2-mikuro-mod-packer.exe compile-mpp    <in.LAYOUT> <out.mpp> [--media <MEDIA>] [--fallback <base MEDIA>]
+.\target\release\tl2-mikuro-mod-packer.exe compile-dat      <in.DAT>       <out.BINDAT>
+.\target\release\tl2-mikuro-mod-packer.exe compile-layout   <in.LAYOUT>    <out.BINLAYOUT>
+.\target\release\tl2-mikuro-mod-packer.exe compile-mpp      <in.LAYOUT>    <out.mpp> [--media <MEDIA>] [--fallback <base MEDIA>]
+.\target\release\tl2-mikuro-mod-packer.exe decompile-dat    <in.BINDAT>    <out.DAT>    [--utf8]
+.\target\release\tl2-mikuro-mod-packer.exe decompile-layout <in.BINLAYOUT> <out.LAYOUT>
 # 语料验证:
-.\target\release\verify.exe binlayout|bindat|raw|mpp <media_dir> ...
+.\target\release\verify.exe binlayout|binlayout-roundtrip|bindat|raw|mpp <media_dir> ...
+.\target\release\verify.exe unpack <mod.MOD>   # 解包→重打包→逐条目内容对账
 ```
 
 - 默认(不加 flag):内存内转换 + 直接打包,不写源目录(等价 Python 默认 overrides 模式)。
@@ -152,6 +157,60 @@ cargo build --release
 - 环境变量:`TL2_MEDIA_DIR`(基础游戏 MEDIA,默认 `E:\Torchlight 2\MEDIA`)、
   `TL2_INSTALL_DIR`(dll 后端)、`TL2_MOD_GAMEVER`(覆写 header gamever)。
 
+无参数启动(双击/拖进目录)会进 ratatui 交互界面:同一张列表里,带 `MOD.DAT` 的子目录
+标为 **pack**,同级/`mods/` 下的 `.MOD` 文件标为 **unpack**(解到 `<root>/unpacked/<名字>/`)。
+
+## 解包(unpack)—— 整条打包链的逆向
+
+`.MOD` **不是**普通压缩包:打包时编译器先跑过,容器里存的是**编译产物,却挂在源文件名下**
+(`FOO.DAT` 里其实是 BINDAT,`FOO.LAYOUT` 里其实是 BINLAYOUT — 见 `packer.rs` 的
+`PACK_EXCLUDE_SUFFIXES` 注释)。所以解包必须**反向编译**,否则产出的树里全是「看着像源码、
+其实是二进制」的文件。
+
+```text
+.MOD ─┬─ header      → MOD.DAT              (build_header 的逆)
+      ├─ *.DAT       → bindat_decompile     → UTF-16LE 文本 .DAT
+      ├─ *.LAYOUT    → binlayout_decompile  → UTF-16LE 文本 .LAYOUT
+      └─ 其它                                → 原样写出
+```
+
+`src/binlayout_decompile.rs` 是新写的 BINLAYOUT 反编译器:BINLAYOUT 自带完整结构,
+用**同一份内嵌 schema**(`data/binlayout_schema.json`)反查即可命名一切 —— 不像 BINDAT
+要靠词表。编译器丢弃的信息按「重编译后逐字节相同」的口径重建:`PARENTID` 从对象树推回;
+Group 的 `CHOICE`/`GAME MODE`/`TAG`/`RANDOMIZATION`/`NUMBER`/`NO TAG FOUND`/
+`LEVEL UNIQUE`/`ACTIVE|DEACTIVE THEMES` 只存在于尾部 datagroup,解析后按结构配对写回
+Group 对象;默认值(RANDOMIZATION 1、NUMBER 1、无 TAG)只在非默认时才发。
+**刻意不重建**默认朝向(`FORWARD` Z==1 / `RIGHT` X==1 / `UP` Y==1 编译时被跳过):shipped
+`.LAYOUT` 源码同样不写它们,凭空补一行等于向下游解析器**断言**了一个朝向,而按
+`FORWARD × RIGHT` 推 `UP` 的读者会被这行假数据带偏。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `verify binlayout-roundtrip` 不动点(我们编译的 BINLAYOUT → 反编译 → 重编译) | **8986/8986 字节精确** |
+| 同上,输入换成 shipped 二进制 | 8967/8986 —— 失败的 19 个**正是** `verify binlayout` 里编译本身就复现不了的那 19 个(shipped 未初始化 `@25` 垃圾),反编译器零新增 |
+| 单元测试 `pack_unpack_repack_is_byte_identical` | 打包→解包→重打包 **SHA256 完全相同**(含 header/MOD.DAT 环回与还原的 FILETIME) |
+| 真实第三方 GUTS mod(熊猫联纵三号,3452 文件)解包→重打包→再解包 | 3452/3453 文件逐字节相同,唯一差异 = 生成型索引 `UNITDATA.RAW` 的**条目顺序**(GUTS 与本实现的枚举序不同,长度/内容集相同) |
+| 绿洲联盟 9 号(73 文件) | 73/74 相同,唯一差异同为生成型 `UI.RAW` 顺序 |
+
+第一轮往返**不能**还原的三件事(都是机制固有,不是丢数据):
+1. **gameVersion** — 打包时从已安装的 `Torchlight2.exe` 读,MOD.DAT 里没有这个字段;
+   解包会把原值打印出来,重打包前 `TL2_MOD_GAMEVER=0x…` 固定即可。
+2. **词表反查不到的 DAT key 名** — 发 `UNK_<HEX8>` 占位符。它**编译回同一个 hash**
+   (游戏照读),但可读名字没了;解包会逐个列出。⚠️ 永远别手改 UNK_ 里的数字。
+3. **生成型文件(`MEDIA/*.RAW`)在 manifest 里的顺序** — 它们原本没有源文件,打包器把它们
+   追加在磁盘扫描之后;解包把它们落到磁盘后,下次扫描就按排序位置收编。条目集合、内容、
+   两个校验哈希都不受影响,**从第二轮起解包↔打包完全字节稳定**。
+
+另注:`packer::filetime_of` 走 `f64` 秒(53 位尾数装不下 57 位的 FILETIME ticks),
+所以还原的时间戳重读时可能差 ±2 tick(200ns)。字段本身只是信息性的。
+
+解包不动的两个安全边界:manifest 路径经 `sanitize_rel` 过滤(`..`/盘符/反斜杠一律拒绝,
+不允许写出目标目录);**反编译失败的载荷不会挂到源文件名上**,而是落成
+`FOO.LAYOUT.BINLAYOUT` 并报警 —— 因为 `content_for` 会去「编译」源文件名位置的东西,
+拿二进制当 layout 文本编译的结果是一个**空的 8 字节 layout**,那才是真的静默毁数据。
+
 ## 与 Python 版的实现对应
 
 | Rust | Python | 说明 |
@@ -162,6 +221,9 @@ cargo build --release
 | `src/binlayout.rs` | `binlayout.py` | 纯 DLL schema 以 `include_str!` 内嵌(`data/*.json`) |
 | `src/raw.rs` | `raw.py` | 两种扫描序(files-first / interleaved)+ UNITDATA BASEFILE 继承链 |
 | `src/packer.rs` | `packer.py` | 容器写入、rollingHash/mhash、manifest 树、convert_all 编排 |
+| `src/binlayout_decompile.rs` | — | BINLAYOUT → LAYOUT 反编译(schema 反查;不动点 8986/8986) |
+| `src/bindat_decompile.rs` | — | BINDAT → DAT 反编译(内嵌词表 + `UNK_<HEX8>` 转义) |
+| `src/pak.rs` / `src/unpack.rs` | — | 容器读取(header/manifest/块)与 `.MOD`→源目录解包 |
 | `src/mpp/*` | `mpp/*` | region 头部 f32 舍入逐操作对齐;native 分类器 = `build_grid_fast` 等价(桶剔除,逐行 rayon 并行);`dll.rs` = console host 驱动 |
 
 刻意保留的 bug-for-bug 行为:ogre_mesh 顶点声明只读第一个 element(Python 的 +14

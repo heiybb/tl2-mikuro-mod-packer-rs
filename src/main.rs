@@ -30,10 +30,18 @@ fn usage() -> ExitCode {
     eprintln!("  --raw auto   Emit RAW indexes on-demand per content type (DEFAULT)");
     eprintln!("  --raw none   Skip RAW generation entirely");
     eprintln!();
+    eprintln!("Unpack (the inverse — container back to editable sources):");
+    eprintln!("  tl2-mikuro-mod-packer unpack <in.MOD|DATA.PAK> <out_dir> [--raw] [--no-times] [--filter <text>]");
+    eprintln!("    --raw        Write the container payloads verbatim (.DAT stays BINDAT)");
+    eprintln!("    --no-times   Do not restore file times from the manifest");
+    eprintln!("    --filter T   Only entries whose path contains T (case-insensitive)");
+    eprintln!();
     eprintln!("Single-file tools:");
     eprintln!("  tl2-mikuro-mod-packer compile-dat <in.DAT> <out.BINDAT>");
     eprintln!("  tl2-mikuro-mod-packer compile-layout <in.LAYOUT> <out.BINLAYOUT>");
     eprintln!("  tl2-mikuro-mod-packer compile-mpp <in.LAYOUT> <out.mpp> [--media <MEDIA>]");
+    eprintln!("  tl2-mikuro-mod-packer decompile-dat <in.BINDAT> <out.DAT>");
+    eprintln!("  tl2-mikuro-mod-packer decompile-layout <in.BINLAYOUT> <out.LAYOUT>");
     ExitCode::FAILURE
 }
 
@@ -111,6 +119,66 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             };
+        }
+        Some("decompile-dat") if argv.len() >= 3 => {
+            // decompile-dat <in.BINDAT> <out.DAT> [--utf8] — inverse of
+            // compile-dat. Keys/section names come from the embedded reverse
+            // dictionary (UNK_<HEX8> for a mod's new keys, which compiles back
+            // to the same hash), values verbatim — so the default output is a
+            // UTF-16LE source that recompiles byte-for-byte. --utf8 writes the
+            // old plain-text dump instead, for eyeballing and diffing.
+            use tl2_mikuro_mod_packer_rs::bindat_decompile as bdd;
+            let utf8 = argv[3..].iter().any(|a| a == "--utf8");
+            return match std::fs::read(&argv[1])
+                .map_err(|e| e.to_string())
+                .and_then(|d| bdd::decompile_bindat_reported(&d))
+            {
+                Ok(d) => {
+                    let bytes = if utf8 {
+                        d.text.into_bytes()
+                    } else {
+                        bdd::to_dat_bytes(&d.text)
+                    };
+                    std::fs::write(&argv[2], bytes).expect("write output");
+                    println!("decompiled → {}", argv[2]);
+                    if !d.unknown_names.is_empty() {
+                        println!(
+                            "  note: {} name(s) had no dictionary entry and kept a raw-hash \
+                             placeholder (do NOT edit the digits): {}",
+                            d.unknown_names.len(),
+                            d.unknown_names.iter().take(8).cloned().collect::<Vec<_>>().join(" ")
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some("decompile-layout") if argv.len() >= 3 => {
+            // decompile-layout <in.BINLAYOUT> <out.LAYOUT> — inverse of
+            // compile-layout. Fully recoverable (schema-driven), so the output
+            // is a real re-editable source, not just a dump.
+            use tl2_mikuro_mod_packer_rs::binlayout_decompile as bld;
+            return match std::fs::read(&argv[1])
+                .map_err(|e| e.to_string())
+                .and_then(|d| bld::decompile_binlayout(&d))
+            {
+                Ok(text) => {
+                    std::fs::write(&argv[2], bld::to_layout_bytes(&text)).expect("write output");
+                    println!("decompiled → {}", argv[2]);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some("unpack") if argv.len() >= 3 => {
+            return run_unpack(&argv[1], &argv[2], &argv[3..]);
         }
         Some("unpack-base") if argv.len() >= 2 => {
             // unpack-base <out_dir> — unpack the embedded base bundle (no game
@@ -294,6 +362,109 @@ fn main() -> ExitCode {
     println!("  Output: {}", output_path.display());
     println!("  Size:   {:.2} MB  ({mod_size} bytes)", mod_size as f64 / 1.0e6);
     ExitCode::SUCCESS
+}
+
+/// `unpack <in.MOD|DATA.PAK> <out_dir> [--raw] [--no-times] [--filter T]`.
+///
+/// A `DATA.PAK` is recognised by name (its manifest lives in the sibling
+/// `.PAK.MAN` and it carries no mod header); anything else is read as a `.MOD`.
+fn run_unpack(input: &str, out_dir: &str, flags: &[String]) -> ExitCode {
+    use tl2_mikuro_mod_packer_rs::unpack::{unpack_mod_with_progress, unpack_pak, Options};
+
+    let mut opt = Options::default();
+    let mut it = flags.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--raw" => opt.raw = true,
+            "--no-times" => opt.restore_times = false,
+            "--filter" => opt.filter = it.next().cloned(),
+            other => {
+                eprintln!("Error: unknown unpack flag {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let src = Path::new(input);
+    let dst = Path::new(out_dir);
+    if !src.is_file() {
+        eprintln!("Error: no such file: {input}");
+        return ExitCode::FAILURE;
+    }
+    let is_pak = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_uppercase().ends_with(".PAK"))
+        .unwrap_or(false);
+
+    // Progress: files are wildly uneven in size (a 40 MB mesh next to a 200 byte
+    // DAT), so tick on a timer rather than every Nth file.
+    let t0 = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let mut tick = |done: usize, total: usize| {
+        if done == total || last.elapsed().as_millis() >= 500 {
+            last = std::time::Instant::now();
+            let pct = if total > 0 { done * 100 / total } else { 100 };
+            print!("\r  {done}/{total} files ({pct}%)   ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+    };
+
+    println!("Unpacking {input} → {out_dir}");
+    let res = if is_pak {
+        unpack_pak(src, dst, &opt, &mut tick)
+    } else {
+        unpack_mod_with_progress(src, dst, &opt, &mut tick)
+    };
+    println!();
+    match res {
+        Ok(rep) => {
+            println!(
+                "  {} files, {:.2} MB  ({:.1}s)",
+                rep.files,
+                rep.bytes as f64 / 1.0e6,
+                t0.elapsed().as_secs_f64()
+            );
+            println!("    BINDAT→DAT:       {} files", rep.dats);
+            println!("    BINLAYOUT→LAYOUT: {} files", rep.layouts);
+            println!("    copied verbatim:  {} files", rep.copied);
+            if !rep.unknown_names.is_empty() {
+                println!(
+                    "  {} DAT name(s) had no dictionary entry and kept a raw-hash \
+                     placeholder — they still recompile to the same hash, but do NOT \
+                     edit the digits:",
+                    rep.unknown_names.len()
+                );
+                for n in rep.unknown_names.iter().take(10) {
+                    println!("      {n}");
+                }
+                if rep.unknown_names.len() > 10 {
+                    println!("      … and {} more", rep.unknown_names.len() - 10);
+                }
+            }
+            if !rep.generated.is_empty() {
+                println!(
+                    "  {} file(s) were GENERATED by the original pack (index rebuilds, \
+                     no source file) and are rebuilt on every pack: {}",
+                    rep.generated.len(),
+                    rep.generated
+                        .iter()
+                        .take(8)
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            for w in &rep.warnings {
+                println!("  note: {w}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// YYYYMMDD_HHMMSS, LOCAL time (mirrors datetime.now()).

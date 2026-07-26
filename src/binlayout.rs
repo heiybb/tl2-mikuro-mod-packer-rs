@@ -54,6 +54,18 @@ fn dgtags() -> &'static HashMap<String, u32> {
     })
 }
 
+/// The embedded descriptor schema (descriptor name -> code + props). Read-only
+/// view for `binlayout_decompile`, which inverts it (code -> name/encoder).
+pub fn schema_map() -> &'static HashMap<String, Descriptor> {
+    schema()
+}
+
+/// The embedded datagroup TAG map (UPPER tag name -> id), for the decompiler's
+/// reverse lookup.
+pub fn datagroup_tags() -> &'static HashMap<String, u32> {
+    dgtags()
+}
+
 // ── .LAYOUT text parser ────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -584,6 +596,21 @@ fn interp_index(name: &str) -> u8 {
     }
 }
 
+/// Inverse of `interp_index` (decompiler). Kept adjacent so the two tables
+/// cannot drift; `interp_index_roundtrips` asserts they agree.
+pub fn interp_name(idx: u8) -> &'static str {
+    match idx {
+        1 => "Linear Round",
+        2 => "Linear Round Down",
+        3 => "Linear Round Up",
+        4 => "Spline",
+        5 => "Quaternion",
+        6 => "No Interpolation",
+        7 => "Use Timeline Default",
+        _ => "Linear",
+    }
+}
+
 fn serialize_timelinedata(tobjs: &[TimelineObj], out: &mut Vec<u8>) {
     out.push(tobjs.len() as u8);
     for to in tobjs {
@@ -756,6 +783,18 @@ fn choice_index(s: &str) -> u8 {
     }
 }
 
+/// Inverse of `choice_index` for the decompiler. Index 0 is emitted as `None`
+/// rather than "ALL": index 0 is also what an ABSENT (and an unmatched) CHOICE
+/// produces, and the shipped corpus authors CHOICE only for 1/2 — so omitting
+/// it both round-trips byte-exactly and matches how the editor writes Groups.
+pub fn choice_name(idx: u8) -> Option<&'static str> {
+    match idx {
+        1 => Some("Weight"),
+        2 => Some("Random Chance"),
+        _ => None,
+    }
+}
+
 /// GAME MODE -> @27. GUTS (sub_10115320 @0x10116201): absent/empty -> 0; any
 /// non-empty value -> `2 - (value == L"NORMAL")` — case-sensitive exact, so
 /// every non-"NORMAL" value (incl. "NEW GAME PLUS") is 2.
@@ -764,6 +803,17 @@ fn gamemode_index(present_value: Option<&str>) -> u8 {
         None | Some("") => 0,
         Some("NORMAL") => 1,
         Some(_) => 2,
+    }
+}
+
+/// Inverse of `gamemode_index` for the decompiler. Index 2 is MANY-to-one (any
+/// non-"NORMAL" non-empty value), so it decompiles to the only other value the
+/// editor offers — which re-encodes to 2 either way.
+pub fn gamemode_name(idx: u8) -> Option<&'static str> {
+    match idx {
+        1 => Some("NORMAL"),
+        2 => Some("NEW GAME PLUS"),
+        _ => None,
     }
 }
 
