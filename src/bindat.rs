@@ -305,11 +305,56 @@ fn resolve_id(ids: &HashMap<WStr, u32>, s: &[u32]) -> u32 {
     }
 }
 
-fn serialize_node(node: &Node, ids: &HashMap<WStr, u32>, out: &mut Vec<u8>) {
-    out.extend_from_slice(&rg_hash(&node.name).to_le_bytes());
+/// A BINDAT stores every section/key NAME as a one-way `rghash`, so the
+/// decompiler emits `UNK_<HEX8>` for a hash its reverse dictionary cannot name
+/// (see `bindat_decompile::name_of`). Recognize that placeholder here and write
+/// the ORIGINAL hash back verbatim — re-hashing the placeholder TEXT would
+/// silently yield a DIFFERENT key, and the engine (which resolves names only by
+/// hash) would stop seeing that section/property. Strict on purpose: exact
+/// length + UPPERCASE hex, matching what the decompiler emits; anything else is
+/// an ordinary name and is hashed normally.
+pub fn raw_hash_token(name: &[u32]) -> Option<u32> {
+    const PREFIX: [u32; 4] = [b'U' as u32, b'N' as u32, b'K' as u32, b'_' as u32];
+    if name.len() != PREFIX.len() + 8 || name[..PREFIX.len()] != PREFIX {
+        return None;
+    }
+    let mut h: u32 = 0;
+    for &c in &name[PREFIX.len()..] {
+        let d = match c {
+            0x30..=0x39 => c - 0x30,      // '0'..='9'
+            0x41..=0x46 => c - 0x41 + 10, // 'A'..='F'
+            _ => return None,
+        };
+        h = (h << 4) | d;
+    }
+    Some(h)
+}
+
+fn name_text(name: &[u32]) -> String {
+    name.iter().filter_map(|&c| char::from_u32(c)).collect()
+}
+
+/// Hash a section/key name, honouring the `UNK_<HEX8>` raw-hash escape. Each
+/// distinct escape is recorded so the caller can warn that a readable name was
+/// lost (the DATA still reaches the engine — only the name is a placeholder).
+fn name_hash(name: &[u32], raw: &mut Vec<String>) -> u32 {
+    match raw_hash_token(name) {
+        Some(h) => {
+            let t = name_text(name);
+            if !raw.contains(&t) {
+                raw.push(t);
+            }
+            h
+        }
+        None => rg_hash(name),
+    }
+}
+
+fn serialize_node(node: &Node, ids: &HashMap<WStr, u32>, out: &mut Vec<u8>, raw: &mut Vec<String>) {
+    out.extend_from_slice(&name_hash(&node.name, raw).to_le_bytes());
     out.extend_from_slice(&(node.props.len() as u32).to_le_bytes());
     for (tc, key, value) in &node.props {
-        out.extend_from_slice(&rg_hash(key).to_le_bytes());
+        out.extend_from_slice(&name_hash(key, raw).to_le_bytes());
         out.extend_from_slice(&tc.to_le_bytes());
         match tc {
             5 | 8 => out.extend_from_slice(&resolve_id(ids, value).to_le_bytes()),
@@ -322,7 +367,7 @@ fn serialize_node(node: &Node, ids: &HashMap<WStr, u32>, out: &mut Vec<u8>) {
     }
     out.extend_from_slice(&(node.children.len() as u32).to_le_bytes());
     for ch in &node.children {
-        serialize_node(ch, ids, out);
+        serialize_node(ch, ids, out, raw);
     }
 }
 
@@ -330,6 +375,7 @@ fn serialize_with_ids(
     roots: &[Node],
     ordered: &[WStr],
     ids: &HashMap<WStr, u32>,
+    raw: &mut Vec<String>,
 ) -> Vec<u8> {
     // id -> string, ascending. Iterate in FIRST-APPEARANCE order so that when
     // the corpus dict maps two distinct strings to one id (715 majority-vote
@@ -355,14 +401,27 @@ fn serialize_with_ids(
         out.extend_from_slice(&enc);
     }
     for r in roots {
-        serialize_node(r, ids, &mut out);
+        serialize_node(r, ids, &mut out, raw);
     }
     out
+}
+
+/// BINDAT bytes + every `UNK_<HEX8>` placeholder name that was written back as a
+/// raw hash (empty for normal sources — non-empty means the text came from an
+/// unpack whose names could not be reversed).
+pub struct CompiledDat {
+    pub bytes: Vec<u8>,
+    pub raw_hash_names: Vec<String>,
 }
 
 /// Serialize a parsed node tree to BINDAT bytes (per-file hash ids — the
 /// production default: no corpus dependency, fully parallel, game-proven).
 pub fn compile_tree(roots: &[Node]) -> Result<Vec<u8>, String> {
+    Ok(compile_tree_reported(roots)?.bytes)
+}
+
+/// `compile_tree` + the raw-hash placeholder report.
+pub fn compile_tree_reported(roots: &[Node]) -> Result<CompiledDat, String> {
     if roots.is_empty() {
         return Err("no root section parsed from DAT".into());
     }
@@ -375,7 +434,9 @@ pub fn compile_tree(roots: &[Node]) -> Result<Vec<u8>, String> {
     let string_set: BTreeSet<WStr> = ordered.iter().cloned().collect();
     let sdict = HashStringDict::new(&string_set);
     let ids: HashMap<WStr, u32> = sdict.s2id.iter().map(|(s, &i)| (s.clone(), i)).collect();
-    Ok(serialize_with_ids(roots, &ordered, &ids))
+    let mut raw = Vec::new();
+    let bytes = serialize_with_ids(roots, &ordered, &ids, &mut raw);
+    Ok(CompiledDat { bytes, raw_hash_names: raw })
 }
 
 /// Serialize with the GLOBAL corpus dictionary — the exact sub_10289A40 /
@@ -384,6 +445,14 @@ pub fn compile_tree(roots: &[Node]) -> Result<Vec<u8>, String> {
 /// order, exactly like GUTS' `id = counter++` at collect time. Reproduces the
 /// shipped global-id scheme byte-for-byte where the source text matches.
 pub fn compile_tree_corpus(roots: &[Node], dict: &CorpusDict) -> Result<Vec<u8>, String> {
+    Ok(compile_tree_corpus_reported(roots, dict)?.bytes)
+}
+
+/// `compile_tree_corpus` + the raw-hash placeholder report.
+pub fn compile_tree_corpus_reported(
+    roots: &[Node],
+    dict: &CorpusDict,
+) -> Result<CompiledDat, String> {
     if roots.is_empty() {
         return Err("no root section parsed from DAT".into());
     }
@@ -405,7 +474,9 @@ pub fn compile_tree_corpus(roots: &[Node], dict: &CorpusDict) -> Result<Vec<u8>,
         };
         ids.insert(s.clone(), id);
     }
-    Ok(serialize_with_ids(roots, &ordered, &ids))
+    let mut raw = Vec::new();
+    let bytes = serialize_with_ids(roots, &ordered, &ids, &mut raw);
+    Ok(CompiledDat { bytes, raw_hash_names: raw })
 }
 
 /// Compile .DAT bytes (UTF-16, BOM-aware) into BINDAT bytes from scratch.
@@ -419,6 +490,31 @@ pub fn compile_dat_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
 pub fn compile_dat_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     compile_dat_bytes(&data)
+}
+
+/// Compile .DAT bytes with either id scheme, reporting any `UNK_<HEX8>`
+/// placeholder name that was written back as a raw hash. This is what the
+/// packers call, so a mod built from unpacked sources gets a warning instead of
+/// silently shipping a name nobody can read.
+pub fn compile_dat_bytes_reported(
+    data: &[u8],
+    dict: Option<&CorpusDict>,
+) -> Result<CompiledDat, String> {
+    let text = decode_dat_bytes(data);
+    let roots = parse_dat_text(&text);
+    match dict {
+        Some(d) => compile_tree_corpus_reported(&roots, d),
+        None => compile_tree_reported(&roots),
+    }
+}
+
+/// `compile_dat_bytes_reported` for a file path.
+pub fn compile_dat_file_reported(
+    path: &std::path::Path,
+    dict: Option<&CorpusDict>,
+) -> Result<CompiledDat, String> {
+    let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    compile_dat_bytes_reported(&data, dict)
 }
 
 /// Compile .DAT bytes with the GLOBAL corpus dictionary (shipped-id scheme).

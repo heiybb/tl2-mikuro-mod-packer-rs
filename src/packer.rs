@@ -14,7 +14,6 @@ use indexmap::IndexMap;
 use rayon::prelude::*;
 use regex::Regex;
 
-use crate::bindat::compile_dat_file;
 use crate::binlayout::compile_layout_file;
 use crate::raw;
 
@@ -1099,16 +1098,20 @@ pub fn convert_all(
     // a barrier before the other starts. Both collects stay order-preserving; the
     // emit order (all BINDAT, then all BINLAYOUT) is unchanged.
     type CompileOut = Vec<(PathBuf, Result<Vec<u8>, String>)>;
-    let (bindat_out, layout_out): (CompileOut, CompileOut) = rayon::join(
+    // The DAT arm also carries the source path + the `UNK_<HEX8>` placeholder
+    // report, so the raw-hash warning below can name the offending file.
+    type DatCompileOut = Vec<(PathBuf, PathBuf, Result<crate::bindat::CompiledDat, String>)>;
+    let (bindat_out, layout_out): (DatCompileOut, CompileOut) = rayon::join(
         || {
             dat_jobs
                 .par_iter()
                 .map(|(dp, bp)| {
-                    let res = match &corpus_dict {
-                        Some(d) => crate::bindat::compile_dat_file_corpus(dp, d),
-                        None => compile_dat_file(dp),
-                    };
-                    (bp.clone(), res.map_err(|e| format!("{}: {e}", dp.display())))
+                    let res = crate::bindat::compile_dat_file_reported(dp, corpus_dict.as_ref());
+                    (
+                        dp.clone(),
+                        bp.clone(),
+                        res.map_err(|e| format!("{}: {e}", dp.display())),
+                    )
                 })
                 .collect()
         },
@@ -1124,14 +1127,46 @@ pub fn convert_all(
                 .collect()
         },
     );
-    for (bp, res) in bindat_out {
+    // Sources that came from an unpack whose section/key names could not be
+    // reversed still carry `UNK_<HEX8>` placeholders. They compile CORRECTLY (the
+    // original hash is written back verbatim, so the engine still sees the data),
+    // but the readable name is gone — say so once, loudly, with examples.
+    let mut raw_hash_hits: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for (dp, bp, res) in bindat_out {
         match res {
             Ok(gen) => {
-                if emit_converted(&bp, gen, media_dir, overrides.as_deref_mut()).is_ok() {
+                if !gen.raw_hash_names.is_empty() {
+                    raw_hash_hits.push((dp, gen.raw_hash_names));
+                }
+                if emit_converted(&bp, gen.bytes, media_dir, overrides.as_deref_mut()).is_ok() {
                     results.bindat += 1;
                 }
             }
             Err(e) => results.errors.push(format!("BINDAT {e}")),
+        }
+    }
+    if !raw_hash_hits.is_empty() {
+        let total: usize = raw_hash_hits.iter().map(|(_, n)| n.len()).sum();
+        eprintln!(
+            "  WARNING: {} DAT file(s) still use {} UNK_<hex> placeholder name(s)\n\
+             \x20          left by an earlier unpack. Their original hashes were written back\n\
+             \x20          verbatim, so the game still reads these sections/properties — but\n\
+             \x20          the readable name is lost. Replace them with the real name where\n\
+             \x20          you know it; NEVER rename an UNK_ token by hand (it changes the hash).",
+            raw_hash_hits.len(),
+            total
+        );
+        for (dp, names) in raw_hash_hits.iter().take(10) {
+            let shown: Vec<&str> = names.iter().take(6).map(|s| s.as_str()).collect();
+            let more = if names.len() > shown.len() {
+                format!(", +{} more", names.len() - shown.len())
+            } else {
+                String::new()
+            };
+            eprintln!("    {}: {}{}", dp.display(), shown.join(", "), more);
+        }
+        if raw_hash_hits.len() > 10 {
+            eprintln!("    ... and {} more file(s)", raw_hash_hits.len() - 10);
         }
     }
     for (bp, res) in layout_out {
