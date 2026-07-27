@@ -1,11 +1,229 @@
 # tl2-mikuro-mod-packer-rs
 
-Torchlight 2 `.MOD` 构建器 — `mikuro_mod_packer`(Python 参考实现,已归档于
-GitHub `heiybb/TL2-RE`;本地 `D:\WizardProject\TL2\TL2-RE` 已于 2026-07-12 删除,
-本仓库是唯一在用的实现)的 **Rust 移植**,目标是更快的构建速度与单文件可分发的
-二进制。三种二进制格式(BINDAT / BINLAYOUT / MPP)都是真正的从零编译器:解析文本 →
-序列化二进制,不读取任何已有二进制,因此文本改动总能正确编译。本仓库自包含,不依赖
-TL2-RE(RE 规格/A-B 基准/frida 探针工具链需查 Python 时 `git clone` GitHub 仓)。
+*[English](README.en.md)*
+
+Torchlight 2 的 **`.MOD` 打包器 + 解包器**,单文件 exe,不需要装游戏编辑器(GUTS)。
+
+- **打包**:把一个 mod 源目录(`MOD.DAT` + `MEDIA/`)编译成游戏能读的 `.MOD`。
+- **解包**:把 `.MOD`(或基础游戏的 `DATA.PAK`)还原成**可编辑的文本源目录**。
+
+三种二进制格式(BINDAT / BINLAYOUT / MPP)都是从零写的编译器:解析文本 → 序列化二进制,
+不读取任何已有二进制,所以文本改动总能正确编译。反向的两个反编译器同理。基础游戏数据
+以 ~3MB gzip 内嵌在 exe 里,所以**没装游戏也能打包**。
+
+Python 参考实现 `mikuro_mod_packer` 已归档于 GitHub `heiybb/TL2-RE`,本仓库是唯一在用的实现。
+
+---
+
+## 快速开始
+
+```powershell
+cargo build --release
+# 产物:target\release\tl2-mikuro-mod-packer.exe(单文件,可直接拷走)
+```
+
+三种用法,按你想干的事选:
+
+| 你想 | 怎么做 |
+| --- | --- |
+| 点几下就打包/解包 | **双击 exe**(或把它丢进 mod 目录/游戏目录再运行)→ 进交互界面 |
+| 写进脚本、CI | 带参数跑 → 就是普通命令行工具 |
+| 只处理单个文件 | `compile-dat` / `decompile-layout` 等单文件子命令 |
+
+---
+
+## 打包
+
+### 什么算一个 mod 源目录
+
+一个文件夹,里面有 **`MOD.DAT`** 和 **`MEDIA/`** 树。`MOD.DAT` 里的 `MOD_FILE_NAME`
+决定输出文件名(没有就用文件夹名),`NAME`/`DISPLAYNAME` 决定游戏里显示的标题。
+
+### 命令
+
+```powershell
+tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,none}] [--raw {auto,none}] [--deploy] <mod目录>
+```
+
+打包时依次发生四件事(`convert_all`):
+
+1. `*.DAT` → BINDAT
+2. `*.LAYOUT` → BINLAYOUT
+3. 生成 `MEDIA/*.RAW` 索引(AFFIXES / SKILLS / TRIGGERABLES / MISSILES / UI / UNITDATA / ROOMPIECES)
+4. 烘 `.MPP` 寻路走格(只有 level mod 需要)
+
+然后写容器:header + 数据段 + manifest,并算两个游戏会校验的哈希(rollingHash、manifest mhash)。
+
+### 编译产物落在哪 —— 三选一
+
+这是 `--in-place` / `--temp-copy` 唯一要回答的问题:
+
+| 写法 | 行为 |
+| --- | --- |
+| 不加(默认) | 只在内存里编译,**除了 `.MOD` 什么都不写** |
+| `--in-place` | **额外**把 `.BINDAT` / `.BINLAYOUT` 留在你的 `MEDIA/` 树里 |
+| `--temp-copy` | 复制一份到临时目录里编译,你的目录保持干净 |
+
+### `.MOD` 落在哪
+
+| 写法 | 输出 |
+| --- | --- |
+| 不加 | `<mod目录>\<MOD_FILE_NAME>_<时间戳>.MOD` |
+| `--deploy` | `%USERPROFILE%\Documents\My Games\Runic Games\Torchlight 2\mods\<MOD_FILE_NAME>.MOD` |
+
+`--deploy` 的路径走注册表 Shell Folders 解析,OneDrive 重定向也安全。
+
+### 其余开关
+
+- `--mpp re`(默认)现烘走格;`--mpp none` 保留源目录里已有的 `.mpp`。
+  content mod(`MEDIA/LAYOUTS` 下没有 `*.LAYOUT`)本来就没东西可烘,给 `none` 更快。
+- `--raw auto`(默认)按内容类型**按需**生成 RAW 索引;`--raw none` 完全跳过。
+
+### base 数据(为什么打包需要它)
+
+有两件事光看 mod 自己算不出来:
+
+- `UNITDATA.RAW` 要沿每个单位的 `BASEFILE` 继承链,进**基础游戏**的 `UNITS` 模板读
+  `UNITTYPE` / `LEVEL` / `RARITY` / `CREATEAS`。
+- `.MPP` 走格要拿基础游戏的**碰撞几何**做烘焙。
+
+所以打包器需要 base 数据,取三层里第一个可用的:
+
+1. exe 旁边的散装 `MEDIA/`(真实解包过的安装)
+2. 旁边的 `PAKS/DATA.PAK` 或 `DATA.PAK`(首次使用时抽取)
+3. **内嵌在 exe 里的 bundle**(永远可用,~3MB gzip)
+
+第 2、3 层只在首次解到 exe 旁的 `.tl2packer_base\` 缓存,之后复用。
+**三层产出的 `.MOD` 字节完全相同**(已在一个 level mod 上验证)。
+
+---
+
+## 解包
+
+### 为什么不能直接解压
+
+`.MOD` **不是**普通压缩包。打包时编译器先跑过一遍,容器里存的是**编译产物,却挂在源文件名下**:
+`FOO.DAT` 里其实是 BINDAT,`FOO.LAYOUT` 里其实是 BINLAYOUT。所以解包必须**反向编译**,
+否则你拿到的树里全是「看着像源码、其实是二进制」的文件。
+
+```text
+.MOD ─┬─ header      → MOD.DAT              (build_header 的逆)
+      ├─ *.DAT       → bindat_decompile     → UTF-16LE 文本 .DAT
+      ├─ *.LAYOUT    → binlayout_decompile  → UTF-16LE 文本 .LAYOUT
+      └─ 其它                                → 原样写出
+```
+
+### 命令
+
+```powershell
+tl2-mikuro-mod-packer.exe unpack <in.MOD|DATA.PAK> <out目录> [--raw] [--no-times] [--filter <文本>]
+```
+
+- `--raw`:不反编译,把载荷原样写出(`.DAT` 保持 BINDAT)。想看真实存储内容时用。
+- `--no-times`:不还原 manifest 里的文件时间戳。
+- `--filter <文本>`:只解路径里含该文本的条目(大小写不敏感),例如 `--filter SKILLS`。
+
+产出的目录**就是一个 mod 源目录**,可以直接改完再打包回去。
+基础游戏的 `PAKS\DATA.PAK`(带 sidecar `DATA.PAK.MAN`)也能解,只是没有 mod header,不写 `MOD.DAT`。
+
+### 解包会告诉你的事
+
+解包结束会打印 `note:`,都不是错误,但值得看一眼:
+
+| 提示 | 含义 / 怎么办 |
+| --- | --- |
+| `gameVersion 0x… is not stored in MOD.DAT` | 打包时从已安装的 `Torchlight2.exe` 读,MOD.DAT 里没这个字段。要复现原值就 `TL2_MOD_GAMEVER=0x…` 再打包 |
+| `UNK_<HEX8>` 占位名 | 词表反查不到的 DAT key 名。它**编译回同一个 hash**(游戏照读),但可读名字没了。⚠️ 永远别手改 UNK_ 里的数字 —— 你改的是 hash |
+| `container lists N duplicate paths` | 容器把同一路径列了多次(第三方 mod 常见)。保留最后一条 —— 与串行解包结果一致 |
+| `BINLAYOUT flag byte is 0x36, not the usual 0x04` | 别的工具打的包。重打包会写 `0x04` |
+| `will not decompile …; kept as FOO.LAYOUT.BINLAYOUT` | 反编译失败,载荷**原样留下并改名**;重打包不会包含这条,除非你补上文本源 |
+
+### 往返(解包 → 重打包)
+
+| 检查 | 结果 |
+| --- | --- |
+| 单元测试 `pack_unpack_repack_is_byte_identical` | 打包→解包→重打包 **SHA256 完全相同** |
+| 真实第三方 GUTS mod(熊猫联纵三号,3452 文件) | 3452/3453 逐字节相同,唯一差异 = 生成型 `UNITDATA.RAW` 的**条目顺序** |
+| 绿洲联盟 9 号(73 文件) | 73/74 相同,唯一差异同为生成型 `UI.RAW` 顺序 |
+
+第一轮往返**不能**还原三件事(机制固有,不是丢数据):**gameVersion**(见上表)、
+**词表外的 key 名**(发 `UNK_`)、**生成型 `MEDIA/*.RAW` 在 manifest 里的顺序**(它们原本没有
+源文件,打包器把它们追加在磁盘扫描之后;解包落盘后下次扫描就按排序位置收编)。条目集合、
+内容、两个校验哈希都不受影响,**从第二轮起解包↔打包完全字节稳定**。
+
+另注:`packer::filetime_of` 走 `f64` 秒(53 位尾数装不下 57 位 FILETIME ticks),
+还原的时间戳重读可能差 ±2 tick(200ns)。该字段只是信息性的。
+
+### 两个不动的安全边界
+
+1. manifest 路径经 `sanitize_rel` 过滤:`..`、盘符、反斜杠一律拒绝,**不可能写出目标目录**。
+2. **反编译失败的载荷不会挂到源文件名上**,而是落成 `FOO.LAYOUT.BINLAYOUT` 并报警 ——
+   因为 `content_for` 会去「编译」源文件名位置的东西,拿二进制当 layout 文本编译的结果是
+   一个**空的 8 字节 layout**,那才是真的静默毁数据。
+
+---
+
+## 交互界面(无参数启动)
+
+双击 exe,或把它丢进 mod 目录 / 游戏目录再运行,会进 ratatui 界面。四个页签:
+
+| 页签 | 内容 |
+| --- | --- |
+| **PACK** | 扫到的 mod 源目录。每行标 content mod / level mod |
+| **UNPACK** | 扫到的 `.MOD` 文件。每行标 local / game mods |
+| **OUTPUT** | 运行日志(实时流式);`c` 清空 |
+| **HELP** | 从**真实代码路径**生成的说明:base 三层、当前用的是哪层、扫描/输出的真实路径、CLI 全部命令 |
+
+扫描位置:
+
+- PACK:exe 所在目录、它的 `mods\` 子目录(**这个目录自身**若含 `MOD.DAT` 也算一个源)
+- UNPACK:上面两处,**加上游戏的 mods 目录**(`--deploy` 的落点,所以刚打的包马上就在列表里)
+
+输出位置:PACK 一律 deploy 到游戏 mods 目录;UNPACK 写到 exe 旁的 `unpacked\<名字>\`,
+**永远不写游戏 mods 目录**,所以解包一个你已装的 mod 是安全的。
+
+按键:`↑↓` 移动 · `Space` 勾选 · `a` 全选 · `Enter` 执行 · `Tab`/`1`-`4` 切页 ·
+`?` 帮助 · `l` 切语言 · `c` 清空日志(OUTPUT 页)· `q` 或 `Ctrl+C` 退出。
+
+界面语言按系统语言自动选(英/中/俄),`TL2_LANG=en|zh|ru` 可覆盖,界面里 `l` 随时切。
+想改措辞或加语言,不用重新编译:把改好的 ini 放到 exe 旁的 `lang\<code>.ini`,
+里面的键覆盖内置的,没写的自动回落。
+
+---
+
+## 单文件工具与验证器
+
+```powershell
+tl2-mikuro-mod-packer.exe compile-dat      <in.DAT>       <out.BINDAT>  [--global-dict <dict.bin>]
+tl2-mikuro-mod-packer.exe compile-layout   <in.LAYOUT>    <out.BINLAYOUT>
+tl2-mikuro-mod-packer.exe compile-mpp      <in.LAYOUT>    <out.mpp> [--media <MEDIA>] [--fallback <base MEDIA>]
+tl2-mikuro-mod-packer.exe decompile-dat    <in.BINDAT>    <out.DAT>  [--utf8]
+tl2-mikuro-mod-packer.exe decompile-layout <in.BINLAYOUT> <out.LAYOUT>
+tl2-mikuro-mod-packer.exe extract-base     <DATA.PAK>     <out目录>    # 抽 base LEVELSETS + 碰撞 mesh
+tl2-mikuro-mod-packer.exe unpack-base      <out目录>                   # 解内嵌 base bundle(不需要装游戏)
+
+verify.exe binlayout|binlayout-roundtrip|bindat|raw|mpp|mpp-corpus <media_dir> ...
+verify.exe unpack <mod.MOD>     # 解包→重打包→逐条目内容对账
+```
+
+`compile-mpp --fallback <base MEDIA>`:单瓦片编译时启用 **mod-over-base VFS overlay**
+(先查 `--media` 的 mod,再查 `--fallback` 的基础安装),用于把单个 mod 瓦片按整包构建的
+口径解析基础游戏 link/mesh 目标。整包构建(主命令)已自动带此 overlay。
+
+`decompile-dat` 默认输出 UTF-16LE 的**可再编辑** `.DAT`;`--utf8` 出的是给人看的纯文本 dump。
+
+## 环境变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `TL2_MEDIA_DIR` | 基础游戏 MEDIA 路径(默认 `E:\Torchlight 2\MEDIA`) |
+| `TL2_MOD_GAMEVER` | 覆写 header 里的 gameVersion(解包往返时用) |
+| `TL2_LANG` | TUI 界面语言 `en` / `zh` / `ru` |
+| `MIKURO_TIMING` | 打印分阶段计时 |
+| `MIKURO_BINDAT_DICT` | 走 corpus 模式的 BINDAT string id(见文末) |
+| `TL2_MODPACK_LIST` | 不进 TUI,把扫描结果 dump 到 stdout(诊断/CI) |
+
+---
 
 ## 验证状态(2026-07-04,与 Python 参考实现 A/B 对比)
 
@@ -16,9 +234,21 @@ TL2-RE(RE 规格/A-B 基准/frida 探针工具链需查 Python 时 `git clone` G
 | RAW ×7 | vs 基础游戏 shipped `MEDIA/*.RAW` | **7/7 字节精确**(AFFIXES/SKILLS/TRIGGERABLES/MISSILES/UI/UNITDATA/ROOMPIECES) |
 | MPP (offline `re`) | 13 个多样 tile(cliff/landmark 别名/boss/town/exit/cave/vault)vs Python `compile_mpp` | **13/13 字节一致** |
 | .MOD 整包 | 佣兵系统 / 职业技能 / 通用素材01 三个真实 mod,vs Python 整包 | header+manifest 结构一致;**全部 1856 / 35864 / 11205 个文件解压内容、CRC、ftime 一致**;rollingHash + mhash 自洽(游戏校验的两个哈希) |
+| BINLAYOUT 反编译不动点 | 我们编译的 BINLAYOUT → 反编译 → 重编译 | **8986/8986 字节精确** |
+| 同上,输入换 shipped 二进制 | 8967/8986 —— 失败的 19 个**正是**编译本身就复现不了的那 19 个,反编译器零新增 |
 
 唯一与 Python 产物的字节差异 = zlib 压缩流(压缩后端不同;游戏只做 inflate,无感知,
 且 Rust 产物略小)。
+
+`src/binlayout_decompile.rs` 能做到不动点,是因为 BINLAYOUT 自带完整结构,用**同一份内嵌
+schema**(`data/binlayout_schema.json`)反查即可命名一切 —— 不像 BINDAT 要靠词表。编译器
+丢弃的信息按「重编译后逐字节相同」的口径重建:`PARENTID` 从对象树推回;Group 的
+`CHOICE`/`GAME MODE`/`TAG`/`RANDOMIZATION`/`NUMBER`/`NO TAG FOUND`/`LEVEL UNIQUE`/
+`ACTIVE|DEACTIVE THEMES` 只存在于尾部 datagroup,解析后按结构配对写回 Group 对象;默认值
+(RANDOMIZATION 1、NUMBER 1、无 TAG)只在非默认时才发。**刻意不重建**默认朝向
+(`FORWARD` Z==1 / `RIGHT` X==1 / `UP` Y==1 编译时被跳过):shipped `.LAYOUT` 源码同样不写
+它们,凭空补一行等于向下游解析器**断言**了一个朝向,而按 `FORWARD × RIGHT` 推 `UP` 的读者
+会被这行假数据带偏。
 
 ## 性能 — 挑战者大陆全系列 10 组件(2026-07-04,16 核,磁盘缓存预热后,产物内容逐文件校验一致)
 
@@ -47,6 +277,9 @@ rollingHash + mhash 自洽;唯一字节差异 = zlib 压缩流(libdeflate,Rust �
 调优过程用 `MIKURO_TIMING=1` 输出分阶段计时。剩余热点是 Windows 每文件 open 开销
 (AFFIXES/SKILLS 等万级小文件读取,已并行摊薄;Defender 实时扫描是主因)与 MPP
 分类器(~1.9s/170 tile),继续压收益有限。
+
+解包侧:并行提取后 1.02 → 0.23 ms/文件,87764 文件 82.4s → 19.7s(**4.2×**),
+产出与串行版逐字节相同(内容 + mtime,73848 文件对账)。
 
 ## 最终对比 — vs 原生 GUTS 编辑器 DLL(挑战者大陆系列,5 次重复实验)
 
@@ -125,93 +358,6 @@ box 会在 **1100 vs 1125** 之间抖动(±25 cell = 一个 10-unit snap-tile;�
 前述 vanilla 语料残差(276839 cell)同属该信息论下限(原生 cliff/multichunk 不确定 +
 per-instance 运行时 nocollide),换语言/精度都不移动它。
 
-## 用法
-
-```powershell
-cargo build --release
-# 与 Python CLI 同参数:
-.\target\release\tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,none}] [--raw {auto,none}] [--deploy] <mod目录>
-# 反向:把 .MOD 解包回可编辑源目录(见下「解包」):
-.\target\release\tl2-mikuro-mod-packer.exe unpack <in.MOD|DATA.PAK> <out目录> [--raw] [--no-times] [--filter <文本>]
-# 单文件工具:
-.\target\release\tl2-mikuro-mod-packer.exe compile-dat      <in.DAT>       <out.BINDAT>
-.\target\release\tl2-mikuro-mod-packer.exe compile-layout   <in.LAYOUT>    <out.BINLAYOUT>
-.\target\release\tl2-mikuro-mod-packer.exe compile-mpp      <in.LAYOUT>    <out.mpp> [--media <MEDIA>] [--fallback <base MEDIA>]
-.\target\release\tl2-mikuro-mod-packer.exe decompile-dat    <in.BINDAT>    <out.DAT>    [--utf8]
-.\target\release\tl2-mikuro-mod-packer.exe decompile-layout <in.BINLAYOUT> <out.LAYOUT>
-# 语料验证:
-.\target\release\verify.exe binlayout|binlayout-roundtrip|bindat|raw|mpp <media_dir> ...
-.\target\release\verify.exe unpack <mod.MOD>   # 解包→重打包→逐条目内容对账
-```
-
-- 默认(不加 flag):内存内转换 + 直接打包,不写源目录(等价 Python 默认 overrides 模式)。
-- `--deploy`:输出 `<MOD_FILE_NAME>.MOD` 到 `%Documents%\My Games\Runic Games\Torchlight 2\mods`
-  (注册表 Shell Folders 解析,OneDrive 重定向安全)。
-- `--mpp re`(默认)离线寻路网格(≈99.7% cell 精确,已知天花板 — 见下「原生非确定性」);
-  `--mpp none` 保留源目录已有 .mpp。
-- 旧的 `--mpp dll` 后端(外壳驱动 `TL2-Mikuro-Console.exe`)**已移除**:离线后端的
-  可走性已到浮点地板,而那个包装要把整个 mod 复制进 `<install>\mods\<name>`、覆盖同名
-  目录才能让 `CreateMod` 认。现在 `re` / `none` 就是全部,其他值一律报错。
-- `compile-mpp --fallback <base MEDIA>`:单瓦片编译时启用 **mod-over-base VFS overlay**
-  (先查 `--media` 的 mod,再查 `--fallback` 的基础安装),用于把单个 mod 瓦片按整包
-  构建的口径解析基础游戏 link/mesh 目标。整包构建(主命令)已自动带此 overlay。
-- 环境变量:`TL2_MEDIA_DIR`(基础游戏 MEDIA,默认 `E:\Torchlight 2\MEDIA`)、
-  `TL2_MOD_GAMEVER`(覆写 header gamever)。
-
-无参数启动(双击/拖进目录)会进 ratatui 交互界面:同一张列表里,带 `MOD.DAT` 的子目录
-标为 **pack**,同级/`mods/` 下的 `.MOD` 文件标为 **unpack**(解到 `<root>/unpacked/<名字>/`)。
-
-## 解包(unpack)—— 整条打包链的逆向
-
-`.MOD` **不是**普通压缩包:打包时编译器先跑过,容器里存的是**编译产物,却挂在源文件名下**
-(`FOO.DAT` 里其实是 BINDAT,`FOO.LAYOUT` 里其实是 BINLAYOUT — 见 `packer.rs` 的
-`PACK_EXCLUDE_SUFFIXES` 注释)。所以解包必须**反向编译**,否则产出的树里全是「看着像源码、
-其实是二进制」的文件。
-
-```text
-.MOD ─┬─ header      → MOD.DAT              (build_header 的逆)
-      ├─ *.DAT       → bindat_decompile     → UTF-16LE 文本 .DAT
-      ├─ *.LAYOUT    → binlayout_decompile  → UTF-16LE 文本 .LAYOUT
-      └─ 其它                                → 原样写出
-```
-
-`src/binlayout_decompile.rs` 是新写的 BINLAYOUT 反编译器:BINLAYOUT 自带完整结构,
-用**同一份内嵌 schema**(`data/binlayout_schema.json`)反查即可命名一切 —— 不像 BINDAT
-要靠词表。编译器丢弃的信息按「重编译后逐字节相同」的口径重建:`PARENTID` 从对象树推回;
-Group 的 `CHOICE`/`GAME MODE`/`TAG`/`RANDOMIZATION`/`NUMBER`/`NO TAG FOUND`/
-`LEVEL UNIQUE`/`ACTIVE|DEACTIVE THEMES` 只存在于尾部 datagroup,解析后按结构配对写回
-Group 对象;默认值(RANDOMIZATION 1、NUMBER 1、无 TAG)只在非默认时才发。
-**刻意不重建**默认朝向(`FORWARD` Z==1 / `RIGHT` X==1 / `UP` Y==1 编译时被跳过):shipped
-`.LAYOUT` 源码同样不写它们,凭空补一行等于向下游解析器**断言**了一个朝向,而按
-`FORWARD × RIGHT` 推 `UP` 的读者会被这行假数据带偏。
-
-### 验证
-
-| 检查 | 结果 |
-| --- | --- |
-| `verify binlayout-roundtrip` 不动点(我们编译的 BINLAYOUT → 反编译 → 重编译) | **8986/8986 字节精确** |
-| 同上,输入换成 shipped 二进制 | 8967/8986 —— 失败的 19 个**正是** `verify binlayout` 里编译本身就复现不了的那 19 个(shipped 未初始化 `@25` 垃圾),反编译器零新增 |
-| 单元测试 `pack_unpack_repack_is_byte_identical` | 打包→解包→重打包 **SHA256 完全相同**(含 header/MOD.DAT 环回与还原的 FILETIME) |
-| 真实第三方 GUTS mod(熊猫联纵三号,3452 文件)解包→重打包→再解包 | 3452/3453 文件逐字节相同,唯一差异 = 生成型索引 `UNITDATA.RAW` 的**条目顺序**(GUTS 与本实现的枚举序不同,长度/内容集相同) |
-| 绿洲联盟 9 号(73 文件) | 73/74 相同,唯一差异同为生成型 `UI.RAW` 顺序 |
-
-第一轮往返**不能**还原的三件事(都是机制固有,不是丢数据):
-1. **gameVersion** — 打包时从已安装的 `Torchlight2.exe` 读,MOD.DAT 里没有这个字段;
-   解包会把原值打印出来,重打包前 `TL2_MOD_GAMEVER=0x…` 固定即可。
-2. **词表反查不到的 DAT key 名** — 发 `UNK_<HEX8>` 占位符。它**编译回同一个 hash**
-   (游戏照读),但可读名字没了;解包会逐个列出。⚠️ 永远别手改 UNK_ 里的数字。
-3. **生成型文件(`MEDIA/*.RAW`)在 manifest 里的顺序** — 它们原本没有源文件,打包器把它们
-   追加在磁盘扫描之后;解包把它们落到磁盘后,下次扫描就按排序位置收编。条目集合、内容、
-   两个校验哈希都不受影响,**从第二轮起解包↔打包完全字节稳定**。
-
-另注:`packer::filetime_of` 走 `f64` 秒(53 位尾数装不下 57 位的 FILETIME ticks),
-所以还原的时间戳重读时可能差 ±2 tick(200ns)。字段本身只是信息性的。
-
-解包不动的两个安全边界:manifest 路径经 `sanitize_rel` 过滤(`..`/盘符/反斜杠一律拒绝,
-不允许写出目标目录);**反编译失败的载荷不会挂到源文件名上**,而是落成
-`FOO.LAYOUT.BINLAYOUT` 并报警 —— 因为 `content_for` 会去「编译」源文件名位置的东西,
-拿二进制当 layout 文本编译的结果是一个**空的 8 字节 layout**,那才是真的静默毁数据。
-
 ## 与 Python 版的实现对应
 
 | Rust | Python | 说明 |
@@ -225,7 +371,8 @@ Group 对象;默认值(RANDOMIZATION 1、NUMBER 1、无 TAG)只在非默认时�
 | `src/binlayout_decompile.rs` | — | BINLAYOUT → LAYOUT 反编译(schema 反查;不动点 8986/8986) |
 | `src/bindat_decompile.rs` | — | BINDAT → DAT 反编译(内嵌词表 + `UNK_<HEX8>` 转义) |
 | `src/pak.rs` / `src/unpack.rs` | — | 容器读取(header/manifest/块)与 `.MOD`→源目录解包 |
-| `src/mpp/*` | `mpp/*` | region 头部 f32 舍入逐操作对齐;native 分类器 = `build_grid_fast` 等价(桶剔除,逐行 rayon 并行);无 `dll.rs` —— 字节精确走编辑器控制台宿主 |
+| `src/tui.rs` | — | ratatui 交互界面(binary-only,不进 wasm) |
+| `src/mpp/*` | `mpp/*` | region 头部 f32 舍入逐操作对齐;native 分类器 = `build_grid_fast` 等价(桶剔除,逐行 rayon 并行) |
 
 刻意保留的 bug-for-bug 行为:ogre_mesh 顶点声明只读第一个 element(Python 的 +14
 步进 bug,POSITION 恒为 element 0);binlayout 的 `NAME`/`CHOICE`/`GAME MODE` 首次出现
@@ -233,6 +380,8 @@ Group 对象;默认值(RANDOMIZATION 1、NUMBER 1、无 TAG)只在非默认时�
 `tl2-packer-formats-bindat-binlayout-mpp` 项目记忆。
 
 未移植:`rules.py`(multichunk 分类只影响诊断信息,不影响 .mpp 字节)。
+
+浏览器版(同一套 `#[path]` 共享代码编到 wasm)见 `../tl2-mikuro-mod-packer-wasm`。
 
 ## BINDAT 双 id 模式(2026-07-04 起)
 

@@ -518,7 +518,7 @@ pub fn run() -> ExitCode {
     }
 
     if packs.is_empty() && unpacks.is_empty() {
-        println!("Mikuro Torchlight II Mod Packer");
+        println!("Mikuro Torchlight II Mod Un/Packer");
         println!();
         println!("Nothing to pack or unpack under:");
         println!("  {}", root.display());
@@ -1226,7 +1226,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let p = Paragraph::new(line)
         .block(panel_body(
             Span::styled(
-                " Mikuro Torchlight II Mod Packer ",
+                " Mikuro Torchlight II Mod Un/Packer ",
                 Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
             ),
             theme::LINE_HI,
@@ -1800,7 +1800,7 @@ mod tests {
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         dump("PACK", &text);
-        assert!(text.contains("Mikuro Torchlight II Mod Packer"), "header brand");
+        assert!(text.contains("Mikuro Torchlight II Mod Un/Packer"), "header brand");
         for t in ["PACK", "UNPACK", "OUTPUT"] {
             assert!(text.contains(t), "tab bar shows {t}");
         }
