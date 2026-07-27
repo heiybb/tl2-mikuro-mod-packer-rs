@@ -57,20 +57,36 @@ mod theme {
 enum Lang {
     En,
     Zh,
+    Ru,
 }
 
 impl Lang {
-    /// Pick a string by language. Call sites read `t(en, zh)`, English first,
-    /// so the source stays greppable against the CLI's own wording.
-    fn t(self, en: &'static str, zh: &'static str) -> &'static str {
+    /// Pick a string by language. Call sites read `t(en, zh, ru)`, English
+    /// first, so the source stays greppable against the CLI's own wording.
+    fn t(self, en: &'static str, zh: &'static str, ru: &'static str) -> &'static str {
         match self {
             Lang::En => en,
             Lang::Zh => zh,
+            Lang::Ru => ru,
         }
     }
 
-    fn is_zh(self) -> bool {
-        self == Lang::Zh
+    /// Short tag for the header, in the language's own script.
+    fn tag(self) -> &'static str {
+        match self {
+            Lang::En => "EN",
+            Lang::Zh => "中文",
+            Lang::Ru => "RU",
+        }
+    }
+
+    /// Cycle order for the in-app switch.
+    fn next(self) -> Lang {
+        match self {
+            Lang::En => Lang::Zh,
+            Lang::Zh => Lang::Ru,
+            Lang::Ru => Lang::En,
+        }
     }
 }
 
@@ -82,37 +98,50 @@ impl Lang {
 /// UI (or the reverse) has no other way to say so.
 fn detect_lang() -> Lang {
     if let Some(v) = std::env::var_os("TL2_LANG") {
-        let v = v.to_string_lossy().to_ascii_lowercase();
-        if v.starts_with("zh") || v.starts_with("cn") {
-            return Lang::Zh;
-        }
-        if v.starts_with("en") {
-            return Lang::En;
+        if let Some(l) = lang_from_code(&v.to_string_lossy()) {
+            return l;
         }
     }
     #[cfg(windows)]
     {
-        // LANGID low 10 bits = primary language; 0x04 = LANG_CHINESE (any of
-        // zh-CN / zh-TW / zh-HK — all get the Simplified strings, which is the
-        // audience this tool actually has).
+        // LANGID low 10 bits = primary language.
+        //   0x04 LANG_CHINESE (zh-CN / TW / HK — all get the Simplified strings,
+        //                      which is the audience this tool actually has)
+        //   0x19 LANG_RUSSIAN
         let id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
-        if id & 0x3FF == 0x04 {
-            return Lang::Zh;
-        }
-        // A non-Chinese Windows UI is a real answer; fall through to English
-        // rather than letting a stray POSIX LANG override the OS setting.
-        return Lang::En;
+        return match id & 0x3FF {
+            0x04 => Lang::Zh,
+            0x19 => Lang::Ru,
+            // A Windows UI in some other language is a real answer; fall to
+            // English rather than letting a stray POSIX LANG override the OS.
+            _ => Lang::En,
+        };
     }
     #[cfg(not(windows))]
     {
         for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
             if let Ok(v) = std::env::var(key) {
-                if v.to_ascii_lowercase().starts_with("zh") {
-                    return Lang::Zh;
+                if let Some(l) = lang_from_code(&v) {
+                    return l;
                 }
             }
         }
         Lang::En
+    }
+}
+
+/// Map a locale-ish string (`zh`, `zh_CN.UTF-8`, `ru-RU`, `en_AU`) to a UI
+/// language. `None` when it names none of them, so detection keeps looking.
+fn lang_from_code(v: &str) -> Option<Lang> {
+    let v = v.to_ascii_lowercase();
+    if v.starts_with("zh") || v.starts_with("cn") {
+        Some(Lang::Zh)
+    } else if v.starts_with("ru") {
+        Some(Lang::Ru)
+    } else if v.starts_with("en") {
+        Some(Lang::En)
+    } else {
+        None
     }
 }
 
@@ -164,8 +193,8 @@ enum Origin {
 impl Origin {
     fn label(self, lang: Lang) -> &'static str {
         match self {
-            Origin::Local => lang.t("local", "本地"),
-            Origin::Deployed => lang.t("game mods", "游戏 mods"),
+            Origin::Local => lang.t("local", "本地", "локально"),
+            Origin::Deployed => lang.t("game mods", "游戏 mods", "моды игры"),
         }
     }
 }
@@ -691,8 +720,15 @@ impl App {
         }
     }
 
-    fn t(&self, en: &'static str, zh: &'static str) -> &'static str {
-        self.lang.t(en, zh)
+    fn t(&self, en: &'static str, zh: &'static str, ru: &'static str) -> &'static str {
+        self.lang.t(en, zh, ru)
+    }
+
+    /// Cycle the UI language. In-app because someone can land in a language
+    /// they cannot read — the key is in the footer of every tab, and the
+    /// header shows which language is live.
+    fn cycle_lang(&mut self) {
+        self.lang = self.lang.next();
     }
 
     fn is_packing(&self) -> bool {
@@ -796,6 +832,8 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
             KeyCode::Char('2') => app.tab = TAB_UNPACK,
             KeyCode::Char('3') => app.tab = TAB_OUTPUT,
             KeyCode::Char('4') | KeyCode::Char('?') | KeyCode::F(1) => app.tab = TAB_HELP,
+            // Language switch, live on every tab (see the footer hint).
+            KeyCode::Char('l') | KeyCode::Char('L') => app.cycle_lang(),
             KeyCode::Char('q') | KeyCode::Esc => {
                 // Ignore quit while a run is going (the child would orphan).
                 if !app.is_packing() {
@@ -882,6 +920,15 @@ fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, areas[4], app);
 }
 
+/// Display width in terminal columns. CJK and full-width punctuation take two
+/// cells; everything else this UI draws (Latin, Cyrillic, box-drawing, arrows)
+/// takes one. Used to decide what still fits on the single-row header.
+fn disp_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| if (c as u32) >= 0x2E80 { 2 } else { 1 })
+        .sum()
+}
+
 /// Panel inner padding: one column each side so text never kisses the border.
 fn panel(title: Span<'_>, border: Color) -> Block<'_> {
     Block::default()
@@ -909,19 +956,19 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     };
     let (status, status_style) = if app.is_packing() {
         (
-            app.t("running…", "运行中…").to_string(),
+            app.t("running…", "运行中…", "работа…").to_string(),
             Style::default().fg(theme::GOLD).add_modifier(Modifier::BOLD),
         )
     } else if app.finished.load(Ordering::Relaxed) {
         (
-            app.t("done", "完成").to_string(),
+            app.t("done", "完成", "готово").to_string(),
             Style::default().fg(theme::SET).add_modifier(Modifier::BOLD),
         )
     } else if let Some(p) = app.pane() {
         (
             format!(
                 "{} {}/{}",
-                app.t("selected", "已选"),
+                app.t("selected", "已选", "выбрано"),
                 p.picked_count(),
                 p.items.len()
             ),
@@ -931,19 +978,41 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         (String::new(), Style::default())
     };
     let gap = || Span::raw("  ");
-    let line = Line::from(vec![
-        tab(app.tab == TAB_PACK, app.t("PACK", "打包"), Some(app.pack.items.len())),
+    let mut spans = vec![
+        tab(app.tab == TAB_PACK, app.t("PACK", "打包", "СБОРКА"), Some(app.pack.items.len())),
         gap(),
-        tab(app.tab == TAB_UNPACK, app.t("UNPACK", "解包"), Some(app.unpack.items.len())),
+        tab(
+            app.tab == TAB_UNPACK,
+            app.t("UNPACK", "解包", "РАСПАКОВКА"),
+            Some(app.unpack.items.len()),
+        ),
         gap(),
-        tab(app.tab == TAB_OUTPUT, app.t("OUTPUT", "输出"), None),
+        tab(app.tab == TAB_OUTPUT, app.t("OUTPUT", "输出", "ВЫВОД"), None),
         gap(),
-        tab(app.tab == TAB_HELP, app.t("HELP", "帮助"), None),
-        Span::styled(app.t("    base ", "    base "), Style::default().fg(theme::MUTED)),
-        Span::styled(app.base.short(), Style::default().fg(theme::GOLD)),
-        Span::styled("    ", Style::default()),
-        Span::styled(status, status_style),
-    ]);
+        tab(app.tab == TAB_HELP, app.t("HELP", "帮助", "СПРАВКА"), None),
+    ];
+    // The header is one row and the labels are longest in Russian, so on a
+    // narrow terminal something has to go. Drop in order of what the user can
+    // recover elsewhere: the base tier is spelled out in full on the Help tab,
+    // and the language switch is advertised in the footer of every tab — the
+    // RUN STATUS has no other home, so it is the last thing to be given up.
+    let inner = area.width.saturating_sub(4) as usize; // borders + padding
+    let used: usize = spans.iter().map(|s| disp_width(&s.content)).sum();
+    let status_w = disp_width(&status) + 3;
+    let lang_w = disp_width(app.lang.tag()) + 3;
+    let base_w = disp_width(app.base.short()) + 3 + 5; // + "base "
+    if used + status_w + lang_w + base_w <= inner {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(app.lang.tag(), Style::default().fg(theme::MAGIC)));
+        spans.push(Span::styled("   base ", Style::default().fg(theme::MUTED)));
+        spans.push(Span::styled(app.base.short(), Style::default().fg(theme::GOLD)));
+    } else if used + status_w + lang_w <= inner {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(app.lang.tag(), Style::default().fg(theme::MAGIC)));
+    }
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(status, status_style));
+    let line = Line::from(spans);
     let p = Paragraph::new(line)
         .block(panel(
             Span::styled(
@@ -962,9 +1031,17 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     let Some(pane) = app.pane() else { return };
     let title = Span::styled(
         if unpacking {
-            app.t(" unpack · Space select · Enter run ", " 解包 · Space 选择 · Enter 运行 ")
+            app.t(
+                " unpack · Space select · Enter run ",
+                " 解包 · Space 选择 · Enter 运行 ",
+                " распаковка · Space выбор · Enter пуск ",
+            )
         } else {
-            app.t(" pack · Space select · Enter run ", " 打包 · Space 选择 · Enter 运行 ")
+            app.t(
+                " pack · Space select · Enter run ",
+                " 打包 · Space 选择 · Enter 运行 ",
+                " сборка · Space выбор · Enter пуск ",
+            )
         },
         Style::default().fg(theme::MUTED),
     );
@@ -974,12 +1051,12 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         let msg = if unpacking {
             vec![
                 Line::from(Span::styled(
-                    app.t("No .MOD files found.", "没有找到 .MOD 文件。"),
+                    app.t("No .MOD files found.", "没有找到 .MOD 文件。", "Файлы .MOD не найдены."),
                     Style::default().fg(theme::MUTED),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    app.t("Looked in:", "找过这些位置:"),
+                    app.t("Looked in:", "找过这些位置:", "Искали здесь:"),
                     Style::default().fg(theme::FAINT),
                 )),
                 Line::from(Span::styled(
@@ -998,7 +1075,11 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         } else {
             vec![
                 Line::from(Span::styled(
-                    app.t("No mod sources found.", "没有找到可打包的 mod 源目录。"),
+                    app.t(
+                        "No mod sources found.",
+                        "没有找到可打包的 mod 源目录。",
+                        "Исходные папки модов не найдены.",
+                    ),
                     Style::default().fg(theme::MUTED),
                 )),
                 Line::from(""),
@@ -1006,6 +1087,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
                     app.t(
                         "A source is a folder holding MOD.DAT and a MEDIA/ tree.",
                         "源目录 = 一个含 MOD.DAT 和 MEDIA/ 的文件夹。",
+                        "Исходная папка — это папка с MOD.DAT и деревом MEDIA/.",
                     ),
                     Style::default().fg(theme::FAINT),
                 )),
@@ -1037,11 +1119,11 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
                     }),
                 ),
                 (Action::Pack, true) => Span::styled(
-                    app.t("  (level mod)", "  (关卡 mod)"),
+                    app.t("  (level mod)", "  (关卡 mod)", "  (мод уровней)"),
                     Style::default().fg(theme::MAGIC),
                 ),
                 (Action::Pack, false) => Span::styled(
-                    app.t("  (content mod)", "  (内容 mod)"),
+                    app.t("  (content mod)", "  (内容 mod)", "  (мод контента)"),
                     Style::default().fg(theme::FAINT),
                 ),
             };
@@ -1089,22 +1171,27 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
     };
     let (title, tstyle) = if total == 0 {
         (
-            app.t(" Output · empty ", " 输出 · 空 ").to_string(),
+            app.t(" Output · empty ", " 输出 · 空 ", " Вывод · пусто ").to_string(),
             Style::default().fg(theme::FAINT),
         )
     } else if app.follow {
         (
             format!(
                 " {} · {} · {total} {} ",
-                app.t("Output", "输出"),
-                app.t("following", "跟随"),
-                app.t("lines", "行")
+                app.t("Output", "输出", "Вывод"),
+                app.t("following", "跟随", "слежение"),
+                app.t("lines", "行", "строк")
             ),
             Style::default().fg(theme::SET),
         )
     } else {
         (
-            format!(" {} · {}/{} ", app.t("Output", "输出"), scroll.min(total), total),
+            format!(
+                " {} · {}/{} ",
+                app.t("Output", "输出", "Вывод"),
+                scroll.min(total),
+                total
+            ),
             Style::default().fg(theme::MUTED),
         )
     };
@@ -1119,6 +1206,11 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
 /// `detect_base` / `resolve_base_media` for the base tiers, `discover_*` for the
 /// scanned locations, `pack_worker` for where output lands, `main::usage` for
 /// the CLI — so it cannot drift into describing a tool we do not ship.
+///
+/// Translations keep ONE line per line: `chinese_ui_renders_and_keeps_commands_
+/// verbatim` asserts the three languages have equal line counts and that no
+/// line is blank in one language and not another, so a skipped translation
+/// cannot slip through as a stray empty row.
 fn help_lines(app: &App) -> Vec<Line<'static>> {
     let head = |s: &str| {
         Line::from(Span::styled(
@@ -1126,8 +1218,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
         ))
     };
-    let body = |s: String| Line::from(Span::styled(s, Style::default().fg(theme::TEXT)));
-    let dim = |s: String| Line::from(Span::styled(s, Style::default().fg(theme::MUTED)));
+    let body = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(theme::TEXT)));
+    let dim = |s: &str| Line::from(Span::styled(s.to_string(), Style::default().fg(theme::MUTED)));
     let path = |s: String| Line::from(Span::styled(s, Style::default().fg(theme::GOLD)));
     let cmd = |c: &str, what: &str| {
         Line::from(vec![
@@ -1137,196 +1229,316 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
     };
     let blank = || Line::from("");
     let root = app.root.display().to_string();
-    let t = |en: &'static str, zh: &'static str| app.t(en, zh);
+    let t = |en: &'static str, zh: &'static str, ru: &'static str| app.t(en, zh, ru);
     // Command names and flags are never translated — they are what you type.
     let mut v = vec![
         head(t(
             "BASE BUNDLE — what it is, and why packing needs it",
             "BASE BUNDLE —— 它是什么,为什么打包需要它",
+            "BASE BUNDLE — что это и зачем он нужен при сборке",
         )),
         body(t(
             "Two things a mod build cannot compute from the mod alone:",
             "有两样东西,光靠 mod 自己算不出来:",
-        ).into()),
+            "Две вещи сборка не может вычислить из одного лишь мода:",
+        )),
         dim(t(
             "  · UNITDATA.RAW follows each unit's BASEFILE chain into the BASE GAME's",
             "  · UNITDATA.RAW 要沿每个单位的 BASEFILE 继承链,读「基础游戏」的",
-        ).into()),
+            "  · UNITDATA.RAW идёт по цепочке BASEFILE каждого юнита в шаблоны",
+        )),
         dim(t(
             "    UNITS templates to read UNITTYPE / LEVEL / RARITY / CREATEAS.",
             "    UNITS 模板里的 UNITTYPE / LEVEL / RARITY / CREATEAS。",
-        ).into()),
+            "    UNITS БАЗОВОЙ ИГРЫ за UNITTYPE / LEVEL / RARITY / CREATEAS.",
+        )),
         dim(t(
             "  · MPP walk-grids are baked against the base game's COLLISION geometry.",
             "  · MPP 寻路走格要拿基础游戏的碰撞几何来烘。",
-        ).into()),
+            "  · Сетки проходимости MPP пекутся по геометрии столкновений базы.",
+        )),
         body(t(
             "So the packer needs base data. It takes the first of three tiers:",
             "所以打包需要 base 数据。按顺序取三层里第一个可用的:",
-        ).into()),
+            "Значит нужны базовые данные. Берётся первый доступный из трёх:",
+        )),
         dim(t(
             "  1. loose MEDIA/ next to this exe         (a real extracted install)",
             "  1. exe 旁边的散装 MEDIA/          (真实解包出来的安装目录)",
-        ).into()),
+            "  1. распакованная MEDIA/ рядом с exe   (настоящая установка игры)",
+        )),
         dim(t(
             "  2. PAKS/DATA.PAK — or DATA.PAK — beside it (extracted on first use)",
             "  2. 旁边的 PAKS/DATA.PAK 或 DATA.PAK  (首次使用时抽取)",
-        ).into()),
+            "  2. рядом PAKS/DATA.PAK или DATA.PAK   (извлекается при 1-м запуске)",
+        )),
         dim(t(
             "  3. the bundle baked into this exe        (always there, ~3 MB gzip)",
             "  3. 烧在这个 exe 里的 bundle        (永远可用,gzip 约 3 MB)",
-        ).into()),
-        body(format!("{} {}", t("Right now:", "当前用的是:"), app.base.label())),
+            "  3. бандл, вшитый в этот exe           (всегда есть, ~3 МБ gzip)",
+        )),
+        body(&format!(
+            "{} {}",
+            t("Right now:", "当前用的是:", "Сейчас:"),
+            app.base.label()
+        )),
         dim(t(
             "Tiers 2 and 3 unpack once into a cache next to the exe and reuse it:",
             "第 2、3 层会在 exe 旁解出一份缓存,之后复用:",
-        ).into()),
+            "Уровни 2 и 3 один раз распаковываются в кэш рядом с exe:",
+        )),
         path(format!("  {}", app.root.join(".tl2packer_base").display())),
         dim(t(
             "All three produce byte-identical .MOD output — verified on a level mod.",
             "三层产出的 .MOD 逐字节一致 —— 已在一个关卡 mod 上验证过。",
-        ).into()),
+            "Все три дают побайтово одинаковый .MOD — проверено на моде уровней.",
+        )),
         blank(),
-        head(t("CONTENT MOD vs LEVEL MOD", "CONTENT MOD 与 LEVEL MOD")),
+        head(t(
+            "CONTENT MOD vs LEVEL MOD",
+            "CONTENT MOD 与 LEVEL MOD",
+            "МОД КОНТЕНТА и МОД УРОВНЕЙ",
+        )),
         body(t(
             "The picker tags each source by one test: does MEDIA/LAYOUTS hold any",
             "列表给每个源目录打的标签只看一件事:MEDIA/LAYOUTS 里有没有",
-        ).into()),
-        body(t("*.LAYOUT file?", "任何 *.LAYOUT 文件?").into()),
+            "Метка в списке ставится по одной проверке: есть ли в MEDIA/LAYOUTS",
+        )),
+        body(t(
+            "*.LAYOUT file?",
+            "任何 *.LAYOUT 文件?",
+            "хоть один файл *.LAYOUT?",
+        )),
         dim(t(
             "  content mod — no layouts. Nothing to bake; packs with --mpp none.",
             "  内容 mod —— 没有 layout。没东西要烘,按 --mpp none 打包。",
-        ).into()),
+            "  мод контента — layout нет. Печь нечего, сборка с --mpp none.",
+        )),
         dim(t(
             "  level mod   — has layouts. Its pathing walk-grids (.MPP) are",
             "  关卡 mod —— 有 layout。它的寻路走格(.MPP)会用 --mpp re",
-        ).into()),
+            "  мод уровней — layout есть. Сетки проходимости (.MPP) заново",
+        )),
         dim(t(
             "                regenerated with --mpp re, which is why it needs the",
             "              重新生成,这正是它需要上面那份基础碰撞几何的原因。",
-        ).into()),
+            "                пекутся через --mpp re — потому и нужна геометрия",
+        )),
         dim(t(
             "                base collision geometry above. Tier 3 is embedded, so",
             "              第 3 层是内嵌的,所以 base 总是可用;",
-        ).into()),
+            "                столкновений выше. Уровень 3 вшит, база есть всегда;",
+        )),
         dim(t(
             "                base is always available; if resolving it fails anyway",
             "              万一解析失败,打包照常进行,",
-        ).into()),
+            "                если её всё же не удалось получить, сборка идёт",
+        )),
         dim(t(
             "                the pack still runs and keeps the existing .MPP.",
             "              只是保留源目录里已有的 .MPP。",
-        ).into()),
+            "                дальше и сохраняет уже имеющийся .MPP.",
+        )),
         blank(),
-        head(t("WHERE FILES ARE READ FROM", "从哪里读文件")),
+        head(t(
+            "WHERE FILES ARE READ FROM",
+            "从哪里读文件",
+            "ОТКУДА ЧИТАЮТСЯ ФАЙЛЫ",
+        )),
         body(t(
             "PACK scans for folders holding MOD.DAT (plus a MEDIA/ tree):",
             "打包:扫描含 MOD.DAT(以及 MEDIA/ 树)的文件夹:",
-        ).into()),
+            "СБОРКА ищет папки с MOD.DAT (и деревом MEDIA/):",
+        )),
         path(format!("  {root}")),
         path(format!("  {}", app.root.join("mods").display())),
         body(t(
             "UNPACK scans for *.MOD files in those two, plus the game's mods folder",
             "解包:在上面两处找 *.MOD,另外加上游戏的 mods 目录 —— 也就是",
-        ).into()),
+            "РАСПАКОВКА ищет *.MOD в этих двух плюс в папке модов игры —",
+        )),
         body(t(
             "— the one --deploy writes to, so anything you just packed shows up:",
             "--deploy 的落点,所以你刚打好的包会直接出现在列表里:",
-        ).into()),
+            "туда пишет --deploy, поэтому только что собранное сразу видно:",
+        )),
         path(format!("  {}", tl2_mods_dir().display())),
         dim(t(
             "Rows are deduped by real path and tagged local / game mods.",
             "按真实路径去重,每行标出处(本地 / 游戏 mods)。",
-        ).into()),
+            "Дубли убираются по реальному пути, у строки есть метка источника.",
+        )),
         blank(),
-        head(t("WHERE OUTPUT GOES", "输出到哪里")),
+        head(t("WHERE OUTPUT GOES", "输出到哪里", "КУДА ИДЁТ РЕЗУЛЬТАТ")),
         body(t(
             "PACK from this TUI always deploys, i.e. writes <MOD_FILE_NAME>.MOD to",
             "在这个界面里打包一律 --deploy,即把 <MOD_FILE_NAME>.MOD 写到:",
-        ).into()),
+            "Сборка из этого интерфейса всегда пишет <MOD_FILE_NAME>.MOD в:",
+        )),
         path(format!("  {}", tl2_mods_dir().display())),
         dim(t(
             "  (MOD_FILE_NAME comes from MOD.DAT; the folder name is the fallback.)",
             "  (MOD_FILE_NAME 取自 MOD.DAT;没有就退回文件夹名。)",
-        ).into()),
+            "  (MOD_FILE_NAME берётся из MOD.DAT; иначе — имя папки.)",
+        )),
         body(t(
             "UNPACK writes a source tree — MOD.DAT + MEDIA/ — under:",
             "解包写出一棵源目录树(MOD.DAT + MEDIA/),落在:",
-        ).into()),
+            "Распаковка пишет дерево исходников (MOD.DAT + MEDIA/) в:",
+        )),
         path(format!("  {}", app.root.join("unpacked").display())),
         dim(t(
             "  one subfolder per mod. The game's mods folder is never written to by",
-            "  每个 mod 一个子目录。解包**从不**写游戏 mods 目录,",
-        ).into()),
+            "  每个 mod 一个子目录。解包「从不」写游戏 mods 目录,",
+            "  по подпапке на мод. Распаковка НИКОГДА не пишет в папку модов",
+        )),
         dim(t(
             "  an unpack, so unpacking something you have installed is safe.",
             "  所以解包一个你已经装着的 mod 是安全的。",
-        ).into()),
+            "  игры, поэтому распаковать установленный мод безопасно.",
+        )),
         blank(),
         head(t(
             "CLI MODE — run it with arguments instead",
             "CLI 模式 —— 带参数运行",
+            "РЕЖИМ CLI — запуск с аргументами",
         )),
         dim(t(
             "Launching with no arguments is what opens this TUI. With arguments it",
             "不带参数启动才会进这个界面;",
-        ).into()),
+            "Без аргументов открывается этот интерфейс;",
+        )),
         dim(t(
             "is the ordinary command-line packer:",
             "带参数时它就是普通的命令行打包器:",
-        ).into()),
+            "с аргументами это обычный упаковщик командной строки:",
+        )),
         blank(),
-        cmd("<mod_dir> [--deploy]", t("pack a mod folder", "打包一个 mod 目录")),
+        cmd(
+            "<mod_dir> [--deploy]",
+            t("pack a mod folder", "打包一个 mod 目录", "собрать папку мода"),
+        ),
         cmd(
             "   --in-place | --temp-copy",
-            t("write converted files out (default: in memory)", "把转换产物写到磁盘(默认只在内存)"),
+            t(
+                "write converted files out (default: in memory)",
+                "把转换产物写到磁盘(默认只在内存)",
+                "писать конвертированное на диск (по умолч. в памяти)",
+            ),
         ),
-        cmd("   --mpp re|dll|none", t("walk-grid backend (default re)", "走格后端(默认 re)")),
-        cmd("   --raw auto|none", t("RAW index generation (default auto)", "RAW 索引生成(默认 auto)")),
+        cmd(
+            "   --mpp re|dll|none",
+            t(
+                "walk-grid backend (default re)",
+                "走格后端(默认 re)",
+                "бэкенд сеток (по умолч. re)",
+            ),
+        ),
+        cmd(
+            "   --raw auto|none",
+            t(
+                "RAW index generation (default auto)",
+                "RAW 索引生成(默认 auto)",
+                "генерация RAW-индексов (по умолч. auto)",
+            ),
+        ),
         blank(),
         cmd(
             "unpack <in.MOD|DATA.PAK> <out_dir>",
-            t("container -> editable sources", "容器 -> 可编辑源目录"),
+            t(
+                "container -> editable sources",
+                "容器 -> 可编辑源目录",
+                "контейнер -> исходники для правки",
+            ),
         ),
-        cmd("   --raw", t("keep payloads compiled (no decompile)", "保留编译产物,不反编译")),
-        cmd("   --no-times", t("do not restore file timestamps", "不还原文件时间戳")),
-        cmd("   --filter <text>", t("only entries whose path contains <text>", "只解包路径含 <text> 的条目")),
+        cmd(
+            "   --raw",
+            t(
+                "keep payloads compiled (no decompile)",
+                "保留编译产物,不反编译",
+                "оставить скомпилированным (без декомпиляции)",
+            ),
+        ),
+        cmd(
+            "   --no-times",
+            t(
+                "do not restore file timestamps",
+                "不还原文件时间戳",
+                "не восстанавливать метки времени",
+            ),
+        ),
+        cmd(
+            "   --filter <text>",
+            t(
+                "only entries whose path contains <text>",
+                "只解包路径含 <text> 的条目",
+                "только записи, чей путь содержит <text>",
+            ),
+        ),
         blank(),
-        cmd("compile-dat <in.DAT> <out.BINDAT>", t("single file", "单文件")),
-        cmd("compile-layout <in.LAYOUT> <out.BINLAYOUT>", t("single file", "单文件")),
-        cmd("compile-mpp <in.LAYOUT> <out.mpp>", t("single tile walk-grid", "单块瓦片走格")),
+        cmd(
+            "compile-dat <in.DAT> <out.BINDAT>",
+            t("single file", "单文件", "один файл"),
+        ),
+        cmd(
+            "compile-layout <in.LAYOUT> <out.BINLAYOUT>",
+            t("single file", "单文件", "один файл"),
+        ),
+        cmd(
+            "compile-mpp <in.LAYOUT> <out.mpp>",
+            t("single tile walk-grid", "单块瓦片走格", "сетка одного тайла"),
+        ),
         cmd(
             "decompile-dat <in.BINDAT> <out.DAT>",
-            t("inverse; --utf8 for a plain dump", "逆向;--utf8 出纯文本"),
+            t(
+                "inverse; --utf8 for a plain dump",
+                "逆向;--utf8 出纯文本",
+                "обратно; --utf8 — простой дамп",
+            ),
         ),
-        cmd("decompile-layout <in.BINLAYOUT> <out.LAYOUT>", t("inverse", "逆向")),
+        cmd(
+            "decompile-layout <in.BINLAYOUT> <out.LAYOUT>",
+            t("inverse", "逆向", "обратно"),
+        ),
         cmd(
             "extract-base <DATA.PAK> <out_dir>",
-            t("base DATs + collision meshes", "基础 DAT + 碰撞网格"),
+            t(
+                "base DATs + collision meshes",
+                "基础 DAT + 碰撞网格",
+                "базовые DAT + меши столкновений",
+            ),
         ),
         cmd(
             "unpack-base <out_dir>",
-            t("the embedded bundle, no install needed", "内嵌 bundle,不需要游戏安装"),
+            t(
+                "the embedded bundle, no install needed",
+                "内嵌 bundle,不需要游戏安装",
+                "вшитый бандл, установка не нужна",
+            ),
         ),
         blank(),
         dim(t(
             "Env: TL2_MEDIA_DIR (base MEDIA)  TL2_MOD_GAMEVER (pin header gameVersion)",
             "环境变量:TL2_MEDIA_DIR(基础 MEDIA) TL2_MOD_GAMEVER(固定 header gameVersion)",
-        ).into()),
+            "Env: TL2_MEDIA_DIR (базовая MEDIA)  TL2_MOD_GAMEVER (фикс. gameVersion)",
+        )),
         dim(t(
             "     MIKURO_TIMING=1 (phase timings)  TL2_MODPACK_LIST=1 (dump discovery)",
             "     MIKURO_TIMING=1(分阶段计时) TL2_MODPACK_LIST=1(打印发现结果)",
-        ).into()),
+            "     MIKURO_TIMING=1 (тайминги)  TL2_MODPACK_LIST=1 (дамп поиска)",
+        )),
         dim(t(
-            "     TL2_LANG=en|zh (force this UI's language)",
-            "     TL2_LANG=en|zh(强制界面语言)",
-        ).into()),
+            "     TL2_LANG=en|zh|ru (force this UI's language; `l` cycles it live)",
+            "     TL2_LANG=en|zh|ru(强制界面语言;按 `l` 可当场切换)",
+            "     TL2_LANG=en|zh|ru (язык интерфейса; `l` переключает на лету)",
+        )),
     ];
     v.push(blank());
     v.push(dim(t(
         "↑↓ / PageUp / PageDown to scroll this page.",
         "↑↓ / PageUp / PageDown 滚动本页。",
-    ).into()));
+        "↑↓ / PageUp / PageDown — прокрутка страницы.",
+    )));
     v
 }
 
@@ -1358,62 +1570,72 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let sep = |s: &'static str| Span::styled(s, Style::default().fg(theme::MUTED));
     // Wider gaps between key/label pairs than between a key and its own label,
     // so the eye groups them correctly instead of reading one long run.
-    let t = |en, zh| app.t(en, zh);
+    let t = |en, zh, ru| app.t(en, zh, ru);
     let quit = if app.is_packing() {
-        t(" (running…)", " (运行中…)")
+        t(" (running…)", " (运行中…)", " (работа…)")
     } else {
-        t(" quit", " 退出")
+        t(" quit", " 退出", " выход")
+    };
+    // The language switch is on every tab: someone can land in a script they
+    // cannot read, and the key must be reachable without understanding the UI.
+    // The label is the NEXT language's own tag, so it reads the same to anyone.
+    let lang_hint = |v: &mut Vec<Span<'static>>| {
+        v.push(key("l"));
+        v.push(Span::styled(
+            format!(" {}    ", app.lang.next().tag()),
+            Style::default().fg(theme::MAGIC),
+        ));
     };
     let hint = if app.tab == TAB_HELP {
-        Line::from(vec![
+        let mut v = vec![
             key("↑↓"),
-            sep(t(" scroll    ", " 滚动    ")),
+            sep(t(" scroll    ", " 滚动    ", " прокрутка    ")),
             key("Home"),
-            sep(t(" top    ", " 回顶    ")),
+            sep(t(" top    ", " 回顶    ", " начало    ")),
             key("Tab"),
-            sep(t(" switch    ", " 切换    ")),
-            key("1-4"),
-            sep(t(" jump    ", " 直达    ")),
-            key("q"),
-            sep(quit),
-        ])
+            sep(t(" switch    ", " 切换    ", " вкладка    ")),
+        ];
+        lang_hint(&mut v);
+        v.push(key("q"));
+        v.push(sep(quit));
+        Line::from(v)
     } else if app.tab == TAB_OUTPUT {
-        Line::from(vec![
+        let mut v = vec![
             key("↑↓"),
-            sep(t(" scroll    ", " 滚动    ")),
+            sep(t(" scroll    ", " 滚动    ", " прокрутка    ")),
             key("End"),
-            sep(t(" follow    ", " 跟随    ")),
+            sep(t(" follow    ", " 跟随    ", " слежение    ")),
             key("c"),
-            sep(t(" clear    ", " 清空    ")),
+            sep(t(" clear    ", " 清空    ", " очистить    ")),
             key("Tab"),
-            sep(t(" switch    ", " 切换    ")),
-            key("1-4"),
-            sep(t(" jump    ", " 直达    ")),
-            key("q"),
-            sep(quit),
-        ])
+            sep(t(" switch    ", " 切换    ", " вкладка    ")),
+        ];
+        lang_hint(&mut v);
+        v.push(key("q"));
+        v.push(sep(quit));
+        Line::from(v)
     } else {
         let run = if app.tab == TAB_UNPACK {
-            t(" unpack    ", " 解包    ")
+            t(" unpack    ", " 解包    ", " распаковать    ")
         } else {
-            t(" pack    ", " 打包    ")
+            t(" pack    ", " 打包    ", " собрать    ")
         };
-        Line::from(vec![
+        let mut v = vec![
             key("↑↓"),
-            sep(t(" move    ", " 移动    ")),
+            sep(t(" move    ", " 移动    ", " навигация    ")),
             key("Space"),
-            sep(t(" select    ", " 选择    ")),
+            sep(t(" select    ", " 选择    ", " выбор    ")),
             key("a"),
-            sep(t(" all    ", " 全选    ")),
+            sep(t(" all    ", " 全选    ", " все    ")),
             key("Enter"),
             sep(run),
-            key("Tab"),
-            sep(t(" switch    ", " 切换    ")),
             key("?"),
-            sep(t(" help    ", " 帮助    ")),
-            key("q"),
-            sep(quit),
-        ])
+            sep(t(" help    ", " 帮助    ", " справка    ")),
+        ];
+        lang_hint(&mut v);
+        v.push(key("q"));
+        v.push(sep(quit));
+        Line::from(v)
     };
     let p = Paragraph::new(hint)
         .block(
@@ -1635,10 +1857,16 @@ mod tests {
         }];
         let mut app = App::new(packs, unpacks, BaseSource::Bundled, PathBuf::from("/x"));
         app.lang = Lang::Zh;
+        let dump = |label: &str, text: &str| {
+            if std::env::var_os("TL2_TUI_DUMP").is_some() {
+                eprintln!("\n──────── {label} ────────\n{text}");
+            }
+        };
 
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let zh = buffer_text(terminal.backend().buffer());
+        dump("ZH", &zh);
         for want in ["打包", "解包", "输出", "帮助", "已选", "(关卡 mod)", "移动", "全选"] {
             assert!(zh.contains(want), "Chinese UI missing {want:?}");
         }
@@ -1651,26 +1879,92 @@ mod tests {
             "origin tag translated"
         );
 
-        // Help: every line has content in BOTH languages, and the command
-        // column is identical in both (you type those, they are not prose).
-        app.lang = Lang::En;
-        let en_lines = help_lines(&app);
-        app.lang = Lang::Zh;
-        let zh_lines = help_lines(&app);
-        assert_eq!(en_lines.len(), zh_lines.len(), "help line counts must match");
-        let flat = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
-        for (i, (e, z)) in en_lines.iter().zip(&zh_lines).enumerate() {
-            let (e, z) = (flat(e), flat(z));
-            assert_eq!(
-                e.trim().is_empty(),
-                z.trim().is_empty(),
-                "help line {i} is blank in only one language: {e:?} / {z:?}"
-            );
+        // Russian too — and every tab in every language must render, with the
+        // header naming the live language and the footer advertising the NEXT
+        // one (so the switch is readable whatever script you are stuck in).
+        for lang in [Lang::En, Lang::Zh, Lang::Ru] {
+            app.lang = lang;
+            for tab in [TAB_PACK, TAB_UNPACK, TAB_OUTPUT, TAB_HELP] {
+                app.tab = tab;
+                terminal.draw(|f| draw(f, &app)).unwrap();
+                let text = buffer_text(terminal.backend().buffer());
+                assert!(text.contains(lang.tag()), "{lang:?} tab {tab}: live language tag");
+                assert!(text.contains(lang.next().tag()), "{lang:?} tab {tab}: switch hint");
+            }
         }
-        let zh_help = zh_lines.iter().map(flat).collect::<Vec<_>>().join("\n");
-        for c in ["unpack <in.MOD|DATA.PAK> <out_dir>", "compile-dat", "decompile-layout",
-                  "--mpp re|dll|none", "--no-times", "TL2_LANG=en|zh"] {
-            assert!(zh_help.contains(c), "command/flag {c:?} must stay verbatim in Chinese");
+        app.lang = Lang::Ru;
+        app.tab = TAB_PACK;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let ru = buffer_text(terminal.backend().buffer());
+        dump("RU", &ru);
+        for want in ["СБОРКА", "РАСПАКОВКА", "ВЫВОД", "СПРАВКА", "выбрано", "(мод уровней)"] {
+            assert!(ru.contains(want), "Russian UI missing {want:?}");
+        }
+        assert!(!ru.contains("PACK") && !ru.contains("selected"), "no English left over");
+
+        // Help: every line has content in EVERY language (a skipped translation
+        // would show up as a blank row), and the command column is identical
+        // everywhere — you type those, they are not prose.
+        let flat = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let page = |app: &mut App, lang| {
+            app.lang = lang;
+            help_lines(app).iter().map(flat).collect::<Vec<_>>()
+        };
+        let en_lines = page(&mut app, Lang::En);
+        for lang in [Lang::Zh, Lang::Ru] {
+            let other = page(&mut app, lang);
+            assert_eq!(en_lines.len(), other.len(), "{lang:?} help line count");
+            for (i, (e, o)) in en_lines.iter().zip(&other).enumerate() {
+                assert_eq!(
+                    e.trim().is_empty(),
+                    o.trim().is_empty(),
+                    "{lang:?} help line {i} blank in only one language: {e:?} / {o:?}"
+                );
+            }
+            let joined = other.join("\n");
+            for c in ["unpack <in.MOD|DATA.PAK> <out_dir>", "compile-dat", "decompile-layout",
+                      "--mpp re|dll|none", "--no-times", "TL2_LANG=en|zh|ru"] {
+                assert!(joined.contains(c), "{lang:?}: {c:?} must stay verbatim");
+            }
+        }
+    }
+
+    /// The header packs tabs + language + base tier + status onto ONE row, and
+    /// Russian labels are the longest. Check the worst realistic case actually
+    /// fits an 80-column terminal instead of silently clipping the status.
+    #[test]
+    fn russian_header_fits_a_narrow_terminal() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let many = |n: usize, action: Action| {
+            (0..n)
+                .map(|i| ModEntry {
+                    title: format!("m{i}"),
+                    file_name: format!("m{i}"),
+                    dir: PathBuf::from("/x"),
+                    has_layouts: false,
+                    action,
+                    origin: Origin::Local,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut app = App::new(
+            many(12, Action::Pack),
+            many(33, Action::Unpack),
+            BaseSource::LooseMedia(PathBuf::from("/game/MEDIA")), // longest short() tag
+            PathBuf::from("/x"),
+        );
+        app.lang = Lang::Ru;
+        for w in [80u16, 96, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(w, 18)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+            let header = text.lines().nth(2).unwrap_or_default().to_string();
+            assert!(
+                header.contains("выбрано 0/12"),
+                "at {w} cols the status is clipped out of the header: {header:?}"
+            );
         }
     }
 
@@ -1684,10 +1978,13 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("TL2_LANG");
         for (v, want) in [("zh", Lang::Zh), ("zh-CN", Lang::Zh), ("cn", Lang::Zh),
+                          ("ru", Lang::Ru), ("ru_RU.UTF-8", Lang::Ru),
                           ("en", Lang::En), ("en-US", Lang::En)] {
             std::env::set_var("TL2_LANG", v);
             assert_eq!(detect_lang(), want, "TL2_LANG={v}");
         }
+        // Cycling visits every language and returns home.
+        assert_eq!(Lang::En.next().next().next(), Lang::En, "cycle covers all three");
         // Garbage does not force a language; detection continues.
         std::env::set_var("TL2_LANG", "klingon");
         let _ = detect_lang();
