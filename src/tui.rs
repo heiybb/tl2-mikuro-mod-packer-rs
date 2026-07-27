@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -170,8 +170,12 @@ struct Strings {
 impl Strings {
     fn load(lang: Lang, root: &Path) -> Strings {
         let mut map = std::collections::HashMap::new();
-        // Four layers, each overriding the one before: English is laid down
-        // first so a partial translation (or a partial override) still reads.
+        // Four layers, each overriding the one before. Order is by SPECIFICITY,
+        // not by source: both English layers go down first as the substrate a
+        // partial translation falls back to, then both layers of the chosen
+        // language. Ordering it the other way (…, builtin zh, disk en, disk zh)
+        // means editing `lang/en.ini` to fix the English wording silently turns
+        // those lines English in the Chinese and Russian UIs too.
         let mut layer = |l: Lang, from_disk: bool| {
             if from_disk {
                 let p = root.join("lang").join(format!("{}.ini", l.code()));
@@ -184,11 +188,9 @@ impl Strings {
         };
         if lang != Lang::En {
             layer(Lang::En, false);
-        }
-        layer(lang, false);
-        if lang != Lang::En {
             layer(Lang::En, true);
         }
+        layer(lang, false);
         layer(lang, true);
         Strings { map }
     }
@@ -400,6 +402,13 @@ fn has_layout_file(dir: &Path) -> bool {
 fn discover_pack_sources(root: &Path) -> Vec<ModEntry> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
+    // The exe dropped INSIDE the mod it builds — root itself is the source.
+    // Only the subdirectories used to be scanned, so that arrangement reported
+    // "nothing to pack" while standing in a perfectly packable folder.
+    seen.insert(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+    if let Some(m) = mod_entry_for(root) {
+        out.push(m);
+    }
     for base in [root.to_path_buf(), root.join("mods")] {
         let Ok(rd) = std::fs::read_dir(&base) else { continue };
         for e in rd.flatten() {
@@ -599,6 +608,12 @@ fn pack_worker(jobs: Vec<Job>, base: BaseSource, root: PathBuf, log: Log) {
     logln(&log, "");
 
     let (mut ok, mut fail, mut unpacked) = (0, 0, 0);
+    // Destination folder names already handed out this run. The unpack picker
+    // deliberately lists a `.MOD` found next to the exe AND the deployed copy
+    // of the same name as separate rows, so "same stem, different file" is a
+    // normal selection — and both would otherwise unpack into one folder and
+    // silently merge two mods into a source tree that is neither.
+    let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for j in &jobs {
         let args: Vec<PathBuf> = match j.action {
             Action::Pack => {
@@ -614,7 +629,17 @@ fn pack_worker(jobs: Vec<Job>, base: BaseSource, root: PathBuf, log: Log) {
             Action::Unpack => {
                 // Unpack next to the .MOD, under `unpacked/<name>/` — never on
                 // top of an existing source folder.
-                let dst = root.join("unpacked").join(&j.file_name);
+                let name = unique_dir_name(&j.file_name, &mut used);
+                let dst = root.join("unpacked").join(&name);
+                if name != j.file_name {
+                    logln(
+                        &log,
+                        format!(
+                            "  note: another selected .MOD is also named {}; unpacking this one into {name}/",
+                            j.file_name
+                        ),
+                    );
+                }
                 logln(&log, format!("═══════ unpack {} → {} ═══════", j.title, dst.display()));
                 vec![PathBuf::from("unpack"), j.path.clone(), dst]
             }
@@ -631,6 +656,21 @@ fn pack_worker(jobs: Vec<Job>, base: BaseSource, root: PathBuf, log: Log) {
         &log,
         format!("── Done: {ok} packed, {unpacked} unpacked, {fail} failed.  [q] to quit ──"),
     );
+}
+
+/// `name`, or `name_2` / `name_3` … if this run already used it. Records the
+/// answer so the next caller sees it taken.
+fn unique_dir_name(name: &str, used: &mut std::collections::BTreeSet<String>) -> String {
+    if used.insert(name.to_string()) {
+        return name.to_string();
+    }
+    for n in 2u32.. {
+        let cand = format!("{name}_{n}");
+        if used.insert(cand.clone()) {
+            return cand;
+        }
+    }
+    unreachable!("2..u32::MAX cannot all be taken")
 }
 
 /// One selected row, resolved for the worker.
@@ -704,6 +744,10 @@ struct Pane {
     items: Vec<ModEntry>,
     picked: Vec<bool>,
     state: ListState,
+    /// Index of the first visible row. ratatui computes this while rendering,
+    /// into the state it is handed; carrying it across frames is what makes the
+    /// view hold still. See `draw_list`.
+    offset: Cell<usize>,
 }
 
 impl Pane {
@@ -713,7 +757,7 @@ impl Pane {
             state.select(Some(0));
         }
         let n = items.len();
-        Pane { items, picked: vec![false; n], state }
+        Pane { items, picked: vec![false; n], state, offset: Cell::new(0) }
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -960,6 +1004,17 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
 /// can drive real keys against a real rendered frame — scroll clamping depends
 /// on what the last frame published, which a hand-poked field cannot show.
 fn handle_key(app: &mut App, k: KeyEvent) -> Option<ExitCode> {
+    // Raw mode means Ctrl+C arrives as a keypress instead of a signal, so if the
+    // app does not answer it, nothing does — and on the Output tab it used to
+    // land on the bare `c` binding and CLEAR THE LOG. Answer it exactly like q.
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        return match k.code {
+            KeyCode::Char('c') | KeyCode::Char('C') if !app.is_packing() => {
+                Some(ExitCode::SUCCESS)
+            }
+            _ => None,
+        };
+    }
     match k.code {
             KeyCode::Tab => app.tab = (app.tab + 1) % TAB_COUNT,
             KeyCode::BackTab => app.tab = (app.tab + TAB_COUNT - 1) % TAB_COUNT,
@@ -1276,8 +1331,15 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         )
         .highlight_symbol("▶ ");
 
-    let mut state = pane.state.clone();
+    // The scroll offset lives in the state ratatui is handed, and the widget
+    // WRITES it there. Handing it a fresh clone every frame threw that away:
+    // the offset restarted at 0 and the widget re-derived "just enough to show
+    // the selection", which pins the cursor to the last visible row forever —
+    // you can never see a row past it, in either direction. Carry it across
+    // frames instead, so the view only moves when the cursor leaves it.
+    let mut state = pane.state.clone().with_offset(pane.offset.get());
     f.render_stateful_widget(list, area, &mut state);
+    pane.offset.set(state.offset());
 }
 
 fn draw_output(f: &mut Frame, area: Rect, app: &App) {
@@ -1386,6 +1448,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         body(tr("pack_scans_for_folders_holding_mod_dat_plus")),
         path(format!("  {root}")),
         path(format!("  {}", app.root.join("mods").display())),
+        dim(tr("that_first_folder_counts_itself_if_it_holds_mod_dat")),
         body(tr("unpack_scans_for_mod_files_in_those_two_plus")),
         body(tr("the_one_deploy_writes_to_so_anything_you_jus")),
         path(format!("  {}", tl2_mods_dir().display())),
@@ -1633,6 +1696,19 @@ mod tests {
         assert!(beta.has_layouts, "BetaLevel has a *.LAYOUT");
         let alpha = packs.iter().find(|m| m.title == "AlphaContent").unwrap();
         assert!(!alpha.has_layouts, "AlphaContent has no layouts");
+
+        // The exe dropped INSIDE a mod: that folder is itself the source, and
+        // is offered alongside anything nested under it.
+        let inner = root.join("AlphaContent");
+        let self_packs = discover_pack_sources(&inner);
+        let self_titles: Vec<&str> = self_packs.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(self_titles, vec!["AlphaContent"], "root itself is a packable source");
+        // …and it is listed once, not twice, when it is also reachable as a child.
+        assert_eq!(
+            packs.iter().filter(|m| m.title == "AlphaContent").count(),
+            1,
+            "no duplicate row"
+        );
 
         let unpacks = discover_mod_files(&root);
         let names: Vec<&str> = unpacks
@@ -1972,6 +2048,24 @@ mod tests {
         std::fs::write(root.join("lang").join("en.ini"), "quit=  spaced  \n").unwrap();
         assert_eq!(Strings::load(Lang::En, &root).get("quit"), "  spaced  ");
 
+        // An English override must NOT leak into a translated UI: English is
+        // only the substrate the chosen language is laid over. (It used to,
+        // because the layers were ordered builtin-en, builtin-zh, disk-en,
+        // disk-zh — so fixing an English line un-translated it everywhere.)
+        std::fs::write(root.join("lang").join("en.ini"), "quit=LEAVE\n").unwrap();
+        let zh = Strings::load(Lang::Zh, &root);
+        assert_eq!(
+            zh.get("quit"),
+            Strings::load(Lang::Zh, Path::new("")).get("quit"),
+            "editing en.ini left the Chinese UI alone"
+        );
+        assert_ne!(zh.get("quit"), "LEAVE");
+        // …but a zh override still wins, and English still fills the gaps.
+        std::fs::write(root.join("lang").join("zh.ini"), "quit=离开\n").unwrap();
+        let zh = Strings::load(Lang::Zh, &root);
+        assert_eq!(zh.get("quit"), "离开", "zh override applied");
+        assert_eq!(zh.get("mode_default"), Strings::load(Lang::Zh, Path::new("")).get("mode_default"));
+
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2193,6 +2287,171 @@ mod tests {
             s.push('\n');
         }
         s
+    }
+
+    /// A picker with more rows than fit must scroll like a list, not like a
+    /// treadmill.
+    ///
+    /// The bug this guards: `draw_list` handed the widget a CLONE of the list
+    /// state, so the scroll offset ratatui writes there was dropped every
+    /// frame. Re-derived from 0, it always came out as "just enough to reveal
+    /// the selection" — which pins the cursor to the LAST visible row for the
+    /// whole rest of the list, in both directions. You could never see a row
+    /// past the cursor, and every keypress dragged the entire list.
+    ///
+    /// Anyone with more deployed mods than terminal rows hits this on the
+    /// Unpack tab immediately, which is why 30 rows in an 18-row terminal.
+    #[test]
+    fn long_picker_scrolls_without_dragging_the_cursor() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let rows: Vec<ModEntry> = (0..30)
+            .map(|i| ModEntry {
+                title: format!("Mod{i:02}"),
+                file_name: format!("M{i:02}"),
+                dir: PathBuf::from("/x"),
+                has_layouts: false,
+                action: Action::Pack,
+                origin: Origin::Local,
+            })
+            .collect();
+        let mut app = App::new(rows, Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        app.set_lang(Lang::En);
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+
+        // Which rows the frame shows, in order.
+        let visible = |app: &App, terminal: &mut Terminal<TestBackend>| -> Vec<String> {
+            terminal.draw(|f| draw(f, app)).unwrap();
+            buffer_text(terminal.backend().buffer())
+                .lines()
+                .filter_map(|l| {
+                    l.split_whitespace()
+                        .find(|w| w.len() == 5 && w.starts_with("Mod"))
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        let press = |app: &mut App, code: KeyCode| {
+            handle_key(app, KeyEvent::from(code));
+        };
+
+        // Walk down until the list has had to scroll.
+        for _ in 0..14 {
+            visible(&app, &mut terminal);
+            press(&mut app, KeyCode::Down);
+        }
+        let at_bottom = visible(&app, &mut terminal);
+        assert_eq!(app.pack.state.selected(), Some(14));
+        assert!(at_bottom.contains(&"Mod14".to_string()), "cursor row is on screen");
+        assert!(!at_bottom.contains(&"Mod00".to_string()), "the list really scrolled");
+
+        // Coming back up must NOT move the window: rows 9..14 are all on screen,
+        // so the cursor just walks up inside it. Under the bug every one of
+        // these shifted the whole list by one and kept the cursor on the last
+        // row.
+        for expect_sel in [13, 12, 11] {
+            press(&mut app, KeyCode::Up);
+            let now = visible(&app, &mut terminal);
+            assert_eq!(app.pack.state.selected(), Some(expect_sel));
+            assert_eq!(now, at_bottom, "window held still while the cursor moved up");
+            assert!(
+                now.last() != Some(&format!("Mod{expect_sel:02}")),
+                "cursor is no longer stuck to the bottom row"
+            );
+        }
+
+        // Wrap-around still works, and jumps the window to the end.
+        app.pack.state.select(Some(0));
+        press(&mut app, KeyCode::Up);
+        let wrapped = visible(&app, &mut terminal);
+        assert_eq!(app.pack.state.selected(), Some(29));
+        assert!(wrapped.contains(&"Mod29".to_string()), "wrapped to the last row and showed it");
+    }
+
+    /// SCRATCH — diagnosing the picker's scroll behaviour with more rows than
+    /// fit. Prints what is visible as the cursor walks down a long list.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_long_list_scroll() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let rows: Vec<ModEntry> = (0..30)
+            .map(|i| ModEntry {
+                title: format!("Mod{i:02}"),
+                file_name: format!("M{i:02}"),
+                dir: PathBuf::from("/x"),
+                has_layouts: false,
+                action: Action::Pack,
+                origin: Origin::Local,
+            })
+            .collect();
+        let mut app = App::new(rows, Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        app.set_lang(Lang::En);
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+        let mut show = |app: &App, terminal: &mut Terminal<TestBackend>, tag: &str| {
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+            let visible: Vec<&str> = text
+                .lines()
+                .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("Mod0") || w.starts_with("Mod1") || w.starts_with("Mod2")))
+                .collect();
+            eprintln!(
+                "step {tag:>7} sel={:>4?} offset={} visible={:?}",
+                app.pack.state.selected(),
+                app.pack.state.offset(),
+                visible
+            );
+        };
+        for i in 0..14 {
+            show(&app, &mut terminal, &format!("dn{i}"));
+            handle_key(&mut app, KeyEvent::from(KeyCode::Down));
+        }
+        for i in 0..4 {
+            show(&app, &mut terminal, &format!("up{i}"));
+            handle_key(&mut app, KeyEvent::from(KeyCode::Up));
+        }
+        // Wrap-around: from the first row, Up should land on the LAST row.
+        app.pack.state.select(Some(0));
+        show(&app, &mut terminal, "top");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Up));
+        show(&app, &mut terminal, "wrap");
+    }
+
+    /// Ctrl+C must quit, not clear the log. In raw mode it is an ordinary
+    /// keypress; unanswered, the app cannot be exited with it at all, and on the
+    /// Output tab it fell through to the bare `c` = clear binding.
+    #[test]
+    fn ctrl_c_quits_and_does_not_clear_the_log() {
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        app.set_lang(Lang::En);
+        app.tab = TAB_OUTPUT;
+        logln(&app.log, "important line");
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_key(&mut app, ctrl_c).is_some(), "Ctrl+C quits");
+        assert_eq!(app.log.lock().unwrap().len(), 1, "and left the transcript alone");
+
+        // Plain `c` still clears, and Ctrl+C is refused mid-run like q is.
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('c'))).is_none());
+        assert!(app.log.lock().unwrap().is_empty(), "bare c still clears");
+        app.packing.store(true, Ordering::Relaxed);
+        assert!(handle_key(&mut app, ctrl_c).is_none(), "no quitting mid-run");
+    }
+
+    /// Two selected `.MOD`s with the same file name (the local build and the
+    /// deployed copy — rows the picker shows side by side on purpose) must
+    /// unpack into separate folders, not merge into one.
+    #[test]
+    fn same_named_mods_unpack_to_separate_folders() {
+        let mut used = std::collections::BTreeSet::new();
+        assert_eq!(unique_dir_name("MIKURO_X", &mut used), "MIKURO_X");
+        assert_eq!(unique_dir_name("MIKURO_X", &mut used), "MIKURO_X_2");
+        assert_eq!(unique_dir_name("MIKURO_X", &mut used), "MIKURO_X_3");
+        assert_eq!(unique_dir_name("OTHER", &mut used), "OTHER", "unrelated names untouched");
+        // A name that collides with a generated one still resolves.
+        assert_eq!(unique_dir_name("MIKURO_X_2", &mut used), "MIKURO_X_2_2");
     }
 
     #[test]

@@ -189,6 +189,17 @@ pub fn unpack_entries(
         })
         .cloned()
         .collect();
+    // Real containers DO list the same path twice — 8 of the 32 mods installed
+    // on the dev machine do, one of them 239 times, and in two of those mods the
+    // duplicated records carry DIFFERENT bytes. Extraction runs in parallel, so
+    // leaving them in means two workers opening and writing one destination at
+    // the same time: a file that is nondeterministically one payload, the other,
+    // or a mix of both.
+    //
+    // Keep the LAST record for each path. That is what serial extraction
+    // produced (each write overwrote the previous one), so this changes no
+    // output that was ever correct — it just makes it deterministic.
+    let entries = dedupe_by_path(entries, report);
     let total = entries.len();
 
     // Manifest paths are '/'-separated and already rooted at MEDIA/, which is
@@ -258,6 +269,42 @@ pub fn unpack_entries(
 /// Entries per rayon task. Big enough that opening a `BlockReader` (one file
 /// open) is amortised, small enough that the tail does not idle the pool.
 const CHUNK: usize = 64;
+
+/// Drop every record whose path a LATER record repeats, keeping manifest order.
+///
+/// Case-insensitively, because the destination filesystem is: two records
+/// differing only in case are one file on Windows, and letting both through
+/// would put the race back.
+fn dedupe_by_path(entries: Vec<Entry>, report: &mut Report) -> Vec<Entry> {
+    let key = |e: &Entry| e.path.to_uppercase();
+    let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        last.insert(key(e), i);
+    }
+    if last.len() == entries.len() {
+        return entries;
+    }
+    let dropped = entries.len() - last.len();
+    let mut example = String::new();
+    let kept: Vec<Entry> = entries
+        .into_iter()
+        .enumerate()
+        .filter(|(i, e)| {
+            let keep = last.get(&key(e)) == Some(i);
+            if !keep && example.is_empty() {
+                example = e.path.clone();
+            }
+            keep
+        })
+        .map(|(_, e)| e)
+        .collect();
+    report.warnings.push(format!(
+        "container lists {dropped} duplicate path{} (e.g. {example}); kept the last record of \
+         each — a repack emits one record per file",
+        if dropped == 1 { "" } else { "s" }
+    ));
+    kept
+}
 
 enum Kind {
     Dat,
@@ -552,6 +599,92 @@ mod tests {
     fn write(p: &Path, s: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, to_utf16le_bom(&format!("\u{FEFF}{s}"))).unwrap();
+    }
+
+    /// A path listed twice must yield ONE destination — the last record's bytes,
+    /// which is what serial extraction produced — and say so. Parallel workers
+    /// would otherwise write the same file at the same time; real containers do
+    /// this (8 of 32 installed mods, up to 239 paths, sometimes with differing
+    /// payloads), so it is not a theoretical case.
+    #[test]
+    fn duplicate_manifest_paths_collapse_to_the_last_record() {
+        let mk = |path: &str, off: u32| Entry {
+            path: path.to_string(),
+            typ: 0,
+            off,
+            size: 1,
+            ftime: 0,
+        };
+        let mut rep = Report::default();
+        let kept = dedupe_by_path(
+            vec![
+                mk("MEDIA/A.DAT", 1),
+                mk("MEDIA/B.DAT", 2),
+                mk("media/a.dat", 3), // same file on Windows, different case
+                mk("MEDIA/C.DAT", 4),
+                mk("MEDIA/B.DAT", 5),
+            ],
+            &mut rep,
+        );
+        let paths: Vec<&str> = kept.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["media/a.dat", "MEDIA/C.DAT", "MEDIA/B.DAT"], "last of each, in order");
+        assert_eq!(kept.iter().map(|e| e.off).collect::<Vec<_>>(), [3, 4, 5], "last record's bytes");
+        assert_eq!(rep.warnings.len(), 1);
+        assert!(rep.warnings[0].contains("2 duplicate paths"), "{}", rep.warnings[0]);
+
+        // No duplicates: untouched, and silent.
+        let mut rep = Report::default();
+        let kept = dedupe_by_path(vec![mk("MEDIA/A.DAT", 1), mk("MEDIA/B.DAT", 2)], &mut rep);
+        assert_eq!(kept.len(), 2);
+        assert!(rep.warnings.is_empty());
+    }
+
+    /// SCRATCH: do real containers ever list the same path twice? Extraction is
+    /// parallel, so duplicates would mean two workers writing one file at once.
+    #[test]
+    #[ignore = "scans the machine's installed mods"]
+    fn scratch_duplicate_manifest_paths() {
+        let dir = crate::packer::tl2_mods_dir();
+        let mut scanned = 0;
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().map(|s| s.eq_ignore_ascii_case("MOD")) != Some(true) {
+                continue;
+            }
+            let Ok(r) = crate::pak::PakReader::open_mod(&p) else { continue };
+            scanned += 1;
+            let mut seen = std::collections::HashMap::<String, usize>::new();
+            for en in r.entries() {
+                *seen.entry(en.path.to_uppercase()).or_default() += 1;
+            }
+            let dupes: Vec<String> =
+                seen.iter().filter(|(_, &n)| n > 1).map(|(k, _)| k.clone()).collect();
+            if dupes.is_empty() {
+                continue;
+            }
+            // Do the duplicated records carry the SAME bytes?
+            let mut r = r;
+            let (mut same, mut diff) = (0, 0);
+            for key in dupes.iter().take(20) {
+                let payloads: Vec<Vec<u8>> = r
+                    .entries()
+                    .iter()
+                    .filter(|e| e.path.to_uppercase() == *key)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .filter_map(|e| r.read_entry(e).ok())
+                    .collect();
+                if payloads.windows(2).all(|w| w[0] == w[1]) { same += 1 } else { diff += 1 }
+            }
+            eprintln!(
+                "{}: {} duplicated paths (sampled: {same} identical, {diff} DIFFERENT), e.g. {}",
+                p.file_name().unwrap().to_string_lossy(),
+                dupes.len(),
+                dupes[0]
+            );
+        }
+        eprintln!("scanned {scanned} containers in {}", dir.display());
     }
 
     /// Pack a tiny mod, unpack it, and repack the result: the two .MOD files
