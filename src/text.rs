@@ -70,6 +70,41 @@ fn bytes_to_units_be(data: &[u8]) -> Vec<u16> {
         .collect()
 }
 
+/// Format an `f32` the way the editor writes it into a `.DAT` / `.LAYOUT`
+/// source — used by both decompilers, so a value reads the same wherever it
+/// lands.
+///
+/// WHEN to use scientific notation follows MSVC `%g`, which is what wrote every
+/// shipped source: exponent < -4 or >= 6. Measured on the shipped corpus rather
+/// than assumed — 1 114 457 layout tokens are scientific, ALL with a three-digit
+/// exponent (`-1.19209e-007`), and across both file kinds not one value below
+/// 1e-4 is written plainly (the two DAT cases in that range are `1e-005`).
+///
+/// WHAT digits to print does NOT follow `%g`: it keeps 6 significant digits and
+/// so fails to read back as the same f32 for 96% of values (measured over
+/// 200 000 random bit patterns). We print the shortest decimal that round-trips,
+/// which is why `19.87122` stays whole where the editor truncates it.
+pub fn fmt_f32_source(x: f32) -> String {
+    if !x.is_finite() || x == 0.0 {
+        return x.to_string();
+    }
+    // LowerExp gives the shortest round-trip mantissa plus the true decimal
+    // exponent — reading the exponent from there avoids log10's off-by-one at
+    // exact powers of ten.
+    let e_form = format!("{x:e}");
+    let (mantissa, exp_str) = e_form.split_once('e').expect("LowerExp always emits 'e'");
+    let exp: i32 = exp_str.parse().expect("LowerExp exponent is an integer");
+    if exp < -4 || exp >= 6 {
+        let (sign, digits) = match exp_str.strip_prefix('-') {
+            Some(d) => ('-', d),
+            None => ('+', exp_str),
+        };
+        format!("{mantissa}e{sign}{digits:0>3}")
+    } else {
+        x.to_string()
+    }
+}
+
 /// Python `_decode_dat_bytes`: BOM-aware UTF-16 decode with surrogatepass.
 /// FF FE -> LE (BOM stripped), FE FF -> BE (BOM stripped), else LE from 0.
 pub fn decode_dat_bytes(data: &[u8]) -> WStr {

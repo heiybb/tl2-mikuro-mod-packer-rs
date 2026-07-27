@@ -128,27 +128,10 @@ fn type_tag(key: &str, enc: &str) -> &'static str {
 /// guarantees round-trip; going through f64 on the way back in is safe because
 /// f64 has more than 2p+2 bits for f32's p=24, so the double rounding is exact).
 ///
-/// Display alone never uses an exponent, so a denormal comes out as forty-odd
-/// characters of zeros. Fall back to the exponent form only when the plain one
-/// is genuinely unreadable — `0.002` must NOT become `2e-3` just because that is
-/// one character shorter; the sources write small values plainly.
-///
-/// (GUTS prints these through MSVC `%g` — `9.80909e-045` — which keeps only 6
-/// significant digits and is therefore lossy. Round-tripping wins over matching
-/// its digits.)
-fn fmt_f32(x: f32) -> String {
-    const PLAIN_MAX: usize = 12;
-    let plain = x.to_string();
-    if plain.len() <= PLAIN_MAX {
-        return plain;
-    }
-    let sci = format!("{x:e}");
-    if sci.len() < plain.len() {
-        sci
-    } else {
-        plain
-    }
-}
+/// Float spelling is shared with the BINDAT decompiler — see
+/// [`crate::text::fmt_f32_source`] for why it follows `%g`'s CHOICE of notation
+/// but not its digits.
+use crate::text::fmt_f32_source as fmt_f32;
 
 // ── byte reader ────────────────────────────────────────────────────────────
 
@@ -532,18 +515,47 @@ fn prop_line(out: &mut String, depth: usize, tag: &str, key: &str, val: &str) {
     let _ = write!(out, "<{tag}>{key}:{val}\r\n");
 }
 
-/// Emit the datagroup-only Group properties. `stream_keys` are the keys already
-/// emitted from the object stream — `LEVEL UNIQUE` is both a schema property AND
-/// a datagroup field, so emitting it twice would make the recompiled object
-/// carry the property block twice.
+/// The datagroup keys that are ALSO ordinary schema properties, so a source can
+/// carry two of them. The compiler swallows the FIRST occurrence as the object's
+/// metadata (which is what feeds the datagroup) and compiles any later one into
+/// the property stream — so when the stream has one, the datagroup copy has to
+/// be emitted BEFORE it or the two values would swap on recompile.
+const DG_KEYS_ALSO_IN_STREAM: [&str; 2] = ["CHOICE", "GAME MODE"];
+
+/// Emit the datagroup copy of a key the stream also carries (see above). Runs
+/// before the stream props; everything else waits for `emit_dg_props`.
+fn emit_dg_props_early(out: &mut String, depth: usize, f: &DgFields, stream_keys: &[&str]) {
+    if stream_keys.contains(&"CHOICE") {
+        if let Some(c) = choice_name(f.choice) {
+            prop_line(out, depth, "STRING", "CHOICE", c);
+        }
+    }
+    if stream_keys.contains(&"GAME MODE") {
+        if let Some(g) = gamemode_name(f.game_mode) {
+            prop_line(out, depth, "STRING", "GAME MODE", g);
+        }
+    }
+}
+
+/// Emit the datagroup-only Group properties, AFTER the stream properties —
+/// which is where the editor authors them: across the shipped corpus every one
+/// of the 1504 Groups carrying both a datagroup key and a stream key writes the
+/// datagroup key last, without exception.
+///
+/// `stream_keys` are the keys already emitted from the object stream.
+/// `LEVEL UNIQUE` is both a schema property AND a datagroup field, so emitting
+/// it twice would make the recompiled object carry the property block twice;
+/// `CHOICE`/`GAME MODE` went out early when the stream also has them.
 fn emit_dg_props(out: &mut String, depth: usize, f: &DgFields, stream_keys: &[&str]) {
     if f.tag != 0xFFFF_FFFF {
         if let Some(name) = tag_by_id().get(&f.tag) {
             prop_line(out, depth, "STRING", "TAG", name);
         }
     }
-    if let Some(c) = choice_name(f.choice) {
-        prop_line(out, depth, "STRING", "CHOICE", c);
+    if !stream_keys.contains(&"CHOICE") {
+        if let Some(c) = choice_name(f.choice) {
+            prop_line(out, depth, "STRING", "CHOICE", c);
+        }
     }
     if f.randomization != 1 {
         prop_line(out, depth, "UNSIGNED INT", "RANDOMIZATION", &f.randomization.to_string());
@@ -557,8 +569,10 @@ fn emit_dg_props(out: &mut String, depth: usize, f: &DgFields, stream_keys: &[&s
     if f.level_unique && !stream_keys.contains(&"LEVEL UNIQUE") {
         prop_line(out, depth, "BOOL", "LEVEL UNIQUE", "true");
     }
-    if let Some(g) = gamemode_name(f.game_mode) {
-        prop_line(out, depth, "STRING", "GAME MODE", g);
+    if !stream_keys.contains(&"GAME MODE") {
+        if let Some(g) = gamemode_name(f.game_mode) {
+            prop_line(out, depth, "STRING", "GAME MODE", g);
+        }
     }
     if !f.active.is_empty() {
         let v: Vec<String> = f.active.iter().map(|i| i.to_string()).collect();
@@ -639,9 +653,9 @@ fn emit_object(out: &mut String, depth: usize, o: &Obj, parent_id: i64) {
     if !omit_id {
         prop_line(out, d, "INTEGER64", "ID", &o.oid.to_string());
     }
+    let stream_keys: Vec<&str> = o.props.iter().map(|p| p.key).collect();
     if let Some(f) = &o.dg {
-        let stream_keys: Vec<&str> = o.props.iter().map(|p| p.key).collect();
-        emit_dg_props(out, d, f, &stream_keys);
+        emit_dg_props_early(out, d, f, &stream_keys);
     }
     for p in &o.props {
         if p.vals.len() == 1 {
@@ -653,6 +667,9 @@ fn emit_object(out: &mut String, depth: usize, o: &Obj, parent_id: i64) {
                 prop_line(out, d, p.tag, &format!("{}{suffix}", p.key), v);
             }
         }
+    }
+    if let Some(f) = &o.dg {
+        emit_dg_props(out, d, f, &stream_keys);
     }
     match &o.adprop {
         Adprop::None => {}
@@ -774,6 +791,34 @@ mod tests {
 
     /// Descriptor codes are written as one byte, so the inverted index would
     /// silently lose descriptors if two of them collided mod 256.
+    /// Float spelling must match the shipped convention (MSVC %g's CHOICE of
+    /// notation, 3-digit exponent) while keeping digits that read back exactly.
+    #[test]
+    fn float_spelling_matches_the_shipped_convention() {
+        for (v, want) in [
+            (0.002f32, "0.002"),          // exponent -3: plain
+            (1.0e-5, "1e-005"),           // exponent -5: scientific
+            (-1.19209e-7, "-1.19209e-007"),
+            (1910800.0, "1.9108e+006"),   // exponent 6: scientific
+            (99999.0, "99999"),           // exponent 4: plain
+            (0.0, "0"),
+            (-5.0, "-5"),
+            (19.87122, "19.87122"),       // %g would truncate this to 19.8712
+        ] {
+            assert_eq!(fmt_f32(v), want, "fmt_f32({v})");
+        }
+        // Every spelling we emit must read back as the SAME f32.
+        for bits in [0x0000_0007u32, 0x3F80_0000, 0x7F7F_FFFF, 0x0080_0000, 0xB380_0000] {
+            let v = f32::from_bits(bits);
+            let s = fmt_f32(v);
+            assert_eq!(
+                s.parse::<f64>().expect("parses") as f32,
+                v,
+                "round-trip of {s} (bits {bits:#010X})"
+            );
+        }
+    }
+
     #[test]
     fn descriptor_codes_are_unique_mod_256() {
         let with_code = schema_map().values().filter(|d| d.code.is_some()).count();

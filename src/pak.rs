@@ -164,6 +164,16 @@ pub fn parse_manifest(b: &[u8]) -> Result<Manifest, String> {
             if typ == TYPE_DIR {
                 continue; // subdirectory marker, not a file
             }
+            // A record with an EMPTY name addresses the directory itself, not a
+            // file in it — the packer emits one (as a `Item::Placeholder`, off
+            // and size 0) whenever it could not resolve content for an entry.
+            // One shipped mod carries 22 of them, typed 18 rather than 7; GUTS'
+            // own unpacker writes nothing for them, and so must we. Reading them
+            // as files means seeking to data offset 0 — the section header, not
+            // a block — and inventing a 600 MB length out of those bytes.
+            if name.is_empty() {
+                continue;
+            }
             files.push(Entry {
                 path: format!("{dname}{name}"),
                 typ,
@@ -182,6 +192,9 @@ pub struct PakReader {
     /// Absolute file offset where the data section starts (0 for a `.PAK`,
     /// `off_data` for a `.MOD`).
     data_base: u64,
+    /// Absolute file offset where the data section ENDS (`off_man` for a `.MOD`,
+    /// EOF for a `.PAK`) — every block length is validated against it.
+    data_end: u64,
     manifest: Manifest,
     /// The mod header — `Some` only for a `.MOD` (a `.PAK` has none).
     header: Option<Header>,
@@ -199,9 +212,12 @@ impl PakReader {
         let manifest = parse_manifest(&man_bytes)?;
         let file = std::fs::File::open(pak_path)
             .map_err(|e| format!("{}: {e}", pak_path.display()))?;
+        // A .PAK is data all the way to EOF (its manifest is the sibling .MAN).
+        let data_end = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
         Ok(Self {
             file,
             data_base: 0,
+            data_end,
             manifest,
             header: None,
             decomp: libdeflater::Decompressor::new(),
@@ -245,6 +261,7 @@ impl PakReader {
         Ok(Self {
             file,
             data_base: off_data,
+            data_end: off_man,
             manifest,
             header: Some(header),
             decomp: libdeflater::Decompressor::new(),
@@ -266,8 +283,22 @@ impl PakReader {
 
     /// Read + inflate one entry's bytes.
     pub fn read_entry(&mut self, e: &Entry) -> Result<Vec<u8>, String> {
+        // A placeholder record (the packer's `Item::Placeholder`) carries no
+        // data block at all — offset 0 is the data section's own
+        // [maxCsz][rollingHash] header, so reading one would decode those bytes
+        // as a block length.
+        if e.off == 0 && e.size == 0 {
+            return Ok(Vec::new());
+        }
+        let block_start = self.data_base + e.off as u64;
+        if block_start + 8 > self.data_end {
+            return Err(format!(
+                "{}: block offset {} is past the data section",
+                e.path, e.off
+            ));
+        }
         self.file
-            .seek(SeekFrom::Start(self.data_base + e.off as u64))
+            .seek(SeekFrom::Start(block_start))
             .map_err(|err| format!("seek {}: {err}", e.path))?;
         let mut hdr = [0u8; 8];
         self.file
@@ -275,6 +306,16 @@ impl PakReader {
             .map_err(|err| format!("read block hdr {}: {err}", e.path))?;
         let usize_ = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         let csize = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        // The lengths come from the file, so check them against the section
+        // before allocating: a corrupt or mis-typed record would otherwise
+        // reserve whatever those four bytes happen to say.
+        let payload = if csize == 0 { usize_ } else { csize };
+        if block_start + 8 + payload as u64 > self.data_end {
+            return Err(format!(
+                "{}: block claims {payload} bytes at offset {}, past the data section end",
+                e.path, e.off
+            ));
+        }
         if csize == 0 {
             let mut out = vec![0u8; usize_];
             self.file
@@ -457,6 +498,48 @@ mod tests {
         if let Ok(disk) = std::fs::read(compiled) {
             assert_eq!(data, disk, "PAK entry == extracted .BINLAYOUT");
         }
+    }
+
+    /// A manifest can carry PLACEHOLDER records — empty name, type 18, offset
+    /// and size 0 — for entries the packer could not resolve content for. They
+    /// address the directory itself, so they must never surface as files:
+    /// reading one seeks to data offset 0 (the section's own header) and decodes
+    /// those bytes as a block length. One shipped mod carries 22 of them and
+    /// used to abort the whole unpack with a 600 MB read.
+    #[test]
+    fn placeholder_records_are_not_files() {
+        // dirCount=1, one dir "MEDIA/" holding: a real file, a dir marker, and
+        // an empty-named placeholder.
+        let mut m: Vec<u8> = Vec::new();
+        let ss = |s: &str, out: &mut Vec<u8>| {
+            let u: Vec<u16> = s.encode_utf16().collect();
+            out.extend_from_slice(&(u.len() as u16).to_le_bytes());
+            for c in u {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+        };
+        m.extend_from_slice(&2u16.to_le_bytes()); // tag
+        m.extend_from_slice(&0u32.to_le_bytes()); // mhash
+        ss("MEDIA/", &mut m);
+        m.extend_from_slice(&3u32.to_le_bytes()); // fileCount
+        m.extend_from_slice(&1u32.to_le_bytes()); // dirCount
+        ss("MEDIA/", &mut m);
+        m.extend_from_slice(&3u32.to_le_bytes()); // 3 records
+        let mut rec = |typ: u8, name: &str, off: u32, size: u32, m: &mut Vec<u8>| {
+            m.extend_from_slice(&0u32.to_le_bytes()); // crc
+            m.push(typ);
+            ss(name, m);
+            m.extend_from_slice(&off.to_le_bytes());
+            m.extend_from_slice(&size.to_le_bytes());
+            m.extend_from_slice(&0u64.to_le_bytes()); // ftime
+        };
+        rec(0, "REAL.DAT", 8, 4, &mut m);
+        rec(TYPE_DIR, "SUB/", 0, 0, &mut m);
+        rec(18, "", 0, 0, &mut m); // the placeholder
+
+        let man = parse_manifest(&m).expect("parse");
+        let names: Vec<&str> = man.files.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(names, vec!["MEDIA/REAL.DAT"], "only the real file is a file");
     }
 
     #[test]

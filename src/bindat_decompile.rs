@@ -115,9 +115,11 @@ fn type_tag(tc: u32) -> &'static str {
 /// LOSES precision — GUTS' own unpack→repack does not reproduce such a value.
 /// Shortest-round-trip always re-reads as the identical f32, so we keep it and
 /// accept the textual difference.
-fn fmt_f32(x: f32) -> String {
-    format!("{x}")
-}
+/// Float spelling is shared with the BINLAYOUT decompiler — see
+/// [`crate::text::fmt_f32_source`]. Shipped `.DAT` sources follow the same `%g`
+/// notation rule as layouts do; they just rarely leave the plain range (the only
+/// two out-of-range values in the whole corpus are written `1e-005`).
+use crate::text::fmt_f32_source as fmt_f32;
 
 fn emit_node(
     c: &mut Cursor,
@@ -255,26 +257,32 @@ mod tests {
     /// A name the dictionary cannot reverse comes out as `UNK_<HEX8>`; compiling
     /// that text back MUST reproduce the original hash byte-for-byte. Before the
     /// escape existed the compiler re-hashed the placeholder TEXT, silently
-    /// turning `[LEVEL20]` (unpacked as `UNK_…`) into a key the engine never
-    /// looks up — the whole section's data went dark with no error anywhere.
+    /// turning an unpacked `UNK_…` section into a key the engine never looks up —
+    /// the whole section's data went dark with no error anywhere.
     #[test]
     fn unknown_name_roundtrips_hash_exact() {
         use crate::bindat::{compile_dat_bytes, compile_dat_bytes_reported};
 
-        // LEVEL20 is beyond every numbered family the shipped data uses, so the
-        // embedded dictionary genuinely cannot name it.
-        assert!(!REVERSE.contains_key(&rg_hash_str("LEVEL20")), "test premise: LEVEL20 unknown");
-        let src = "[SKILL]\r\n<STRING>NAME:T\r\n[LEVEL20]\r\n<FLOAT>DAMAGE:3.5\r\n[/LEVEL20]\r\n[/SKILL]\r\n";
+        // A mod's brand-new section name: no shipped DAT uses it, and it belongs
+        // to no numbered family the dictionary generates.
+        const NOVEL: &str = "MIKURO_NOVEL_SECTION_QQ";
+        assert!(
+            !REVERSE.contains_key(&rg_hash_str(NOVEL)),
+            "test premise: {NOVEL} must be outside the dictionary"
+        );
+        let src = &format!(
+            "[SKILL]\r\n<STRING>NAME:T\r\n[{NOVEL}]\r\n<FLOAT>DAMAGE:3.5\r\n[/{NOVEL}]\r\n[/SKILL]\r\n"
+        );
         let original = compile_dat_bytes(&to_dat_bytes(src)).expect("compile");
 
         let text = decompile_bindat(&original).expect("decompile");
-        assert!(text.contains("UNK_"), "LEVEL20 should decompile to a placeholder: {text}");
+        assert!(text.contains("UNK_"), "{NOVEL} should decompile to a placeholder: {text}");
 
         let out = compile_dat_bytes_reported(&to_dat_bytes(&text), None).expect("recompile");
         assert_eq!(out.bytes, original, "decompile→compile must be byte-identical");
         assert_eq!(
             out.raw_hash_names,
-            vec![format!("UNK_{:08X}", rg_hash_str("LEVEL20"))],
+            vec![format!("UNK_{:08X}", rg_hash_str(NOVEL))],
             "the placeholder must be reported so the packer can warn"
         );
 
