@@ -74,8 +74,7 @@ rollingHash + mhash 自洽;唯一字节差异 = zlib 压缩流(libdeflate,Rust �
 - 三条管线同工作量参考:原生 GUTS 983s / Python(isal+numba 满优化)~64s / **Rust 46s**。
 - 原生表中的 地图拓展(242.98s)与 POE(52.72s)源副本已删除,无法复测,未计入合计。
 - MPP 口径差异:原生 = EditorRegenPathingData(字节精确);Rust = 离线 `re` 后端
-  (≈99.7% cell 精确,已知天花板)。要字节精确请直接跑 `TL2-Mikuro-Console.exe build
-  <MOD_FILE_NAME> --clean --twice`(速度即原生 MPP 列),再用 `--mpp none` 打包。
+  (≈99.7% cell 精确,已知天花板 —— 实际可走性已到浮点地板,见下)。
 
 ### MPP 全语料 A/B(`verify mpp-corpus`,2026-07-04)
 
@@ -121,7 +120,7 @@ box 会在 **1100 vs 1125** 之间抖动(±25 cell = 一个 10-unit snap-tile;�
 均不可走。按此「de-cosmetic」口径(1≡255)复测:aggregate **99.8934%**,THECROSSING
 **99.8938% ≈ 其浮点地板 0.0965%**。raw-byte 残差里约一半是树簇内部的 255↔1 void/wall
 标注差(单 tile 可走性无影响、仅 tile 缝隙处相关)+ 余为不可约浮点。**换言之:寻路网格
-的实际可走性已与原生匹配到浮点地板;字节精确唯一途径仍是直接驱动编辑器控制台宿主。**
+的实际可走性已与原生匹配到浮点地板 —— 这也是只保留离线后端的依据。**
 
 前述 vanilla 语料残差(276839 cell)同属该信息论下限(原生 cliff/multichunk 不确定 +
 per-instance 运行时 nocollide),换语言/精度都不移动它。
@@ -150,12 +149,9 @@ cargo build --release
   (注册表 Shell Folders 解析,OneDrive 重定向安全)。
 - `--mpp re`(默认)离线寻路网格(≈99.7% cell 精确,已知天花板 — 见下「原生非确定性」);
   `--mpp none` 保留源目录已有 .mpp。
-- **`--mpp dll` 已移除**(它只是外壳驱动 `TL2-Mikuro-Console.exe`,而 `CreateMod` 只认
-  `<install>\mods\<name>` 下的工程 → 必须把整个 mod 复制过去、覆盖同名目录,默认内存
-  模式下还要先复制一份到临时目录)。要字节精确就自己跑那一条命令:
-  `cd "<TL2 安装目录>" && TL2-Mikuro-Console.exe build <MOD_FILE_NAME> --clean --twice`,
-  然后 `--mpp none` 打包即可保留它写出的 .mpp。传 `--mpp dll` 会报错并打印这段说明
-  (**不会**静默退回近似后端 —— 要的是字节精确,拿到近似的却不知道,是最坏结果)。
+- 旧的 `--mpp dll` 后端(外壳驱动 `TL2-Mikuro-Console.exe`)**已移除**:离线后端的
+  可走性已到浮点地板,而那个包装要把整个 mod 复制进 `<install>\mods\<name>`、覆盖同名
+  目录才能让 `CreateMod` 认。现在 `re` / `none` 就是全部,其他值一律报错。
 - `compile-mpp --fallback <base MEDIA>`:单瓦片编译时启用 **mod-over-base VFS overlay**
   (先查 `--media` 的 mod,再查 `--fallback` 的基础安装),用于把单个 mod 瓦片按整包
   构建的口径解析基础游戏 link/mesh 目标。整包构建(主命令)已自动带此 overlay。

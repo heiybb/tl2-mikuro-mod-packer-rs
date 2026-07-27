@@ -266,13 +266,6 @@ fn main() -> ExitCode {
             _ => positional.push(a),
         }
     }
-    // `dll` is refused by name rather than as an unknown value: existing
-    // scripts pass it, and they asked for BYTE-EXACT grids — quietly giving
-    // them the approximate ones would be the one outcome nobody wants.
-    if mpp_backend == "dll" {
-        eprintln!("Error: {}", packer::MPP_DLL_REMOVED);
-        return ExitCode::FAILURE;
-    }
     if !matches!(mpp_backend.as_str(), "re" | "none") {
         eprintln!("Error: --mpp must be one of re|none (got {mpp_backend:?})");
         return ExitCode::FAILURE;
