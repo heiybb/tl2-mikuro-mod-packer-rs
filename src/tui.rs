@@ -2221,6 +2221,142 @@ mod tests {
         assert_eq!(app.out_scroll, tail - 1, "one Up scrolls one line back");
     }
 
+    /// Dump the rendered frames — glyphs AND colours — as JSON, for the README
+    /// screenshots. Not a test: it asserts nothing and only runs when asked.
+    ///
+    ///   TL2_TUI_SHOT=<dir> cargo test --bin tl2-mikuro-mod-packer dump_frames -- --ignored
+    ///
+    /// Rendering here rather than photographing a terminal is what keeps the
+    /// images honest: they come out of the same `draw` the program runs, so
+    /// they cannot drift from the UI the way a hand-taken screenshot does. The
+    /// content is fixed demo data, deliberately IDENTICAL across languages, so
+    /// the three sets show exactly what is translated (the chrome) and what is
+    /// not (mod names, CLI flags).
+    #[test]
+    #[ignore = "writes README screenshots"]
+    fn dump_frames_for_docs() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let Some(dir) = std::env::var_os("TL2_TUI_SHOT") else {
+            eprintln!("set TL2_TUI_SHOT=<dir>");
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let demo_pack = || {
+            vec![
+                ModEntry {
+                    title: "Extra Maps".into(),
+                    file_name: "EXTRA_MAPS".into(),
+                    dir: PathBuf::from("/x/ExtraMaps"),
+                    has_layouts: true,
+                    action: Action::Pack,
+                    origin: Origin::Local,
+                },
+                ModEntry {
+                    title: "My First Mod".into(),
+                    file_name: "MY_FIRST_MOD".into(),
+                    dir: PathBuf::from("/x/MyFirstMod"),
+                    has_layouts: false,
+                    action: Action::Pack,
+                    origin: Origin::Local,
+                },
+            ]
+        };
+        let demo_unpack = || {
+            vec![
+                ModEntry {
+                    title: "Extra Maps".into(),
+                    file_name: "EXTRA_MAPS".into(),
+                    dir: PathBuf::from("/x/EXTRA_MAPS.MOD"),
+                    has_layouts: false,
+                    action: Action::Unpack,
+                    origin: Origin::Local,
+                },
+                ModEntry {
+                    title: "Someone Else's Mod".into(),
+                    file_name: "SOMEONE_ELSES_MOD".into(),
+                    dir: PathBuf::from("/game/mods/SOMEONE_ELSES_MOD.MOD"),
+                    has_layouts: false,
+                    action: Action::Unpack,
+                    origin: Origin::Deployed,
+                },
+            ]
+        };
+
+        for lang in [Lang::En, Lang::Zh, Lang::Ru] {
+            for (tab, name) in [(TAB_PACK, "pack"), (TAB_UNPACK, "unpack"), (TAB_OUTPUT, "output")] {
+                let mut app =
+                    App::new(demo_pack(), demo_unpack(), BaseSource::Bundled, PathBuf::from("/x"));
+                app.set_lang(lang);
+                app.tab = tab;
+                match tab {
+                    TAB_PACK => app.pack.toggle_current(),
+                    TAB_UNPACK => app.unpack.toggle_current(),
+                    _ => {
+                        // A believable mid-run transcript: the lines the worker
+                        // really streams, in the order it streams them.
+                        app.packing.store(true, Ordering::Relaxed);
+                        for l in [
+                            "Pathing base: C:\\Tools\\.tl2packer_base",
+                            "",
+                            "═══════ pack Extra Maps  (mpp=re) ═══════",
+                            "MOD: EXTRA_MAPS",
+                            "Title: Extra Maps",
+                            "[1/3] Converting in memory (no copy)...",
+                            "  Generating MPP files (backend=re)...",
+                            "",
+                            "  Results:",
+                            "    DAT→BINDAT:   184 files",
+                            "    LAYOUT→BINLAYOUT: 37 files",
+                            "    RAW generated: 3 files",
+                            "    MPP generated: 12 files (backend=re)",
+                            "    (convert took 1.8s)",
+                            "[2/3] Packing .MOD...",
+                        ] {
+                            logln(&app.log, l);
+                        }
+                    }
+                }
+                // The pickers are short lists; the log wants room to look like
+                // a log rather than a four-line peephole.
+                let rows = if tab == TAB_OUTPUT { 24 } else { 18 };
+                let mut terminal = Terminal::new(TestBackend::new(96, rows)).unwrap();
+                terminal.draw(|f| draw(f, &app)).unwrap();
+                let buf = terminal.backend().buffer();
+
+                let hex = |c: Option<Color>| match c {
+                    Some(Color::Rgb(r, g, b)) => format!("\"#{r:02X}{g:02X}{b:02X}\""),
+                    _ => "null".to_string(),
+                };
+                let mut out =
+                    format!("{{\"w\":{},\"h\":{},\"cells\":[", buf.area.width, buf.area.height);
+                for y in 0..buf.area.height {
+                    for x in 0..buf.area.width {
+                        let cell = &buf[(x, y)];
+                        let st = cell.style();
+                        let sym = cell.symbol().replace('\\', "\\\\").replace('"', "\\\"");
+                        if !(x == 0 && y == 0) {
+                            out.push(',');
+                        }
+                        out.push_str(&format!(
+                            "{{\"s\":\"{sym}\",\"fg\":{},\"bg\":{},\"b\":{}}}",
+                            hex(st.fg),
+                            hex(st.bg),
+                            st.add_modifier.contains(Modifier::BOLD)
+                        ));
+                    }
+                }
+                out.push_str("]}");
+                let p = dir.join(format!("tui-{}-{name}.json", lang.code()));
+                std::fs::write(&p, out).unwrap();
+                eprintln!("wrote {}", p.display());
+            }
+        }
+    }
+
     /// An empty picker must say what it looked for instead of showing a blank
     /// box — the unpack tab in particular is empty for anyone who has not built
     /// a mod yet, and the three scanned locations are the useful answer.

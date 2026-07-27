@@ -1,6 +1,6 @@
 # tl2-mikuro-mod-packer-rs
 
-*[中文](README.zh-CN.md)*
+*[中文](README.zh-CN.md) · [Русский](README.ru.md)*
 
 A **`.MOD` packer and unpacker** for Torchlight 2 — a single executable, with no
 need for the game's editor (GUTS).
@@ -16,6 +16,14 @@ without the game installed**.
 
 The Python reference implementation `mikuro_mod_packer` is archived at GitHub
 `heiybb/TL2-RE`; this repository is the only implementation in use.
+
+> **Want the whole story?** How the container is assembled, what each of the five
+> binary formats actually is, which single hash the game validates, how the pathing
+> grid is baked — plus the real mechanism behind the classic failures (ticked in the
+> launcher but nothing happens / a portrait turned into some other image / players
+> can't move after a level transition):
+> **[What's Actually Inside a .MOD](https://tl2-mod.chr.moe/en/devlog/tl2-mod-packing-full-analysis/)**
+> on Emberworks. This README is the manual; that post is the explanation.
 
 ---
 
@@ -33,6 +41,48 @@ Three ways to drive it, depending on what you want:
 | Click through it | **Double-click the exe** (or drop it in a mod folder / the game folder and run it) → interactive UI |
 | Scripting, CI | Run it with arguments → an ordinary command-line tool |
 | One file at a time | The `compile-dat` / `decompile-layout` / … subcommands |
+
+---
+
+## A walk through the interface
+
+Started with no arguments, it opens on the picker. The images below are the real
+frames the program draws, in English — the [Chinese](README.zh-CN.md) and
+[Russian](README.ru.md) READMEs show the same walkthrough in their own language.
+Notice what is *not* translated: mod names, paths, and every CLI flag, because
+those are what you type.
+
+### 1 · Choose what to pack
+
+![The PACK tab: two mod sources, one ticked](docs/img/tui-en-pack.png)
+
+Every folder holding `MOD.DAT` shows up here — from the exe's own folder, its
+`mods\` subfolder, and the folder itself if that is where you dropped the exe.
+`↑↓` moves, `Space` ticks, `a` ticks everything, `Enter` starts. With nothing
+ticked, `Enter` packs the row under the cursor.
+
+Each row is tagged `level mod` or `content mod`. One test decides it — does
+`MEDIA/LAYOUTS` hold any `*.LAYOUT`? — and that decides whether the pathing
+walk-grids get baked, which is the slow part of a build.
+
+### 2 · Watch it run
+
+![The OUTPUT tab: a pack in progress, following the tail](docs/img/tui-en-output.png)
+
+The view switches to OUTPUT and streams the packer's own log line by line, so a
+long build never looks like it hung. `↑↓` scrolls (which stops the auto-follow),
+`End` re-follows the tail, `c` clears the transcript, `q` quits — but not while a
+run is going, so a child process is never orphaned.
+
+### 3 · Unpack, the other direction
+
+![The UNPACK tab: a local .MOD and a deployed one](docs/img/tui-en-unpack.png)
+
+`.MOD` files found next to the exe, in `.\mods`, and — the one that matters — in
+the game's own mods folder, each row tagged `local` or `game mods` so you can tell
+your fresh build from what is installed. Output lands in `unpacked\<name>\` next
+to the exe. **The game's mods folder is never written to by an unpack**, so taking
+apart something you have installed is safe.
 
 ---
 
