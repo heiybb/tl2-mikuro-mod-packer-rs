@@ -213,7 +213,13 @@ fn convert(path: &str, payload: Vec<u8>, opt: &Options, report: &mut Report) -> 
     }
     let up = path.to_uppercase();
     if DAT_SOURCES.iter().any(|s| up.ends_with(s)) && !is_text(&payload) {
-        match bindat_decompile::decompile_bindat_reported(&payload) {
+        // A mod's own section name is usually the file's basename (and sometimes
+        // its directory) — hashes the embedded dictionary cannot know but the
+        // path can supply. GUTS recovers these from its runtime string interner;
+        // this is the same information, taken from where it is still written down.
+        let hints = path_name_hints(&up);
+        let hint_refs: Vec<&str> = hints.iter().map(String::as_str).collect();
+        match bindat_decompile::decompile_bindat_hinted(&payload, &hint_refs) {
             Ok(d) => {
                 for n in &d.unknown_names {
                     report.unknown_names.insert(format!("{n}  ({path})"));
@@ -262,6 +268,25 @@ fn convert(path: &str, payload: Vec<u8>, opt: &Options, report: &mut Report) -> 
         }
     }
     copy(payload)
+}
+
+/// Candidate section/key names taken from an entry's own path: the file stem
+/// (`UNITTYPES/MERCHANT_PETS.DAT` → `MERCHANT_PETS`) and its parent directory.
+/// Wrong guesses cost nothing — a hint is only consulted when its `rg_hash`
+/// matches the hash actually stored in the file.
+fn path_name_hints(upper_path: &str) -> Vec<String> {
+    let mut parts: Vec<&str> = upper_path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut out = Vec::new();
+    if let Some(file) = parts.pop() {
+        let stem = file.split('.').next().unwrap_or(file);
+        if !stem.is_empty() {
+            out.push(stem.to_string());
+        }
+    }
+    if let Some(dir) = parts.pop() {
+        out.push(dir.to_string());
+    }
+    out
 }
 
 /// True when the payload is already a TEXT source rather than a compiled blob.

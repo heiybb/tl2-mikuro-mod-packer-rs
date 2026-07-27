@@ -39,13 +39,24 @@ fn name_of(hash: u32) -> String {
         .unwrap_or_else(|| format!("UNK_{hash:08X}"))
 }
 
-/// `name_of`, also recording the placeholder when the dictionary cannot name
-/// the hash — so an unpack can tell the user WHICH names it could not recover.
-fn name_of_reported(hash: u32, unknown: &mut BTreeSet<String>) -> String {
-    let n = name_of(hash);
-    if REVERSE.get(&hash).is_none() {
-        unknown.insert(n.clone());
+/// `name_of`, but first consulting per-file HINTS, and recording the
+/// placeholder when neither can name the hash — so an unpack can tell the user
+/// WHICH names it could not recover.
+///
+/// The hints matter more than they look: a mod's own section name is very often
+/// the file's own basename (`UNITTYPES/MERCHANT_PETS.DAT` opens `[MERCHANT_PETS]`),
+/// which the embedded dictionary cannot know but the caller can simply hand over.
+/// That is also how GUTS gets those names back — its interner has seen every
+/// string the editor ever loaded.
+fn name_of_hinted(hash: u32, hints: &HashMap<u32, String>, unknown: &mut BTreeSet<String>) -> String {
+    if let Some(n) = REVERSE.get(&hash) {
+        return n.to_string();
     }
+    if let Some(n) = hints.get(&hash) {
+        return n.clone();
+    }
+    let n = format!("UNK_{hash:08X}");
+    unknown.insert(n.clone());
     n
 }
 
@@ -78,12 +89,14 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// The type tag emitted for a stored type code (inverse of `bindat::type_code`).
+/// The type tag emitted for a stored type code (inverse of `bindat::type_code`,
+/// which normalises by removing spaces — so the spelling here is free to match
+/// what the shipped sources and GUTS' own unpacker write).
 fn type_tag(tc: u32) -> &'static str {
     match tc {
         1 => "INTEGER",
         2 => "FLOAT",
-        4 => "UNSIGNEDINT",
+        4 => "UNSIGNED INT",
         5 => "STRING",
         6 => "BOOL",
         7 => "INTEGER64",
@@ -92,14 +105,18 @@ fn type_tag(tc: u32) -> &'static str {
     }
 }
 
-/// Format a float the way TL2 DATs do — a trailing `.0` for whole values so the
-/// type stays visibly float, otherwise the shortest exact decimal.
+/// Format a float the way TL2 DATs do: the shortest decimal that round-trips,
+/// with NO forced `.0` on whole values — `<FLOAT>DURATION:0` is what both the
+/// shipped sources and GUTS' own unpacker write, and the `<FLOAT>` tag is what
+/// makes the value a float on recompile, not the decimal point.
+///
+/// One deliberate divergence from GUTS: it prints large values through MSVC's
+/// `%g` (`1.9108e+006`), which keeps only 6 significant digits and therefore
+/// LOSES precision — GUTS' own unpack→repack does not reproduce such a value.
+/// Shortest-round-trip always re-reads as the identical f32, so we keep it and
+/// accept the textual difference.
 fn fmt_f32(x: f32) -> String {
-    if x.is_finite() && x.fract() == 0.0 && x.abs() < 1e15 {
-        format!("{x:.1}")
-    } else {
-        format!("{x}")
-    }
+    format!("{x}")
 }
 
 fn emit_node(
@@ -107,14 +124,25 @@ fn emit_node(
     strs: &HashMap<u32, String>,
     out: &mut String,
     unknown: &mut BTreeSet<String>,
+    hints: &HashMap<u32, String>,
+    depth: usize,
 ) -> Result<(), String> {
     let name_hash = c.u32()?;
     let nprops = c.u32()?;
-    let name = name_of_reported(name_hash, unknown);
+    let name = name_of_hinted(name_hash, hints, unknown);
+    // Tab-indent by nesting depth — that is what the shipped .DAT sources and
+    // GUTS' own unpacker emit, so a decompiled file reads (and diffs) like one.
+    let indent = |out: &mut String, d: usize| {
+        for _ in 0..d {
+            out.push('\t');
+        }
+    };
+    indent(out, depth);
     out.push('[');
     out.push_str(&name);
     out.push_str("]\r\n");
     for _ in 0..nprops {
+        indent(out, depth + 1);
         let key_hash = c.u32()?;
         let tc = c.u32()?;
         let value = match tc {
@@ -134,15 +162,16 @@ fn emit_node(
         out.push('<');
         out.push_str(type_tag(tc));
         out.push('>');
-        out.push_str(&name_of_reported(key_hash, unknown));
+        out.push_str(&name_of_hinted(key_hash, hints, unknown));
         out.push(':');
         out.push_str(&value);
         out.push_str("\r\n");
     }
     let nchildren = c.u32()?;
     for _ in 0..nchildren {
-        emit_node(c, strs, out, unknown)?;
+        emit_node(c, strs, out, unknown, hints, depth + 1)?;
     }
+    indent(out, depth);
     out.push_str("[/");
     out.push_str(&name);
     out.push_str("]\r\n");
@@ -162,6 +191,18 @@ pub struct Decompiled {
 /// (keys/section names via the embedded dictionary; values verbatim), reporting
 /// the unrecoverable names.
 pub fn decompile_bindat_reported(data: &[u8]) -> Result<Decompiled, String> {
+    decompile_bindat_hinted(data, &[])
+}
+
+/// `decompile_bindat_reported`, plus caller-supplied candidate names tried when
+/// the embedded dictionary cannot reverse a hash — pass the file's own basename
+/// (and anything else you know) to recover a mod's private section names.
+pub fn decompile_bindat_hinted(data: &[u8], hints: &[&str]) -> Result<Decompiled, String> {
+    let hint_map: HashMap<u32, String> = hints
+        .iter()
+        .filter(|h| !h.is_empty())
+        .map(|h| (rg_hash_str(h), h.to_string()))
+        .collect();
     let mut c = Cursor { b: data, p: 0 };
     let _ver = c.u32()?; // 2
     let count = c.u32()? as usize;
@@ -176,7 +217,7 @@ pub fn decompile_bindat_reported(data: &[u8]) -> Result<Decompiled, String> {
     let mut out = String::new();
     let mut unknown = BTreeSet::new();
     while c.p < data.len() {
-        emit_node(&mut c, &strs, &mut out, &mut unknown)?;
+        emit_node(&mut c, &strs, &mut out, &mut unknown, &hint_map, 0)?;
     }
     Ok(Decompiled { text: out, unknown_names: unknown })
 }
