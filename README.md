@@ -33,7 +33,7 @@ Building the whole 挑战者大陆 series — ten components, 173k files — tak
 GUTS editor **983 seconds**; this packer takes **46**. Per component the speedup runs
 from 2× to 43×, and the widest gaps are exactly where the editor bakes pathing grids.
 
-The native numbers come from the native benchmark in `D:\WizardProject\TL2\TL2-RE\README.md`
+The native numbers come from the benchmark in the archived `heiybb/TL2-RE`
 (a forked headless `tl2_console_fork` driving the real EditorGuts.dll; InitEditor's
 one-off 3.85s is amortised, warm timing over `CreateMod` + `EditorRegenPathingData`).
 These 5 Rust runs used the **same source copies as the native benchmark**
@@ -368,7 +368,7 @@ plain-text dump for reading.
 | MPP (offline `re`) | 13 varied tiles (cliff / landmark alias / boss / town / exit / cave / vault) vs the reference implementation | **13/13 identical** |
 | Whole `.MOD` | Three real mods, container against container | header + manifest structurally identical; **all 1856 / 35864 / 11205 files match on decompressed content, CRC and ftime**; rollingHash + mhash self-consistent (the two hashes the game checks) |
 | BINLAYOUT decompile fixed point | our BINLAYOUT → decompile → recompile | **8986/8986 byte-exact** |
-| same, from shipped binaries | 8967/8986 — the 19 failures are **exactly** the 19 compilation itself cannot reproduce; the decompiler adds none |
+| same, fed the shipped binaries | shipped BINLAYOUT → decompile → compile | **8967/8986** — the 19 failures are **exactly** the 19 that compilation itself cannot reproduce; the decompiler adds none |
 
 The only byte difference between our container and another packer's is the zlib
 stream — a different compression backend. The game inflates, so it cannot tell, and
@@ -493,7 +493,7 @@ change of language or precision moves it.
 | `src/bindat_decompile.rs` | BINDAT → DAT (embedded dictionary + the `UNK_<HEX8>` escape) |
 | `src/pak.rs` / `src/unpack.rs` | Container reading (header/manifest/blocks) and `.MOD` → source tree |
 | `src/tui.rs` | The ratatui interface (binary-only; never reaches wasm) |
-| `src/mpp/*` | Region-header f32 rounding aligned per operation; the native classifier is `build_grid_fast`-equivalent (bucket culling, row-parallel with rayon) |
+| `src/mpp/*` | Region-header f32 rounding aligned per operation; the production grid builder culls by bucket and runs row-parallel with rayon |
 
 Bug-for-bug behaviour kept on purpose: ogre_mesh reads only the first vertex-declaration
 element (an inherited +14 stride bug; POSITION is always element 0); binlayout swallows

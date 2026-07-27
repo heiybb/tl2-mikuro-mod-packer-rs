@@ -26,7 +26,7 @@ Python 参考实现 `mikuro_mod_packer` 已归档于 GitHub `heiybb/TL2-RE`,本�
 把整个挑战者大陆系列打完 —— 10 个组件、17.3 万文件 —— 官方 GUTS 编辑器要 **983 秒**,
 本打包器 **46 秒**。逐组件加速从 2× 到 43×,差距最大的正是编辑器要烘寻路走格的那些。
 
-原生数据来自 `D:\WizardProject\TL2\TL2-RE\README.md` 的 native 基准(forked headless
+原生数据来自已归档的 `heiybb/TL2-RE` 里的 native 基准(forked headless
 `tl2_console_fork` 驱动真实 EditorGuts.dll,InitEditor 一次性 3.85s 已摊销,warm 计时
 `CreateMod` + `EditorRegenPathingData`)。本次 Rust 5 轮实验跑在**与 native 基准相同的
 源副本**上(`E:\Torchlight 2\mods`,含编译产物 sibling,故文件数大于 monorepo)。
@@ -323,7 +323,7 @@ verify.exe unpack <mod.MOD>     # 解包→重打包→逐条目内容对账
 | MPP (offline `re`) | 13 个多样 tile(cliff/landmark 别名/boss/town/exit/cave/vault)vs 参考实现 | **13/13 字节一致** |
 | .MOD 整包 | 佣兵系统 / 职业技能 / 通用素材01 三个真实 mod,容器对容器 | header+manifest 结构一致;**全部 1856 / 35864 / 11205 个文件解压内容、CRC、ftime 一致**;rollingHash + mhash 自洽(游戏校验的两个哈希) |
 | BINLAYOUT 反编译不动点 | 我们编译的 BINLAYOUT → 反编译 → 重编译 | **8986/8986 字节精确** |
-| 同上,输入换 shipped 二进制 | 8967/8986 —— 失败的 19 个**正是**编译本身就复现不了的那 19 个,反编译器零新增 |
+| 同上,输入换 shipped 二进制 | shipped BINLAYOUT → 反编译 → 编译 | **8967/8986** —— 失败的 19 个**正是**编译本身就复现不了的那 19 个,反编译器零新增 |
 
 我们的容器与别的打包器唯一的字节差异 = zlib 压缩流(压缩后端不同)。游戏只做 inflate,
 分辨不出,而且我们的产物略小。
@@ -429,12 +429,11 @@ per-instance 运行时 nocollide),换语言/精度都不移动它。
 | `src/bindat_decompile.rs` | BINDAT → DAT 反编译(内嵌词表 + `UNK_<HEX8>` 转义) |
 | `src/pak.rs` / `src/unpack.rs` | 容器读取(header/manifest/块)与 `.MOD`→源目录解包 |
 | `src/tui.rs` | ratatui 交互界面(binary-only,不进 wasm) |
-| `src/mpp/*` | region 头部 f32 舍入逐操作对齐;native 分类器 = `build_grid_fast` 等价(桶剔除,逐行 rayon 并行) |
+| `src/mpp/*` | region 头部 f32 舍入逐操作对齐;生产用网格构建器按桶剔除、逐行 rayon 并行 |
 
 刻意保留的 bug-for-bug 行为:ogre_mesh 顶点声明只读第一个 element(沿袭下来的 +14
 步进 bug,POSITION 恒为 element 0);binlayout 的 `NAME`/`CHOICE`/`GAME MODE` 首次出现
-吞为对象元数据;TAGS.DAT 空根名哈希等 — 详见各文件注释与
-`tl2-packer-formats-bindat-binlayout-mpp` 项目记忆。
+吞为对象元数据;TAGS.DAT 空根名哈希等 —— 详见各文件注释。
 
 浏览器版(同一套 `#[path]` 共享代码编到 wasm)见 `../tl2-mikuro-mod-packer-wasm`。
 
