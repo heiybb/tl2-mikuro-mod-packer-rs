@@ -4,11 +4,10 @@
 //! remainder is cliff/overhang float tie-breaks and nocollide cave walls, which
 //! are not reproducible offline.
 //!
-//! This is the ONLY backend. There used to be a `dll` one that shelled out to
-//! `TL2-Mikuro-Console.exe` for byte-exact grids; it is gone (see
-//! `packer::MPP_DLL_REMOVED` for how to run the console host directly), because
-//! wrapping it meant staging the whole mod into the editor's own mods folder —
-//! over anything already there.
+//! The ceiling is cosmetic where it matters: measured with 1 (wall) and 255
+//! (void) treated alike — both are impassable to the pathfinder — walkability
+//! agrees with native to the float floor. That is why this is the only backend;
+//! the one that drove the real editor for byte-exact grids is gone.
 
 pub mod dat;
 pub mod geom;
