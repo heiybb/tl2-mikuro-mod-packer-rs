@@ -621,6 +621,18 @@ impl App {
         }
     }
 
+    /// Empty the run log. Allowed mid-run on purpose — the usual reason to
+    /// reach for it is that a long pack has buried the part you care about, and
+    /// the worker just keeps appending after it. Only the transcript is dropped;
+    /// the run itself and the done/running status are untouched.
+    fn clear_log(&mut self) {
+        if let Ok(mut v) = self.log.lock() {
+            v.clear();
+        }
+        self.out_scroll = 0;
+        self.follow = true;
+    }
+
     /// Spawn the worker for the ACTIVE picker and switch to Output.
     fn start_run(&mut self) {
         let Some(pane) = self.pane() else { return };
@@ -709,6 +721,7 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
                 }
                 KeyCode::PageDown => app.out_scroll = app.out_scroll.saturating_add(10),
                 KeyCode::End | KeyCode::Char('G') => app.follow = true,
+                KeyCode::Char('c') => app.clear_log(),
                 _ => {}
             },
             _ if !app.is_packing() => match k.code {
@@ -944,8 +957,13 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
     } else {
         app.out_scroll.min(max_scroll)
     };
-    let (title, tstyle) = if app.follow {
-        (" Output · following ".to_string(), Style::default().fg(theme::SET))
+    let (title, tstyle) = if total == 0 {
+        (" Output · empty ".to_string(), Style::default().fg(theme::FAINT))
+    } else if app.follow {
+        (
+            format!(" Output · following · {total} lines "),
+            Style::default().fg(theme::SET),
+        )
     } else {
         (
             format!(" Output · {}/{} ", scroll.min(total), total),
@@ -972,6 +990,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             sep(" scroll    "),
             key("End"),
             sep(" follow    "),
+            key("c"),
+            sep(" clear    "),
             key("Tab"),
             sep(" switch    "),
             key("1/2/3"),
@@ -1157,6 +1177,26 @@ mod tests {
         dump("OUTPUT", &out);
         assert!(out.contains("Output"), "output tab title");
         assert!(out.contains("hello from worker"), "log line rendered");
+        assert!(out.contains("clear"), "footer offers the clear key");
+
+        // `c` empties the transcript and returns to following the tail.
+        app.follow = false;
+        app.out_scroll = 7;
+        app.clear_log();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let cleared = buffer_text(terminal.backend().buffer());
+        dump("OUTPUT (cleared)", &cleared);
+        assert!(!cleared.contains("hello from worker"), "log emptied");
+        assert!(cleared.contains("Output · empty"), "title says so");
+        assert!(app.follow && app.out_scroll == 0, "clear re-arms tail-following");
+        // Clearing the transcript must not rewrite what happened: a finished run
+        // still reads as finished in the header.
+        app.finished.store(true, Ordering::Relaxed);
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(
+            buffer_text(terminal.backend().buffer()).contains("done"),
+            "clear does not reset the run status"
+        );
     }
 
     /// An empty picker must say what it looked for instead of showing a blank
