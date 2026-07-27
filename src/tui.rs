@@ -48,6 +48,74 @@ mod theme {
     pub const SET: Color = Color::Rgb(0x7C, 0xC9, 0x6E); // ok / done / selected mark
 }
 
+// ── UI language ────────────────────────────────────────────────────────────
+// Only the TUI is localized. Everything the CLI prints (and every line the pack
+// / unpack workers stream into the Output tab) stays English: those are the
+// same strings the scriptable CLI emits, and people paste them into bug reports.
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Lang {
+    En,
+    Zh,
+}
+
+impl Lang {
+    /// Pick a string by language. Call sites read `t(en, zh)`, English first,
+    /// so the source stays greppable against the CLI's own wording.
+    fn t(self, en: &'static str, zh: &'static str) -> &'static str {
+        match self {
+            Lang::En => en,
+            Lang::Zh => zh,
+        }
+    }
+
+    fn is_zh(self) -> bool {
+        self == Lang::Zh
+    }
+}
+
+/// `TL2_LANG=en|zh` wins; otherwise the Windows user UI language; otherwise the
+/// POSIX `LC_ALL`/`LANG`; otherwise English.
+///
+/// The env override is not just for testing — this session's own shell exports
+/// `LANG=C.UTF-8`, and a user whose Windows is English but who wants the Chinese
+/// UI (or the reverse) has no other way to say so.
+fn detect_lang() -> Lang {
+    if let Some(v) = std::env::var_os("TL2_LANG") {
+        let v = v.to_string_lossy().to_ascii_lowercase();
+        if v.starts_with("zh") || v.starts_with("cn") {
+            return Lang::Zh;
+        }
+        if v.starts_with("en") {
+            return Lang::En;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // LANGID low 10 bits = primary language; 0x04 = LANG_CHINESE (any of
+        // zh-CN / zh-TW / zh-HK — all get the Simplified strings, which is the
+        // audience this tool actually has).
+        let id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
+        if id & 0x3FF == 0x04 {
+            return Lang::Zh;
+        }
+        // A non-Chinese Windows UI is a real answer; fall through to English
+        // rather than letting a stray POSIX LANG override the OS setting.
+        return Lang::En;
+    }
+    #[cfg(not(windows))]
+    {
+        for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            if let Ok(v) = std::env::var(key) {
+                if v.to_ascii_lowercase().starts_with("zh") {
+                    return Lang::Zh;
+                }
+            }
+        }
+        Lang::En
+    }
+}
+
 /// Shared, worker-appended log rendered live in the Output tab.
 type Log = Arc<Mutex<Vec<String>>>;
 
@@ -94,10 +162,10 @@ enum Origin {
 }
 
 impl Origin {
-    fn label(self) -> &'static str {
+    fn label(self, lang: Lang) -> &'static str {
         match self {
-            Origin::Local => "local",
-            Origin::Deployed => "game mods",
+            Origin::Local => lang.t("local", "本地"),
+            Origin::Deployed => lang.t("game mods", "游戏 mods"),
         }
     }
 }
@@ -324,7 +392,14 @@ pub fn run() -> ExitCode {
         }
         println!("mod files: {}", unpacks.len());
         for m in &unpacks {
-            println!("  - unpack {}  [{}]  {}", m.title, m.origin.label(), m.dir.display());
+            // The diagnostic dump stays English whatever the UI language is —
+            // it is machine-facing output that ends up in bug reports.
+            println!(
+                "  - unpack {}  [{}]  {}",
+                m.title,
+                m.origin.label(Lang::En),
+                m.dir.display()
+            );
         }
         return ExitCode::SUCCESS;
     }
@@ -593,6 +668,7 @@ struct App {
     follow: bool, // Output tab auto-scroll to tail
     out_scroll: u16,
     help_scroll: u16,
+    lang: Lang,
 }
 
 impl App {
@@ -611,7 +687,12 @@ impl App {
             follow: true,
             out_scroll: 0,
             help_scroll: 0,
+            lang: detect_lang(),
         }
+    }
+
+    fn t(&self, en: &'static str, zh: &'static str) -> &'static str {
+        self.lang.t(en, zh)
     }
 
     fn is_packing(&self) -> bool {
@@ -827,12 +908,23 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(text, style)
     };
     let (status, status_style) = if app.is_packing() {
-        ("running…".to_string(), Style::default().fg(theme::GOLD).add_modifier(Modifier::BOLD))
+        (
+            app.t("running…", "运行中…").to_string(),
+            Style::default().fg(theme::GOLD).add_modifier(Modifier::BOLD),
+        )
     } else if app.finished.load(Ordering::Relaxed) {
-        ("done".to_string(), Style::default().fg(theme::SET).add_modifier(Modifier::BOLD))
+        (
+            app.t("done", "完成").to_string(),
+            Style::default().fg(theme::SET).add_modifier(Modifier::BOLD),
+        )
     } else if let Some(p) = app.pane() {
         (
-            format!("selected {}/{}", p.picked_count(), p.items.len()),
+            format!(
+                "{} {}/{}",
+                app.t("selected", "已选"),
+                p.picked_count(),
+                p.items.len()
+            ),
             Style::default().fg(theme::EMBER),
         )
     } else {
@@ -840,14 +932,14 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     };
     let gap = || Span::raw("  ");
     let line = Line::from(vec![
-        tab(app.tab == TAB_PACK, "PACK", Some(app.pack.items.len())),
+        tab(app.tab == TAB_PACK, app.t("PACK", "打包"), Some(app.pack.items.len())),
         gap(),
-        tab(app.tab == TAB_UNPACK, "UNPACK", Some(app.unpack.items.len())),
+        tab(app.tab == TAB_UNPACK, app.t("UNPACK", "解包"), Some(app.unpack.items.len())),
         gap(),
-        tab(app.tab == TAB_OUTPUT, "OUTPUT", None),
+        tab(app.tab == TAB_OUTPUT, app.t("OUTPUT", "输出"), None),
         gap(),
-        tab(app.tab == TAB_HELP, "HELP", None),
-        Span::styled("    base ", Style::default().fg(theme::MUTED)),
+        tab(app.tab == TAB_HELP, app.t("HELP", "帮助"), None),
+        Span::styled(app.t("    base ", "    base "), Style::default().fg(theme::MUTED)),
         Span::styled(app.base.short(), Style::default().fg(theme::GOLD)),
         Span::styled("    ", Style::default()),
         Span::styled(status, status_style),
@@ -870,9 +962,9 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     let Some(pane) = app.pane() else { return };
     let title = Span::styled(
         if unpacking {
-            " unpack · Space select · Enter run "
+            app.t(" unpack · Space select · Enter run ", " 解包 · Space 选择 · Enter 运行 ")
         } else {
-            " pack · Space select · Enter run "
+            app.t(" pack · Space select · Enter run ", " 打包 · Space 选择 · Enter 运行 ")
         },
         Style::default().fg(theme::MUTED),
     );
@@ -882,11 +974,14 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         let msg = if unpacking {
             vec![
                 Line::from(Span::styled(
-                    "No .MOD files found.",
+                    app.t("No .MOD files found.", "没有找到 .MOD 文件。"),
                     Style::default().fg(theme::MUTED),
                 )),
                 Line::from(""),
-                Line::from(Span::styled("Looked in:", Style::default().fg(theme::FAINT))),
+                Line::from(Span::styled(
+                    app.t("Looked in:", "找过这些位置:"),
+                    Style::default().fg(theme::FAINT),
+                )),
                 Line::from(Span::styled(
                     format!("  {}", app.root.display()),
                     Style::default().fg(theme::FAINT),
@@ -903,12 +998,15 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         } else {
             vec![
                 Line::from(Span::styled(
-                    "No mod sources found.",
+                    app.t("No mod sources found.", "没有找到可打包的 mod 源目录。"),
                     Style::default().fg(theme::MUTED),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "A source is a folder holding MOD.DAT and a MEDIA/ tree.",
+                    app.t(
+                        "A source is a folder holding MOD.DAT and a MEDIA/ tree.",
+                        "源目录 = 一个含 MOD.DAT 和 MEDIA/ 的文件夹。",
+                    ),
                     Style::default().fg(theme::FAINT),
                 )),
             ]
@@ -931,19 +1029,21 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
                 // On the unpack tab every row is a .MOD, so the useful tag is
                 // WHERE it came from, not what it is.
                 (Action::Unpack, _) => Span::styled(
-                    format!("  ({})", m.origin.label()),
+                    format!("  ({})", m.origin.label(app.lang)),
                     Style::default().fg(if m.origin == Origin::Deployed {
                         theme::GOLD
                     } else {
                         theme::FAINT
                     }),
                 ),
-                (Action::Pack, true) => {
-                    Span::styled("  (level mod)", Style::default().fg(theme::MAGIC))
-                }
-                (Action::Pack, false) => {
-                    Span::styled("  (content mod)", Style::default().fg(theme::FAINT))
-                }
+                (Action::Pack, true) => Span::styled(
+                    app.t("  (level mod)", "  (关卡 mod)"),
+                    Style::default().fg(theme::MAGIC),
+                ),
+                (Action::Pack, false) => Span::styled(
+                    app.t("  (content mod)", "  (内容 mod)"),
+                    Style::default().fg(theme::FAINT),
+                ),
             };
             let mark_style = if on {
                 Style::default().fg(theme::SET).add_modifier(Modifier::BOLD)
@@ -988,15 +1088,23 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
         app.out_scroll.min(max_scroll)
     };
     let (title, tstyle) = if total == 0 {
-        (" Output · empty ".to_string(), Style::default().fg(theme::FAINT))
+        (
+            app.t(" Output · empty ", " 输出 · 空 ").to_string(),
+            Style::default().fg(theme::FAINT),
+        )
     } else if app.follow {
         (
-            format!(" Output · following · {total} lines "),
+            format!(
+                " {} · {} · {total} {} ",
+                app.t("Output", "输出"),
+                app.t("following", "跟随"),
+                app.t("lines", "行")
+            ),
             Style::default().fg(theme::SET),
         )
     } else {
         (
-            format!(" Output · {}/{} ", scroll.min(total), total),
+            format!(" {} · {}/{} ", app.t("Output", "输出"), scroll.min(total), total),
             Style::default().fg(theme::MUTED),
         )
     };
@@ -1029,77 +1137,196 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
     };
     let blank = || Line::from("");
     let root = app.root.display().to_string();
-
+    let t = |en: &'static str, zh: &'static str| app.t(en, zh);
+    // Command names and flags are never translated — they are what you type.
     let mut v = vec![
-        head("BASE BUNDLE — what it is, and why packing needs it"),
-        body("Two things a mod build cannot compute from the mod alone:".into()),
-        dim("  · UNITDATA.RAW follows each unit's BASEFILE chain into the BASE GAME's".into()),
-        dim("    UNITS templates to read UNITTYPE / LEVEL / RARITY / CREATEAS.".into()),
-        dim("  · MPP walk-grids are baked against the base game's COLLISION geometry.".into()),
-        body("So the packer needs base data. It takes the first of three tiers:".into()),
-        dim("  1. loose MEDIA/ next to this exe         (a real extracted install)".into()),
-        dim("  2. PAKS/DATA.PAK — or DATA.PAK — beside it (extracted on first use)".into()),
-        dim("  3. the bundle baked into this exe        (always there, ~3 MB gzip)".into()),
-        body(format!("Right now: {}", app.base.label())),
-        dim("Tiers 2 and 3 unpack once into a cache next to the exe and reuse it:".into()),
+        head(t(
+            "BASE BUNDLE — what it is, and why packing needs it",
+            "BASE BUNDLE —— 它是什么,为什么打包需要它",
+        )),
+        body(t(
+            "Two things a mod build cannot compute from the mod alone:",
+            "有两样东西,光靠 mod 自己算不出来:",
+        ).into()),
+        dim(t(
+            "  · UNITDATA.RAW follows each unit's BASEFILE chain into the BASE GAME's",
+            "  · UNITDATA.RAW 要沿每个单位的 BASEFILE 继承链,读「基础游戏」的",
+        ).into()),
+        dim(t(
+            "    UNITS templates to read UNITTYPE / LEVEL / RARITY / CREATEAS.",
+            "    UNITS 模板里的 UNITTYPE / LEVEL / RARITY / CREATEAS。",
+        ).into()),
+        dim(t(
+            "  · MPP walk-grids are baked against the base game's COLLISION geometry.",
+            "  · MPP 寻路走格要拿基础游戏的碰撞几何来烘。",
+        ).into()),
+        body(t(
+            "So the packer needs base data. It takes the first of three tiers:",
+            "所以打包需要 base 数据。按顺序取三层里第一个可用的:",
+        ).into()),
+        dim(t(
+            "  1. loose MEDIA/ next to this exe         (a real extracted install)",
+            "  1. exe 旁边的散装 MEDIA/          (真实解包出来的安装目录)",
+        ).into()),
+        dim(t(
+            "  2. PAKS/DATA.PAK — or DATA.PAK — beside it (extracted on first use)",
+            "  2. 旁边的 PAKS/DATA.PAK 或 DATA.PAK  (首次使用时抽取)",
+        ).into()),
+        dim(t(
+            "  3. the bundle baked into this exe        (always there, ~3 MB gzip)",
+            "  3. 烧在这个 exe 里的 bundle        (永远可用,gzip 约 3 MB)",
+        ).into()),
+        body(format!("{} {}", t("Right now:", "当前用的是:"), app.base.label())),
+        dim(t(
+            "Tiers 2 and 3 unpack once into a cache next to the exe and reuse it:",
+            "第 2、3 层会在 exe 旁解出一份缓存,之后复用:",
+        ).into()),
         path(format!("  {}", app.root.join(".tl2packer_base").display())),
-        dim("All three produce byte-identical .MOD output — verified on a level mod.".into()),
+        dim(t(
+            "All three produce byte-identical .MOD output — verified on a level mod.",
+            "三层产出的 .MOD 逐字节一致 —— 已在一个关卡 mod 上验证过。",
+        ).into()),
         blank(),
-        head("CONTENT MOD vs LEVEL MOD"),
-        body("The picker tags each source by one test: does MEDIA/LAYOUTS hold any".into()),
-        body("*.LAYOUT file?".into()),
-        dim("  content mod — no layouts. Nothing to bake; packs with --mpp none.".into()),
-        dim("  level mod   — has layouts. Its pathing walk-grids (.MPP) are".into()),
-        dim("                regenerated with --mpp re, which is why it needs the".into()),
-        dim("                base collision geometry above. Tier 3 is embedded, so".into()),
-        dim("                base is always available; if resolving it fails anyway".into()),
-        dim("                the pack still runs and keeps the existing .MPP.".into()),
+        head(t("CONTENT MOD vs LEVEL MOD", "CONTENT MOD 与 LEVEL MOD")),
+        body(t(
+            "The picker tags each source by one test: does MEDIA/LAYOUTS hold any",
+            "列表给每个源目录打的标签只看一件事:MEDIA/LAYOUTS 里有没有",
+        ).into()),
+        body(t("*.LAYOUT file?", "任何 *.LAYOUT 文件?").into()),
+        dim(t(
+            "  content mod — no layouts. Nothing to bake; packs with --mpp none.",
+            "  内容 mod —— 没有 layout。没东西要烘,按 --mpp none 打包。",
+        ).into()),
+        dim(t(
+            "  level mod   — has layouts. Its pathing walk-grids (.MPP) are",
+            "  关卡 mod —— 有 layout。它的寻路走格(.MPP)会用 --mpp re",
+        ).into()),
+        dim(t(
+            "                regenerated with --mpp re, which is why it needs the",
+            "              重新生成,这正是它需要上面那份基础碰撞几何的原因。",
+        ).into()),
+        dim(t(
+            "                base collision geometry above. Tier 3 is embedded, so",
+            "              第 3 层是内嵌的,所以 base 总是可用;",
+        ).into()),
+        dim(t(
+            "                base is always available; if resolving it fails anyway",
+            "              万一解析失败,打包照常进行,",
+        ).into()),
+        dim(t(
+            "                the pack still runs and keeps the existing .MPP.",
+            "              只是保留源目录里已有的 .MPP。",
+        ).into()),
         blank(),
-        head("WHERE FILES ARE READ FROM"),
-        body("PACK scans for folders holding MOD.DAT (plus a MEDIA/ tree):".into()),
+        head(t("WHERE FILES ARE READ FROM", "从哪里读文件")),
+        body(t(
+            "PACK scans for folders holding MOD.DAT (plus a MEDIA/ tree):",
+            "打包:扫描含 MOD.DAT(以及 MEDIA/ 树)的文件夹:",
+        ).into()),
         path(format!("  {root}")),
         path(format!("  {}", app.root.join("mods").display())),
-        body("UNPACK scans for *.MOD files in those two, plus the game's mods folder".into()),
-        body("— the one --deploy writes to, so anything you just packed shows up:".into()),
+        body(t(
+            "UNPACK scans for *.MOD files in those two, plus the game's mods folder",
+            "解包:在上面两处找 *.MOD,另外加上游戏的 mods 目录 —— 也就是",
+        ).into()),
+        body(t(
+            "— the one --deploy writes to, so anything you just packed shows up:",
+            "--deploy 的落点,所以你刚打好的包会直接出现在列表里:",
+        ).into()),
         path(format!("  {}", tl2_mods_dir().display())),
-        dim("Rows are deduped by real path and tagged local / game mods.".into()),
+        dim(t(
+            "Rows are deduped by real path and tagged local / game mods.",
+            "按真实路径去重,每行标出处(本地 / 游戏 mods)。",
+        ).into()),
         blank(),
-        head("WHERE OUTPUT GOES"),
-        body("PACK from this TUI always deploys, i.e. writes <MOD_FILE_NAME>.MOD to".into()),
+        head(t("WHERE OUTPUT GOES", "输出到哪里")),
+        body(t(
+            "PACK from this TUI always deploys, i.e. writes <MOD_FILE_NAME>.MOD to",
+            "在这个界面里打包一律 --deploy,即把 <MOD_FILE_NAME>.MOD 写到:",
+        ).into()),
         path(format!("  {}", tl2_mods_dir().display())),
-        dim("  (MOD_FILE_NAME comes from MOD.DAT; the folder name is the fallback.)".into()),
-        body("UNPACK writes a source tree — MOD.DAT + MEDIA/ — under:".into()),
+        dim(t(
+            "  (MOD_FILE_NAME comes from MOD.DAT; the folder name is the fallback.)",
+            "  (MOD_FILE_NAME 取自 MOD.DAT;没有就退回文件夹名。)",
+        ).into()),
+        body(t(
+            "UNPACK writes a source tree — MOD.DAT + MEDIA/ — under:",
+            "解包写出一棵源目录树(MOD.DAT + MEDIA/),落在:",
+        ).into()),
         path(format!("  {}", app.root.join("unpacked").display())),
-        dim("  one subfolder per mod. The game's mods folder is never written to by".into()),
-        dim("  an unpack, so unpacking something you have installed is safe.".into()),
+        dim(t(
+            "  one subfolder per mod. The game's mods folder is never written to by",
+            "  每个 mod 一个子目录。解包**从不**写游戏 mods 目录,",
+        ).into()),
+        dim(t(
+            "  an unpack, so unpacking something you have installed is safe.",
+            "  所以解包一个你已经装着的 mod 是安全的。",
+        ).into()),
         blank(),
-        head("CLI MODE — run it with arguments instead"),
-        dim("Launching with no arguments is what opens this TUI. With arguments it".into()),
-        dim("is the ordinary command-line packer:".into()),
+        head(t(
+            "CLI MODE — run it with arguments instead",
+            "CLI 模式 —— 带参数运行",
+        )),
+        dim(t(
+            "Launching with no arguments is what opens this TUI. With arguments it",
+            "不带参数启动才会进这个界面;",
+        ).into()),
+        dim(t(
+            "is the ordinary command-line packer:",
+            "带参数时它就是普通的命令行打包器:",
+        ).into()),
         blank(),
-        cmd("<mod_dir> [--deploy]", "pack a mod folder"),
-        cmd("   --in-place | --temp-copy", "write converted files out (default: in memory)"),
-        cmd("   --mpp re|dll|none", "walk-grid backend (default re)"),
-        cmd("   --raw auto|none", "RAW index generation (default auto)"),
+        cmd("<mod_dir> [--deploy]", t("pack a mod folder", "打包一个 mod 目录")),
+        cmd(
+            "   --in-place | --temp-copy",
+            t("write converted files out (default: in memory)", "把转换产物写到磁盘(默认只在内存)"),
+        ),
+        cmd("   --mpp re|dll|none", t("walk-grid backend (default re)", "走格后端(默认 re)")),
+        cmd("   --raw auto|none", t("RAW index generation (default auto)", "RAW 索引生成(默认 auto)")),
         blank(),
-        cmd("unpack <in.MOD|DATA.PAK> <out_dir>", "container -> editable sources"),
-        cmd("   --raw", "keep payloads compiled (no decompile)"),
-        cmd("   --no-times", "do not restore file timestamps"),
-        cmd("   --filter <text>", "only entries whose path contains <text>"),
+        cmd(
+            "unpack <in.MOD|DATA.PAK> <out_dir>",
+            t("container -> editable sources", "容器 -> 可编辑源目录"),
+        ),
+        cmd("   --raw", t("keep payloads compiled (no decompile)", "保留编译产物,不反编译")),
+        cmd("   --no-times", t("do not restore file timestamps", "不还原文件时间戳")),
+        cmd("   --filter <text>", t("only entries whose path contains <text>", "只解包路径含 <text> 的条目")),
         blank(),
-        cmd("compile-dat <in.DAT> <out.BINDAT>", "single file"),
-        cmd("compile-layout <in.LAYOUT> <out.BINLAYOUT>", "single file"),
-        cmd("compile-mpp <in.LAYOUT> <out.mpp>", "single tile walk-grid"),
-        cmd("decompile-dat <in.BINDAT> <out.DAT>", "inverse; --utf8 for a plain dump"),
-        cmd("decompile-layout <in.BINLAYOUT> <out.LAYOUT>", "inverse"),
-        cmd("extract-base <DATA.PAK> <out_dir>", "base DATs + collision meshes"),
-        cmd("unpack-base <out_dir>", "the embedded bundle, no install needed"),
+        cmd("compile-dat <in.DAT> <out.BINDAT>", t("single file", "单文件")),
+        cmd("compile-layout <in.LAYOUT> <out.BINLAYOUT>", t("single file", "单文件")),
+        cmd("compile-mpp <in.LAYOUT> <out.mpp>", t("single tile walk-grid", "单块瓦片走格")),
+        cmd(
+            "decompile-dat <in.BINDAT> <out.DAT>",
+            t("inverse; --utf8 for a plain dump", "逆向;--utf8 出纯文本"),
+        ),
+        cmd("decompile-layout <in.BINLAYOUT> <out.LAYOUT>", t("inverse", "逆向")),
+        cmd(
+            "extract-base <DATA.PAK> <out_dir>",
+            t("base DATs + collision meshes", "基础 DAT + 碰撞网格"),
+        ),
+        cmd(
+            "unpack-base <out_dir>",
+            t("the embedded bundle, no install needed", "内嵌 bundle,不需要游戏安装"),
+        ),
         blank(),
-        dim("Env: TL2_MEDIA_DIR (base MEDIA)  TL2_MOD_GAMEVER (pin header gameVersion)".into()),
-        dim("     MIKURO_TIMING=1 (phase timings)  TL2_MODPACK_LIST=1 (dump discovery)".into()),
+        dim(t(
+            "Env: TL2_MEDIA_DIR (base MEDIA)  TL2_MOD_GAMEVER (pin header gameVersion)",
+            "环境变量:TL2_MEDIA_DIR(基础 MEDIA) TL2_MOD_GAMEVER(固定 header gameVersion)",
+        ).into()),
+        dim(t(
+            "     MIKURO_TIMING=1 (phase timings)  TL2_MODPACK_LIST=1 (dump discovery)",
+            "     MIKURO_TIMING=1(分阶段计时) TL2_MODPACK_LIST=1(打印发现结果)",
+        ).into()),
+        dim(t(
+            "     TL2_LANG=en|zh (force this UI's language)",
+            "     TL2_LANG=en|zh(强制界面语言)",
+        ).into()),
     ];
     v.push(blank());
-    v.push(dim("↑↓ / PageUp / PageDown to scroll this page.".into()));
+    v.push(dim(t(
+        "↑↓ / PageUp / PageDown to scroll this page.",
+        "↑↓ / PageUp / PageDown 滚动本页。",
+    ).into()));
     v
 }
 
@@ -1131,51 +1358,61 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let sep = |s: &'static str| Span::styled(s, Style::default().fg(theme::MUTED));
     // Wider gaps between key/label pairs than between a key and its own label,
     // so the eye groups them correctly instead of reading one long run.
+    let t = |en, zh| app.t(en, zh);
+    let quit = if app.is_packing() {
+        t(" (running…)", " (运行中…)")
+    } else {
+        t(" quit", " 退出")
+    };
     let hint = if app.tab == TAB_HELP {
         Line::from(vec![
             key("↑↓"),
-            sep(" scroll    "),
+            sep(t(" scroll    ", " 滚动    ")),
             key("Home"),
-            sep(" top    "),
+            sep(t(" top    ", " 回顶    ")),
             key("Tab"),
-            sep(" switch    "),
+            sep(t(" switch    ", " 切换    ")),
             key("1-4"),
-            sep(" jump    "),
+            sep(t(" jump    ", " 直达    ")),
             key("q"),
-            sep(if app.is_packing() { " (running…)" } else { " quit" }),
+            sep(quit),
         ])
     } else if app.tab == TAB_OUTPUT {
         Line::from(vec![
             key("↑↓"),
-            sep(" scroll    "),
+            sep(t(" scroll    ", " 滚动    ")),
             key("End"),
-            sep(" follow    "),
+            sep(t(" follow    ", " 跟随    ")),
             key("c"),
-            sep(" clear    "),
+            sep(t(" clear    ", " 清空    ")),
             key("Tab"),
-            sep(" switch    "),
+            sep(t(" switch    ", " 切换    ")),
             key("1-4"),
-            sep(" jump    "),
+            sep(t(" jump    ", " 直达    ")),
             key("q"),
-            sep(if app.is_packing() { " (running…)" } else { " quit" }),
+            sep(quit),
         ])
     } else {
-        let run = if app.tab == TAB_UNPACK { " unpack    " } else { " pack    " };
+        let run = if app.tab == TAB_UNPACK {
+            t(" unpack    ", " 解包    ")
+        } else {
+            t(" pack    ", " 打包    ")
+        };
         Line::from(vec![
             key("↑↓"),
-            sep(" move    "),
+            sep(t(" move    ", " 移动    ")),
             key("Space"),
-            sep(" select    "),
+            sep(t(" select    ", " 选择    ")),
             key("a"),
-            sep(" all    "),
+            sep(t(" all    ", " 全选    ")),
             key("Enter"),
             sep(run),
             key("Tab"),
-            sep(" switch    "),
+            sep(t(" switch    ", " 切换    ")),
             key("?"),
-            sep(" help    "),
+            sep(t(" help    ", " 帮助    ")),
             key("q"),
-            sep(" quit"),
+            sep(quit),
         ])
     };
     let p = Paragraph::new(hint)
@@ -1286,6 +1523,10 @@ mod tests {
             origin: Origin::Deployed,
         }];
         let mut app = App::new(packs, unpacks, BaseSource::Bundled, PathBuf::from("/x"));
+        // Pin the language: `App::new` detects it from the OS, so without this
+        // the assertions below would pass or fail depending on whose Windows
+        // ran them. The Chinese frames get their own test.
+        app.lang = Lang::En;
         app.pack.toggle_current(); // pick Alpha (row under cursor)
 
         // Layout work is visual: `TL2_TUI_DUMP=1 cargo test --bin
@@ -1366,13 +1607,104 @@ mod tests {
         assert!(help.contains("BASE BUNDLE"), "help covers the base bundle");
     }
 
+    /// The Chinese UI has to be rendered by a test or it rots: a translation
+    /// that never runs is a translation nobody notices is broken. This also
+    /// pins the two rules the localisation follows — command names and flags
+    /// stay verbatim, and every English help line has a Chinese counterpart
+    /// (no silently blank rows where a translation was skipped).
+    #[test]
+    fn chinese_ui_renders_and_keeps_commands_verbatim() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let packs = vec![ModEntry {
+            title: "组件10".into(),
+            file_name: "C10".into(),
+            dir: PathBuf::from("/x/C10"),
+            has_layouts: true,
+            action: Action::Pack,
+            origin: Origin::Local,
+        }];
+        let unpacks = vec![ModEntry {
+            title: "已部署包".into(),
+            file_name: "DEP".into(),
+            dir: PathBuf::from("/x/DEP.MOD"),
+            has_layouts: false,
+            action: Action::Unpack,
+            origin: Origin::Deployed,
+        }];
+        let mut app = App::new(packs, unpacks, BaseSource::Bundled, PathBuf::from("/x"));
+        app.lang = Lang::Zh;
+
+        let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let zh = buffer_text(terminal.backend().buffer());
+        for want in ["打包", "解包", "输出", "帮助", "已选", "(关卡 mod)", "移动", "全选"] {
+            assert!(zh.contains(want), "Chinese UI missing {want:?}");
+        }
+        assert!(!zh.contains("PACK") && !zh.contains("selected"), "no English left over");
+
+        app.tab = TAB_UNPACK;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(
+            buffer_text(terminal.backend().buffer()).contains("游戏 mods"),
+            "origin tag translated"
+        );
+
+        // Help: every line has content in BOTH languages, and the command
+        // column is identical in both (you type those, they are not prose).
+        app.lang = Lang::En;
+        let en_lines = help_lines(&app);
+        app.lang = Lang::Zh;
+        let zh_lines = help_lines(&app);
+        assert_eq!(en_lines.len(), zh_lines.len(), "help line counts must match");
+        let flat = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        for (i, (e, z)) in en_lines.iter().zip(&zh_lines).enumerate() {
+            let (e, z) = (flat(e), flat(z));
+            assert_eq!(
+                e.trim().is_empty(),
+                z.trim().is_empty(),
+                "help line {i} is blank in only one language: {e:?} / {z:?}"
+            );
+        }
+        let zh_help = zh_lines.iter().map(flat).collect::<Vec<_>>().join("\n");
+        for c in ["unpack <in.MOD|DATA.PAK> <out_dir>", "compile-dat", "decompile-layout",
+                  "--mpp re|dll|none", "--no-times", "TL2_LANG=en|zh"] {
+            assert!(zh_help.contains(c), "command/flag {c:?} must stay verbatim in Chinese");
+        }
+    }
+
+    /// Language detection: the explicit override wins over everything, and an
+    /// unrecognised value falls through to the OS/default rather than erroring.
+    #[test]
+    fn lang_override_is_honoured() {
+        // Serialised via a lock: env is process-global and these tests can run
+        // alongside others that read it.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("TL2_LANG");
+        for (v, want) in [("zh", Lang::Zh), ("zh-CN", Lang::Zh), ("cn", Lang::Zh),
+                          ("en", Lang::En), ("en-US", Lang::En)] {
+            std::env::set_var("TL2_LANG", v);
+            assert_eq!(detect_lang(), want, "TL2_LANG={v}");
+        }
+        // Garbage does not force a language; detection continues.
+        std::env::set_var("TL2_LANG", "klingon");
+        let _ = detect_lang();
+        match prev {
+            Some(v) => std::env::set_var("TL2_LANG", v),
+            None => std::env::remove_var("TL2_LANG"),
+        }
+    }
+
     /// The help text is the tool's own documentation, so assert it actually
     /// answers each question asked of it — and that the paths it quotes are the
     /// ones the code really uses, not prose that can drift.
     #[test]
     fn help_answers_every_question_with_real_paths() {
         let root = PathBuf::from("/x");
-        let app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, root.clone());
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, root.clone());
+        app.lang = Lang::En;
         let text = help_lines(&app)
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
@@ -1414,13 +1746,13 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        app.lang = Lang::En;
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("No mod sources found"), "pack empty state");
 
-        let mut app = app;
         app.tab = TAB_UNPACK;
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
@@ -1444,7 +1776,8 @@ mod tests {
             action: Action::Pack,
             origin: Origin::Local,
         }];
-        let app = App::new(packs, Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(packs, Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        app.lang = Lang::En;
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -1469,11 +1802,26 @@ mod tests {
         assert!(fgs.contains(&theme::TEXT), "primary parchment text");
     }
 
+    /// Read the rendered buffer back as text.
+    ///
+    /// A double-width glyph (every CJK character in the Chinese UI) occupies
+    /// TWO cells and ratatui leaves the second one blank, so walking cells
+    /// naively yields "打 包" — and no assertion on Chinese text can ever
+    /// match. Skip the continuation cell after a wide glyph.
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        // Everything this UI draws above U+2E80 is CJK or full-width
+        // punctuation (double-width); its box-drawing and arrows sit below.
+        let wide = |sym: &str| {
+            let mut it = sym.chars();
+            matches!((it.next(), it.next()), (Some(c), None) if (c as u32) >= 0x2E80)
+        };
         let mut s = String::new();
         for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                s.push_str(buf[(x, y)].symbol());
+            let mut x = 0;
+            while x < buf.area.width {
+                let sym = buf[(x, y)].symbol();
+                s.push_str(sym);
+                x += if wide(sym) { 2 } else { 1 };
             }
             s.push('\n');
         }
