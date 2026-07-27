@@ -1,6 +1,6 @@
 //! tl2-mikuro-mod-packer — Torchlight 2 .MOD builder CLI (Rust port of mikuro_mod_packer).
 //!
-//! Usage: tl2-mikuro-mod-packer [--in-place|--temp-copy] [--mpp {re,dll,none}]
+//! Usage: tl2-mikuro-mod-packer [--in-place|--temp-copy] [--mpp {re,none}]
 //!                   [--raw {auto,none}] [--deploy] <mod_directory>
 //!
 //! Extra single-file tools:
@@ -19,13 +19,12 @@ mod base_bundle;
 mod tui;
 
 fn usage() -> ExitCode {
-    eprintln!("Usage: tl2-mikuro-mod-packer [--in-place|--temp-copy] [--mpp {{re,dll,none}}] [--raw {{auto,none}}] [--deploy] <mod_directory>");
+    eprintln!("Usage: tl2-mikuro-mod-packer [--in-place|--temp-copy] [--mpp {{re,none}}] [--raw {{auto,none}}] [--deploy] <mod_directory>");
     eprintln!("  (no flag)    Compile in memory — nothing but the .MOD is written (default)");
     eprintln!("  --in-place   ALSO leave the compiled .BINDAT/.BINLAYOUT in your MEDIA tree");
     eprintln!("  --temp-copy  Compile on disk in a throwaway copy; your MEDIA stays clean");
     eprintln!("  --deploy     Output straight to TL2's default mods dir as <MOD_FILE_NAME>.MOD");
     eprintln!("  --mpp re     Offline .MPP generator (DEFAULT; robust, ~99.7% cell-accurate)");
-    eprintln!("  --mpp dll    Byte-exact .MPP via the real EditorGuts.dll (needs editor env)");
     eprintln!("  --mpp none   Skip generation, keep the source's existing .MPP");
     eprintln!("  --raw auto   Emit RAW indexes on-demand per content type (DEFAULT)");
     eprintln!("  --raw none   Skip RAW generation entirely");
@@ -267,8 +266,15 @@ fn main() -> ExitCode {
             _ => positional.push(a),
         }
     }
-    if !matches!(mpp_backend.as_str(), "re" | "dll" | "none") {
-        eprintln!("Error: --mpp must be one of re|dll|none (got {mpp_backend:?})");
+    // `dll` is refused by name rather than as an unknown value: existing
+    // scripts pass it, and they asked for BYTE-EXACT grids — quietly giving
+    // them the approximate ones would be the one outcome nobody wants.
+    if mpp_backend == "dll" {
+        eprintln!("Error: {}", packer::MPP_DLL_REMOVED);
+        return ExitCode::FAILURE;
+    }
+    if !matches!(mpp_backend.as_str(), "re" | "none") {
+        eprintln!("Error: --mpp must be one of re|none (got {mpp_backend:?})");
         return ExitCode::FAILURE;
     }
     if !matches!(raw_mode.as_str(), "auto" | "none") {

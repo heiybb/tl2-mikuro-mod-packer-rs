@@ -74,8 +74,8 @@ rollingHash + mhash 自洽;唯一字节差异 = zlib 压缩流(libdeflate,Rust �
 - 三条管线同工作量参考:原生 GUTS 983s / Python(isal+numba 满优化)~64s / **Rust 46s**。
 - 原生表中的 地图拓展(242.98s)与 POE(52.72s)源副本已删除,无法复测,未计入合计。
 - MPP 口径差异:原生 = EditorRegenPathingData(字节精确);Rust = 离线 `re` 后端
-  (≈99.7% cell 精确,已知天花板)。要字节精确用 `--mpp dll`(走同一个原生 DLL,速度
-  即原生 MPP 列)。
+  (≈99.7% cell 精确,已知天花板)。要字节精确请直接跑 `TL2-Mikuro-Console.exe build
+  <MOD_FILE_NAME> --clean --twice`(速度即原生 MPP 列),再用 `--mpp none` 打包。
 
 ### MPP 全语料 A/B(`verify mpp-corpus`,2026-07-04)
 
@@ -121,7 +121,7 @@ box 会在 **1100 vs 1125** 之间抖动(±25 cell = 一个 10-unit snap-tile;�
 均不可走。按此「de-cosmetic」口径(1≡255)复测:aggregate **99.8934%**,THECROSSING
 **99.8938% ≈ 其浮点地板 0.0965%**。raw-byte 残差里约一半是树簇内部的 255↔1 void/wall
 标注差(单 tile 可走性无影响、仅 tile 缝隙处相关)+ 余为不可约浮点。**换言之:寻路网格
-的实际可走性已与原生匹配到浮点地板;字节精确唯一途径仍是 `--mpp dll`。**
+的实际可走性已与原生匹配到浮点地板;字节精确唯一途径仍是直接驱动编辑器控制台宿主。**
 
 前述 vanilla 语料残差(276839 cell)同属该信息论下限(原生 cliff/multichunk 不确定 +
 per-instance 运行时 nocollide),换语言/精度都不移动它。
@@ -131,7 +131,7 @@ per-instance 运行时 nocollide),换语言/精度都不移动它。
 ```powershell
 cargo build --release
 # 与 Python CLI 同参数:
-.\target\release\tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,dll,none}] [--raw {auto,none}] [--deploy] <mod目录>
+.\target\release\tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,none}] [--raw {auto,none}] [--deploy] <mod目录>
 # 反向:把 .MOD 解包回可编辑源目录(见下「解包」):
 .\target\release\tl2-mikuro-mod-packer.exe unpack <in.MOD|DATA.PAK> <out目录> [--raw] [--no-times] [--filter <文本>]
 # 单文件工具:
@@ -149,13 +149,18 @@ cargo build --release
 - `--deploy`:输出 `<MOD_FILE_NAME>.MOD` 到 `%Documents%\My Games\Runic Games\Torchlight 2\mods`
   (注册表 Shell Folders 解析,OneDrive 重定向安全)。
 - `--mpp re`(默认)离线寻路网格(≈99.7% cell 精确,已知天花板 — 见下「原生非确定性」);
-  `--mpp dll` 走 `TL2-Mikuro-Console.exe` 驱动真实 EditorGuts.dll(字节精确,需可用的编辑器
-  环境);`--mpp none` 保留源目录已有 .mpp。
+  `--mpp none` 保留源目录已有 .mpp。
+- **`--mpp dll` 已移除**(它只是外壳驱动 `TL2-Mikuro-Console.exe`,而 `CreateMod` 只认
+  `<install>\mods\<name>` 下的工程 → 必须把整个 mod 复制过去、覆盖同名目录,默认内存
+  模式下还要先复制一份到临时目录)。要字节精确就自己跑那一条命令:
+  `cd "<TL2 安装目录>" && TL2-Mikuro-Console.exe build <MOD_FILE_NAME> --clean --twice`,
+  然后 `--mpp none` 打包即可保留它写出的 .mpp。传 `--mpp dll` 会报错并打印这段说明
+  (**不会**静默退回近似后端 —— 要的是字节精确,拿到近似的却不知道,是最坏结果)。
 - `compile-mpp --fallback <base MEDIA>`:单瓦片编译时启用 **mod-over-base VFS overlay**
   (先查 `--media` 的 mod,再查 `--fallback` 的基础安装),用于把单个 mod 瓦片按整包
   构建的口径解析基础游戏 link/mesh 目标。整包构建(主命令)已自动带此 overlay。
 - 环境变量:`TL2_MEDIA_DIR`(基础游戏 MEDIA,默认 `E:\Torchlight 2\MEDIA`)、
-  `TL2_INSTALL_DIR`(dll 后端)、`TL2_MOD_GAMEVER`(覆写 header gamever)。
+  `TL2_MOD_GAMEVER`(覆写 header gamever)。
 
 无参数启动(双击/拖进目录)会进 ratatui 交互界面:同一张列表里,带 `MOD.DAT` 的子目录
 标为 **pack**,同级/`mods/` 下的 `.MOD` 文件标为 **unpack**(解到 `<root>/unpacked/<名字>/`)。
@@ -224,7 +229,7 @@ Group 对象;默认值(RANDOMIZATION 1、NUMBER 1、无 TAG)只在非默认时�
 | `src/binlayout_decompile.rs` | — | BINLAYOUT → LAYOUT 反编译(schema 反查;不动点 8986/8986) |
 | `src/bindat_decompile.rs` | — | BINDAT → DAT 反编译(内嵌词表 + `UNK_<HEX8>` 转义) |
 | `src/pak.rs` / `src/unpack.rs` | — | 容器读取(header/manifest/块)与 `.MOD`→源目录解包 |
-| `src/mpp/*` | `mpp/*` | region 头部 f32 舍入逐操作对齐;native 分类器 = `build_grid_fast` 等价(桶剔除,逐行 rayon 并行);`dll.rs` = console host 驱动 |
+| `src/mpp/*` | `mpp/*` | region 头部 f32 舍入逐操作对齐;native 分类器 = `build_grid_fast` 等价(桶剔除,逐行 rayon 并行);无 `dll.rs` —— 字节精确走编辑器控制台宿主 |
 
 刻意保留的 bug-for-bug 行为:ogre_mesh 顶点声明只读第一个 element(Python 的 +14
 步进 bug,POSITION 恒为 element 0);binlayout 的 `NAME`/`CHOICE`/`GAME MODE` 首次出现

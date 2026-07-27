@@ -1495,7 +1495,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         cmd("   --in-place", tr("mode_in_place")),
         cmd("   --temp-copy", tr("mode_temp_copy")),
         cmd(
-            "   --mpp re|dll|none",
+            "   --mpp re|none",
             tr("walk_grid_backend_default_re"),
         ),
         cmd(
@@ -1958,7 +1958,7 @@ mod tests {
             }
             let joined = other.join("\n");
             for c in ["unpack <in.MOD|DATA.PAK> <out_dir>", "compile-dat", "decompile-layout",
-                      "--mpp re|dll|none", "--no-times", "TL2_LANG=en|zh|ru"] {
+                      "--mpp re|none", "--no-times", "TL2_LANG=en|zh|ru"] {
                 assert!(joined.contains(c), "{lang:?}: {c:?} must stay verbatim");
             }
         }

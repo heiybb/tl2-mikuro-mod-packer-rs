@@ -43,6 +43,20 @@ impl Drop for Phase {
     }
 }
 
+/// What to tell someone who asks for the removed byte-exact MPP backend.
+///
+/// Every caller of `--mpp dll` gets this exact text — it is the whole
+/// replacement for the code that used to be here, so it has to be actionable:
+/// the command, and the one constraint that made the wrapper messy in the first
+/// place (the editor only builds projects under its own mods folder).
+pub const MPP_DLL_REMOVED: &str = "the byte-exact `dll` MPP backend was removed. It shelled out to TL2's own \
+     console host, which only builds projects under <install>\\mods\\<name> — so it had to copy your \
+     whole mod there (destroying anything already using that name) and, in the default in-memory mode, \
+     into a temp dir first. Drive the console host yourself instead:\n  \
+     cd \"<TL2 install>\" && TL2-Mikuro-Console.exe build <MOD_FILE_NAME> --clean --twice\n  \
+     (needs the editor environment: a working D3D9 device, and the mod living in <install>\\mods\\)\n  \
+     Then pack with --mpp none to keep the .mpp files it wrote.";
+
 pub const TYPE_DIR: u8 = 7;
 pub const TYPE_UNKNOWN: u8 = 18;
 
@@ -1197,20 +1211,10 @@ pub fn convert_all(
         eprintln!("  Generating MPP files (backend={mpp_backend})...");
         match generate_mpp_files(media_dir, overrides.as_deref_mut(), mpp_backend, None) {
             Ok(n) => results.mpp = n,
-            Err(e) => {
-                if mpp_backend == "dll" {
-                    eprintln!(
-                        "  WARNING: byte-exact DLL MPP backend unavailable ({e});\n           \
-                         falling back to APPROXIMATE offline MPP."
-                    );
-                    match generate_mpp_files(media_dir, overrides.as_deref_mut(), "re", None) {
-                        Ok(n) => results.mpp = n,
-                        Err(e2) => results.errors.push(format!("MPP: {e2}")),
-                    }
-                } else {
-                    results.errors.push(format!("MPP: {e}"));
-                }
-            }
+            // No silent downgrade to the approximate backend: asking for grids
+            // and getting different ones without noticing is worse than a
+            // failed build you can see.
+            Err(e) => results.errors.push(format!("MPP: {e}")),
         }
     }
 
@@ -1283,7 +1287,14 @@ pub fn generate_raw_files(media_dir: &Path, mut overrides: Option<&mut Overrides
     count
 }
 
-/// Generate .MPP pathing grids (backend "re" offline / "dll" byte-exact).
+/// Generate .MPP pathing grids with the offline backend ("re"), or none.
+///
+/// There is no `dll` backend here any more. It shelled out to TL2's own console
+/// host, which only builds projects under `<install>\mods\<name>` — so it copied
+/// the whole mod there (deleting whatever already had that name), and in the
+/// default in-memory mode copied it to a temp dir first, two full copies before
+/// the build even started. Anyone who needs byte-exact grids should drive the
+/// console host directly; the pointer is in `MPP_DLL_REMOVED`.
 pub fn generate_mpp_files(
     media_dir: &Path,
     mut overrides: Option<&mut Overrides>,
@@ -1292,7 +1303,7 @@ pub fn generate_mpp_files(
 ) -> Result<usize, String> {
     match backend {
         "none" | "skip" => return Ok(0),
-        "dll" => return crate::mpp::dll::generate_mpp_files_dll(media_dir, overrides, install_dir),
+        "dll" => return Err(MPP_DLL_REMOVED.to_string()),
         "re" => {}
         other => return Err(format!("unknown mpp backend: {other:?}")),
     }
@@ -1424,6 +1435,23 @@ pub fn tl2_mods_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The removed byte-exact backend must FAIL, loudly and with directions —
+    /// never quietly hand back approximate grids. Someone passing `--mpp dll`
+    /// asked for byte-exact output; silently substituting the offline backend
+    /// would be the one outcome they cannot detect.
+    #[test]
+    fn the_dll_backend_is_gone_and_says_where_to_go() {
+        let err = generate_mpp_files(Path::new("/nonexistent/MEDIA"), None, "dll", None)
+            .expect_err("`dll` must not silently succeed");
+        assert!(err.contains("TL2-Mikuro-Console.exe"), "names the tool to run: {err}");
+        assert!(err.contains("--mpp none"), "and how to pack afterwards: {err}");
+        // `none` and `re` are what is left; an unknown value still says so.
+        assert_eq!(generate_mpp_files(Path::new("/x"), None, "none", None), Ok(0));
+        assert!(generate_mpp_files(Path::new("/x"), None, "nope", None)
+            .unwrap_err()
+            .contains("unknown mpp backend"));
+    }
 
     #[test]
     fn murmur64b_matches_reference() {

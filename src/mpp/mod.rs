@@ -1,10 +1,16 @@
 //! .MPP pathing-grid generation (port of the mikuro_mod_packer.mpp package):
 //! a clean reimplementation of TL2's pathing bake, grounded in the RE of
-//! EditorGuts.dll. Offline backend ≈99.7% cell-accurate (a known, accepted
-//! ceiling); the `dll` backend drives the real editor for byte-exact output.
+//! EditorGuts.dll. ≈99.7% cell-accurate — a known, accepted ceiling; the
+//! remainder is cliff/overhang float tie-breaks and nocollide cave walls, which
+//! are not reproducible offline.
+//!
+//! This is the ONLY backend. There used to be a `dll` one that shelled out to
+//! `TL2-Mikuro-Console.exe` for byte-exact grids; it is gone (see
+//! `packer::MPP_DLL_REMOVED` for how to run the console host directly), because
+//! wrapping it meant staging the whole mod into the editor's own mods folder —
+//! over anything already there.
 
 pub mod dat;
-pub mod dll;
 pub mod geom;
 pub mod layout;
 pub mod native;
