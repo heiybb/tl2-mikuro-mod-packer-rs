@@ -72,17 +72,39 @@ fn tag_by_id() -> &'static HashMap<u32, &'static str> {
     })
 }
 
-/// The seven `u32int` keys the shipped corpus writes as `<UNSIGNED INT>` rather
-/// than `<INTEGER>`. The tag is decoration — the compiler reads only key+value —
-/// but matching the editor keeps a decompiled file diffable against its source.
-const UNSIGNED_INT_KEYS: [&str; 7] = [
+/// The `u32int` keys written as `<UNSIGNED INT>` rather than `<INTEGER>`.
+///
+/// The DLL's descriptor schema knows each property's real UI type, but the
+/// embedded dump (`binlayout_schema.json`) collapses both onto `enc: u32int`, so
+/// the spelling is recovered from usage instead: every `u32int` key in the
+/// shipped `.LAYOUT` corpus whose INTEGER/UNSIGNED-INT usage is dominantly
+/// unsigned, plus three keys that never appear in shipped text but that GUTS'
+/// own unpacker writes unsigned (`SECONDARY INDEX`, `INDEX_`,
+/// `SECONDARY INDEX_`). Anything unlisted defaults to `<INTEGER>`.
+///
+/// Purely cosmetic for correctness — `bindat`/`binlayout` read key+value and
+/// ignore the tag — but it is what makes a decompiled file diff cleanly against
+/// its original source and against GUTS' output.
+const UNSIGNED_INT_KEYS: [&str; 19] = [
     "BRIGHTNESS",
+    "COUNT",
+    "CURRENT STATE",
+    "FAME",
+    "GOLD",
+    "INDEX",
+    "INDEX_",
     "MAX ALLOWED",
+    "MAX LENGTH",
     "NUM RICOCHETS",
     "NUMBER OF POINTS",
     "NUMBER REQUIRED",
+    "RENDER ORDER",
+    "SECONDARY INDEX",
+    "SECONDARY INDEX_",
     "SEGMENTS",
+    "SELECTED INDEX",
     "VISUAL QUOTA",
+    "XP",
 ];
 
 fn type_tag(key: &str, enc: &str) -> &'static str {
@@ -105,8 +127,27 @@ fn type_tag(key: &str, enc: &str) -> &'static str {
 /// Shortest decimal that parses back to the same f32 (Rust's Display already
 /// guarantees round-trip; going through f64 on the way back in is safe because
 /// f64 has more than 2p+2 bits for f32's p=24, so the double rounding is exact).
+///
+/// Display alone never uses an exponent, so a denormal comes out as forty-odd
+/// characters of zeros. Fall back to the exponent form only when the plain one
+/// is genuinely unreadable — `0.002` must NOT become `2e-3` just because that is
+/// one character shorter; the sources write small values plainly.
+///
+/// (GUTS prints these through MSVC `%g` — `9.80909e-045` — which keeps only 6
+/// significant digits and is therefore lossy. Round-tripping wins over matching
+/// its digits.)
 fn fmt_f32(x: f32) -> String {
-    x.to_string()
+    const PLAIN_MAX: usize = 12;
+    let plain = x.to_string();
+    if plain.len() <= PLAIN_MAX {
+        return plain;
+    }
+    let sci = format!("{x:e}");
+    if sci.len() < plain.len() {
+        sci
+    } else {
+        plain
+    }
 }
 
 // ── byte reader ────────────────────────────────────────────────────────────
@@ -632,8 +673,35 @@ fn emit_object(out: &mut String, depth: usize, o: &Obj, parent_id: i64) {
 
 // ── entry points ───────────────────────────────────────────────────────────
 
+/// The document-type name a `.LAYOUT` opens with, chosen from where the file
+/// lives. It is NOT in the binary (the whole shipped corpus has the same magic
+/// and flag bytes) — the editor decides it by which asset folder is being
+/// edited, and this rule reproduces all 8985 shipped sources exactly:
+/// `MEDIA/PARTICLES/**` → `[Particle Creator]` (3501/3501), `MEDIA/UI/**` →
+/// `[UI]` (171/171), everything else → `[Layout]` (5294/5294).
+///
+/// Cosmetic for the compiler, which scans for `[OBJECTS]` and ignores the root
+/// tag — but it is what the editor shows and what GUTS' unpacker writes.
+pub fn document_type_for(media_rel_path: &str) -> &'static str {
+    let p = media_rel_path.replace('\\', "/").to_uppercase();
+    let p = p.strip_prefix("MEDIA/").unwrap_or(&p);
+    if p.starts_with("PARTICLES/") {
+        "Particle Creator"
+    } else if p.starts_with("UI/") {
+        "UI"
+    } else {
+        "Layout"
+    }
+}
+
 /// Decompile BINLAYOUT bytes into the `.LAYOUT` text they were compiled from.
 pub fn decompile_binlayout(data: &[u8]) -> Result<String, String> {
+    decompile_binlayout_as(data, "Layout")
+}
+
+/// `decompile_binlayout`, with the document-type root tag chosen by the caller
+/// (see `document_type_for`).
+pub fn decompile_binlayout_as(data: &[u8], doc_type: &str) -> Result<String, String> {
     if data.len() < 8 {
         return Err("binlayout: too short".into());
     }
@@ -658,7 +726,7 @@ pub fn decompile_binlayout(data: &[u8]) -> Result<String, String> {
 
     let mut out = String::new();
     out.push('\u{FEFF}');
-    line(&mut out, 0, "[Layout]");
+    line(&mut out, 0, &format!("[{doc_type}]"));
     prop_line(&mut out, 1, "INTEGER", "VERSION", "4");
     prop_line(&mut out, 1, "UNSIGNED INT", "COUNT", &count_objects(&objs).to_string());
     line(&mut out, 1, "[OBJECTS]");
@@ -666,7 +734,7 @@ pub fn decompile_binlayout(data: &[u8]) -> Result<String, String> {
         emit_object(&mut out, 2, o, -1);
     }
     line(&mut out, 1, "[/OBJECTS]");
-    line(&mut out, 0, "[/Layout]");
+    line(&mut out, 0, &format!("[/{doc_type}]"));
     Ok(out)
 }
 

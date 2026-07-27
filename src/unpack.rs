@@ -250,7 +250,10 @@ fn convert(path: &str, payload: Vec<u8>, opt: &Options, report: &mut Report) -> 
                 payload.get(1).copied().unwrap_or(0)
             ));
         }
-        match binlayout_decompile::decompile_binlayout(&payload) {
+        // The document-type root tag comes from where the file lives, not from
+        // the binary — see `document_type_for`.
+        let doc = binlayout_decompile::document_type_for(&up);
+        match binlayout_decompile::decompile_binlayout_as(&payload, doc) {
             Ok(text) => {
                 return Converted {
                     bytes: binlayout_decompile::to_layout_bytes(&text),
@@ -373,17 +376,23 @@ fn utf16_field(out: &mut String, tag: &str, key: &str, value: &str) {
 /// whole file, so the top-level scalars must precede the REQUIRED_MODS block
 /// (whose sub-blocks carry their own NAME / VERSION).
 pub fn mod_dat_text(h: &Header, mod_file_name: &str) -> String {
+    // Field ORDER follows GUTS' own unpacker (NAME, MOD_ID, AUTHOR, DESCRIPTION,
+    // WEBSITE, DOWNLOAD_URL, MOD_FILE_NAME, VERSION) so the two are diffable;
+    // `parse_mod_dat` keys off names, so the order is free.
     let mut s = String::from("\u{FEFF}[MOD]\r\n");
     utf16_field(&mut s, "STRING", "NAME", &h.title);
+    utf16_field(&mut s, "INTEGER64", "MOD_ID", &(h.modid as i64).to_string());
     utf16_field(&mut s, "STRING", "AUTHOR", &h.author);
     utf16_field(&mut s, "STRING", "DESCRIPTION", &h.descr);
-    utf16_field(&mut s, "INTEGER64", "MOD_ID", &(h.modid as i64).to_string());
     utf16_field(&mut s, "STRING", "WEBSITE", &h.website);
-    if !h.download.is_empty() {
-        utf16_field(&mut s, "STRING", "DOWNLOAD_URL", &h.download);
-    }
+    utf16_field(&mut s, "STRING", "DOWNLOAD_URL", &h.download);
+    // MOD_FILE_NAME is not in the container header. GUTS writes it EMPTY, which
+    // silently renames the mod on the next build (the packer then falls back to
+    // the folder name); the `.MOD` file name is the one place it survives, so
+    // recover it from there instead.
     utf16_field(&mut s, "STRING", "MOD_FILE_NAME", mod_file_name);
-    // The header stores version+1 (`build_header`), so undo that here.
+    // The header stores version+1 (`build_header`), so undo that here. GUTS does
+    // NOT undo it — its unpack→repack drifts the version up by one every cycle.
     utf16_field(&mut s, "INTEGER", "VERSION", &(h.modver as i64 - 1).to_string());
     if !h.reqs.is_empty() {
         s.push_str("\t[REQUIRED_MODS]\r\n");
