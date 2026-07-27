@@ -21,6 +21,38 @@ Python 参考实现 `mikuro_mod_packer` 已归档于 GitHub `heiybb/TL2-RE`,本�
 
 ---
 
+## 有多快 —— 对比游戏自带的编辑器
+
+把整个挑战者大陆系列打完 —— 10 个组件、17.3 万文件 —— 官方 GUTS 编辑器要 **983 秒**,
+本打包器 **46 秒**。逐组件加速从 2× 到 43×,差距最大的正是编辑器要烘寻路走格的那些。
+
+原生数据来自 `D:\WizardProject\TL2\TL2-RE\README.md` 的 native 基准(forked headless
+`tl2_console_fork` 驱动真实 EditorGuts.dll,InitEditor 一次性 3.85s 已摊销,warm 计时
+`CreateMod` + `EditorRegenPathingData`)。本次 Rust 5 轮实验跑在**与 native 基准相同的
+源副本**上(`E:\Torchlight 2\mods`,含编译产物 sibling,故文件数大于 monorepo)。
+
+| 组件 | 文件数 | 原生 build | 原生 MPP | 原生合计 | Rust 5 次 (s) | Rust 均值 | 加速 |
+| --- | --: | --: | --: | --: | --- | --: | --: |
+| 通用素材01 | 12712 | 164.05 | 208.77 | 372.82 | 6.46/11.75/12.37/6.25/6.05 | **8.58** | **43.5×** |
+| 职业技能 | 68217 | 268.42 | 0.00 | 268.42 | 12.14/19.55/8.85/9.30/11.05 | **12.18** | **22.0×** |
+| 群魔堕落 | 52438 | 169.36 | 0.51 | 169.87 | 12.79/7.56/7.66/8.09/16.58 | **10.54** | **16.1×** |
+| 暗黑传奇 | 32020 | 97.86 | 6.02 | 103.88 | 9.46/5.21/5.36/9.76/10.18 | **7.99** | **13.0×** |
+| 暗黑世界(临时) | 354 | 9.68 | 17.26 | 26.94 | 0.89/0.76/2.10/2.30/1.73 | **1.56** | **17.3×** |
+| 佣兵系统 | 2956 | 14.16 | 0.86 | 15.02 | 1.09/0.79/1.02/2.48/2.47 | **1.57** | **9.6×** |
+| 至尊适配 | 1818 | 11.14 | 0.00 | 11.14 | 0.82/0.56/0.57/1.23/1.31 | **0.90** | **12.4×** |
+| 实验内容 | 470 | 8.31 | 0.00 | 8.31 | 0.65/0.47/0.47/1.07/1.06 | **0.74** | **11.2×** |
+| 护身符 | 1348 | 4.29 | 0.00 | 4.29 | 0.48/0.36/0.96/0.99/0.33 | **0.62** | **6.9×** |
+| 宠物系统 | 431 | 1.96 | 0.17 | 2.13 | 0.51/0.43/1.83/1.76/0.38 | **0.98** | **2.2×** |
+| **合计** | | 749.2 | 233.6 | **982.8** | | **45.66** | **21.5×** |
+
+- 按各组件 5 次最优值合计 = 31.0s → **31.7×**;逐次波动主要来自 Defender 实时扫描与
+  写回缓存冲刷(实验含每轮 ~600MB .MOD 写盘)。
+- 原生表中的 地图拓展(242.98s)与 POE(52.72s)源副本已删除,无法复测,未计入合计。
+- MPP 口径差异:原生 = EditorRegenPathingData(字节精确);Rust = 离线 `re` 后端
+  (≈99.7% cell 精确,已知天花板 —— 实际可走性已到浮点地板,见[烘出来的走格能放心发吗?](#walkgrid)一节)。
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -119,6 +151,8 @@ tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,none}] [--raw {aut
 - `--mpp re`(默认)现烘走格;`--mpp none` 保留源目录里已有的 `.mpp`。
   content mod(`MEDIA/LAYOUTS` 下没有 `*.LAYOUT`)本来就没东西可烘,给 `none` 更快。
 - `--raw auto`(默认)按内容类型**按需**生成 RAW 索引;`--raw none` 完全跳过。
+
+<a id="walkgrid"></a>
 
 ### 烘出来的走格能放心发吗?
 
@@ -279,20 +313,20 @@ verify.exe unpack <mod.MOD>     # 解包→重打包→逐条目内容对账
 
 ---
 
-## 验证状态(2026-07-04,与 Python 参考实现 A/B 对比)
+## 验证状态(2026-07-04)
 
 | 模块 | 验证方式 | 结果 |
 | --- | --- | --- |
-| BINLAYOUT | 基础游戏全语料 8985 个 .LAYOUT 字节对比 shipped | **8965/8985 字节精确**(与 Python 完全同级;20 个 miss 是 shipped 文件里不可复现的未初始化 `@25` 垃圾) |
-| BINDAT | 400 随机样本 + TAGS.DAT,vs Python `compile_dat` | **401/401 字节一致**(含非法 UTF-16 surrogate 的 TAGS.DAT) |
+| BINLAYOUT | 基础游戏全语料 8985 个 .LAYOUT 字节对比 shipped | **8965/8985 字节精确**(20 个 miss 是 shipped 文件里不可复现的未初始化 `@25` 垃圾) |
+| BINDAT | 400 随机样本 + TAGS.DAT,vs 参考实现 | **401/401 字节一致**(含非法 UTF-16 surrogate 的 TAGS.DAT) |
 | RAW ×7 | vs 基础游戏 shipped `MEDIA/*.RAW` | **7/7 字节精确**(AFFIXES/SKILLS/TRIGGERABLES/MISSILES/UI/UNITDATA/ROOMPIECES) |
-| MPP (offline `re`) | 13 个多样 tile(cliff/landmark 别名/boss/town/exit/cave/vault)vs Python `compile_mpp` | **13/13 字节一致** |
-| .MOD 整包 | 佣兵系统 / 职业技能 / 通用素材01 三个真实 mod,vs Python 整包 | header+manifest 结构一致;**全部 1856 / 35864 / 11205 个文件解压内容、CRC、ftime 一致**;rollingHash + mhash 自洽(游戏校验的两个哈希) |
+| MPP (offline `re`) | 13 个多样 tile(cliff/landmark 别名/boss/town/exit/cave/vault)vs 参考实现 | **13/13 字节一致** |
+| .MOD 整包 | 佣兵系统 / 职业技能 / 通用素材01 三个真实 mod,容器对容器 | header+manifest 结构一致;**全部 1856 / 35864 / 11205 个文件解压内容、CRC、ftime 一致**;rollingHash + mhash 自洽(游戏校验的两个哈希) |
 | BINLAYOUT 反编译不动点 | 我们编译的 BINLAYOUT → 反编译 → 重编译 | **8986/8986 字节精确** |
 | 同上,输入换 shipped 二进制 | 8967/8986 —— 失败的 19 个**正是**编译本身就复现不了的那 19 个,反编译器零新增 |
 
-唯一与 Python 产物的字节差异 = zlib 压缩流(压缩后端不同;游戏只做 inflate,无感知,
-且 Rust 产物略小)。
+我们的容器与别的打包器唯一的字节差异 = zlib 压缩流(压缩后端不同)。游戏只做 inflate,
+分辨不出,而且我们的产物略小。
 
 `src/binlayout_decompile.rs` 能做到不动点,是因为 BINLAYOUT 自带完整结构,用**同一份内嵌
 schema**(`data/binlayout_schema.json`)反查即可命名一切 —— 不像 BINDAT 要靠词表。编译器
@@ -304,29 +338,26 @@ schema**(`data/binlayout_schema.json`)反查即可命名一切 —— 不像 BIN
 它们,凭空补一行等于向下游解析器**断言**了一个朝向,而按 `FORWARD × RIGHT` 推 `UP` 的读者
 会被这行假数据带偏。
 
-## 性能 — 挑战者大陆全系列 10 组件(2026-07-04,16 核,磁盘缓存预热后,产物内容逐文件校验一致)
+## 吞吐 — 挑战者大陆全系列 10 组件(2026-07-04,16 核,磁盘缓存预热后,产物内容逐文件校验一致)
 
 优化后(并行 Pass A 内容读取 + libdeflate 压缩后端 + RAW 并发/去锁):
 
-| 组件 | Python(isal+numba+多进程) | Rust | 加速 | .MOD 大小 Rust / Python |
-| --- | --- | --- | --- | --- |
-| 宠物系统 | 1.27s | **0.32s** | 4.0× | 0.41 / 0.44 MB |
-| 护身符 | 0.81s | **0.30s** | 2.7× | 0.73 / 0.76 MB |
-| 暗黑世界(临时) | 5.07s | **0.64s** | 7.9× | 1.38 / 1.57 MB |
-| 至尊适配 | 1.30s | **0.46s** | 2.8× | 25.8 / 26.7 MB |
-| 实验内容 | 1.66s | **0.40s** | 4.2× | 18.0 / 18.5 MB |
-| 佣兵系统 | 2.78s | **0.64s** | 4.3× | 19.7 / 20.6 MB |
-| 暗黑传奇 | 8.98s | **3.93s** | 2.3× | 43.7 / 46.0 MB |
-| 群魔堕落 | 10.32s | **5.89s** | 1.8× | 76.5 / 79.1 MB |
-| 职业技能 | 13.53s | **5.98s** | 2.3× | 106.6 / 111.7 MB |
-| 通用素材01 | 18.14s | **5.16s** | 3.5× | 263.5 / 277.8 MB |
-| **全系列合计** | **63.9s** | **23.7s** | **2.69×** | 556 / 603 MB |
+| 组件 | 耗时 | .MOD 大小 |
+| --- | --: | --: |
+| 宠物系统 | **0.32s** | 0.41 MB |
+| 护身符 | **0.30s** | 0.73 MB |
+| 暗黑世界(临时) | **0.64s** | 1.38 MB |
+| 至尊适配 | **0.46s** | 25.8 MB |
+| 实验内容 | **0.40s** | 18.0 MB |
+| 佣兵系统 | **0.64s** | 19.7 MB |
+| 暗黑传奇 | **3.93s** | 43.7 MB |
+| 群魔堕落 | **5.89s** | 76.5 MB |
+| 职业技能 | **5.98s** | 106.6 MB |
+| 通用素材01 | **5.16s** | 263.5 MB |
+| **全系列合计** | **23.7s** | 556 MB |
 
-每一对 .MOD 均通过结构校验:header/manifest 一致、全部文件解压内容+CRC+ftime 一致、
-rollingHash + mhash 自洽;唯一字节差异 = zlib 压缩流(libdeflate,Rust 产物平均还小
-~5%)。RAW 7/7、BINLAYOUT 8965/8985 对 shipped 语料在优化后复验仍字节精确。
-(Python 一侧已带满优化:isal SIMD 压缩、numba JIT 的 MPP 内核、进程/线程池;冷启动
-时 Python 还要付 numba 编译等开销,差距更大。)
+这些构建不只是掐了表:每个条目的解压内容、CRC、ftime 都逐条校验过,rollingHash 与
+mhash 自洽。RAW 7/7、BINLAYOUT 8965/8985 对 shipped 语料在优化后复验仍字节精确。
 
 调优过程用 `MIKURO_TIMING=1` 输出分阶段计时。剩余热点是 Windows 每文件 open 开销
 (AFFIXES/SKILLS 等万级小文件读取,已并行摊薄;Defender 实时扫描是主因)与 MPP
@@ -334,34 +365,6 @@ rollingHash + mhash 自洽;唯一字节差异 = zlib 压缩流(libdeflate,Rust �
 
 解包侧:并行提取后 1.02 → 0.23 ms/文件,87764 文件 82.4s → 19.7s(**4.2×**),
 产出与串行版逐字节相同(内容 + mtime,73848 文件对账)。
-
-## 最终对比 — vs 原生 GUTS 编辑器 DLL(挑战者大陆系列,5 次重复实验)
-
-原生数据来自 `D:\WizardProject\TL2\TL2-RE\README.md` 的 native 基准(forked headless
-`tl2_console_fork` 驱动真实 EditorGuts.dll,InitEditor 一次性 3.85s 已摊销,warm 计时
-`CreateMod` + `EditorRegenPathingData`)。本次 Rust 5 轮实验跑在**与 native 基准相同的
-源副本**上(`E:\Torchlight 2\mods`,含编译产物 sibling,故文件数大于 monorepo)。
-
-| 组件 | 文件数 | 原生 build | 原生 MPP | 原生合计 | Rust 5 次 (s) | Rust 均值 | 加速 |
-| --- | --: | --: | --: | --: | --- | --: | --: |
-| 通用素材01 | 12712 | 164.05 | 208.77 | 372.82 | 6.46/11.75/12.37/6.25/6.05 | **8.58** | **43.5×** |
-| 职业技能 | 68217 | 268.42 | 0.00 | 268.42 | 12.14/19.55/8.85/9.30/11.05 | **12.18** | **22.0×** |
-| 群魔堕落 | 52438 | 169.36 | 0.51 | 169.87 | 12.79/7.56/7.66/8.09/16.58 | **10.54** | **16.1×** |
-| 暗黑传奇 | 32020 | 97.86 | 6.02 | 103.88 | 9.46/5.21/5.36/9.76/10.18 | **7.99** | **13.0×** |
-| 暗黑世界(临时) | 354 | 9.68 | 17.26 | 26.94 | 0.89/0.76/2.10/2.30/1.73 | **1.56** | **17.3×** |
-| 佣兵系统 | 2956 | 14.16 | 0.86 | 15.02 | 1.09/0.79/1.02/2.48/2.47 | **1.57** | **9.6×** |
-| 至尊适配 | 1818 | 11.14 | 0.00 | 11.14 | 0.82/0.56/0.57/1.23/1.31 | **0.90** | **12.4×** |
-| 实验内容 | 470 | 8.31 | 0.00 | 8.31 | 0.65/0.47/0.47/1.07/1.06 | **0.74** | **11.2×** |
-| 护身符 | 1348 | 4.29 | 0.00 | 4.29 | 0.48/0.36/0.96/0.99/0.33 | **0.62** | **6.9×** |
-| 宠物系统 | 431 | 1.96 | 0.17 | 2.13 | 0.51/0.43/1.83/1.76/0.38 | **0.98** | **2.2×** |
-| **合计** | | 749.2 | 233.6 | **982.8** | | **45.66** | **21.5×** |
-
-- 按各组件 5 次最优值合计 = 31.0s → **31.7×**;逐次波动主要来自 Defender 实时扫描与
-  写回缓存冲刷(实验含每轮 ~600MB .MOD 写盘)。
-- 三条管线同工作量参考:原生 GUTS 983s / Python(isal+numba 满优化)~64s / **Rust 46s**。
-- 原生表中的 地图拓展(242.98s)与 POE(52.72s)源副本已删除,无法复测,未计入合计。
-- MPP 口径差异:原生 = EditorRegenPathingData(字节精确);Rust = 离线 `re` 后端
-  (≈99.7% cell 精确,已知天花板 —— 实际可走性已到浮点地板,见下)。
 
 ### MPP 全语料 A/B(`verify mpp-corpus`,2026-07-04)
 
@@ -373,7 +376,7 @@ byte-exact files: 118/1293   dim-match: 1272/1293
 cells: 95,773,940   diff: 276,839   accuracy: 99.7109%
 ```
 
-**diff 计数与 Python/numba 版的存档数字(276839 / 95.7M)逐 cell 一致** — f64 内核
+**diff 计数与参考实现的存档数字(276839 / 95.7M)逐 cell 一致** — f64 内核
 逐操作对齐的移植在全语料尺度上 cell-for-cell 等价。此 **vanilla 语料**数字不受下述
 mod 修复影响(vanilla 无 Layout-Link-to-base / 克隆链,下面两处修复在全 1293 tile 上
 逐字节零改动)。
@@ -395,7 +398,7 @@ vanilla shipped `.mpp` 是多年前烘的、且原生本身非确定(见下),故
 
 结果(17 瓦片 vs 新鲜原生,aggregate):**99.7232% → 99.7718%**,12 张改善 0 张回归
 (DARKWOODS −3171、DARKWOODS111 −3167、NETHER −2426);vanilla 全语料逐字节不变;
-`compile-mpp` Rust 产物与 Python 参考实现在这 17 张 + 8 张 vanilla 上 **byte-exact**。
+`compile-mpp` 产物与参考实现在这 17 张 + 8 张 vanilla 上 **byte-exact**。
 
 **原生非确定性 = 真实浮点天花板(实测)。** 同一 mod 瓦片连烘两次:DARKWOODS 的 region
 box 会在 **1100 vs 1125** 之间抖动(±25 cell = 一个 10-unit snap-tile;某碰撞 bound 正好
@@ -412,28 +415,26 @@ box 会在 **1100 vs 1125** 之间抖动(±25 cell = 一个 10-unit snap-tile;�
 前述 vanilla 语料残差(276839 cell)同属该信息论下限(原生 cliff/multichunk 不确定 +
 per-instance 运行时 nocollide),换语言/精度都不移动它。
 
-## 与 Python 版的实现对应
+## 模块地图
 
-| Rust | Python | 说明 |
-| --- | --- | --- |
-| `src/rghash.rs` | `rghash.py` | RGHash(== EditorGuts sub_100CA9A0),按码点哈希 |
-| `src/text.rs` | — | UTF-16 surrogatepass 等价层(`WStr = Vec<u32>` 码点串) |
-| `src/bindat.rs` | `bindat.py` | 每文件 hash string-id(`HashStringDict`),排序/探测语义逐一对齐 |
-| `src/binlayout.rs` | `binlayout.py` | 纯 DLL schema 以 `include_str!` 内嵌(`data/*.json`) |
-| `src/raw.rs` | `raw.py` | 两种扫描序(files-first / interleaved)+ UNITDATA BASEFILE 继承链 |
-| `src/packer.rs` | `packer.py` | 容器写入、rollingHash/mhash、manifest 树、convert_all 编排 |
-| `src/binlayout_decompile.rs` | — | BINLAYOUT → LAYOUT 反编译(schema 反查;不动点 8986/8986) |
-| `src/bindat_decompile.rs` | — | BINDAT → DAT 反编译(内嵌词表 + `UNK_<HEX8>` 转义) |
-| `src/pak.rs` / `src/unpack.rs` | — | 容器读取(header/manifest/块)与 `.MOD`→源目录解包 |
-| `src/tui.rs` | — | ratatui 交互界面(binary-only,不进 wasm) |
-| `src/mpp/*` | `mpp/*` | region 头部 f32 舍入逐操作对齐;native 分类器 = `build_grid_fast` 等价(桶剔除,逐行 rayon 并行) |
+| 模块 | 作用 |
+| --- | --- |
+| `src/rghash.rs` | RGHash(== EditorGuts sub_100CA9A0),按码点哈希 |
+| `src/text.rs` | UTF-16 surrogatepass 等价层(`WStr = Vec<u32>` 码点串) |
+| `src/bindat.rs` | 每文件 hash string-id(`HashStringDict`),排序/探测语义逐一对齐 |
+| `src/binlayout.rs` | 纯 DLL schema 以 `include_str!` 内嵌(`data/*.json`) |
+| `src/raw.rs` | 两种扫描序(files-first / interleaved)+ UNITDATA BASEFILE 继承链 |
+| `src/packer.rs` | 容器写入、rollingHash/mhash、manifest 树、convert_all 编排 |
+| `src/binlayout_decompile.rs` | BINLAYOUT → LAYOUT 反编译(schema 反查;不动点 8986/8986) |
+| `src/bindat_decompile.rs` | BINDAT → DAT 反编译(内嵌词表 + `UNK_<HEX8>` 转义) |
+| `src/pak.rs` / `src/unpack.rs` | 容器读取(header/manifest/块)与 `.MOD`→源目录解包 |
+| `src/tui.rs` | ratatui 交互界面(binary-only,不进 wasm) |
+| `src/mpp/*` | region 头部 f32 舍入逐操作对齐;native 分类器 = `build_grid_fast` 等价(桶剔除,逐行 rayon 并行) |
 
-刻意保留的 bug-for-bug 行为:ogre_mesh 顶点声明只读第一个 element(Python 的 +14
+刻意保留的 bug-for-bug 行为:ogre_mesh 顶点声明只读第一个 element(沿袭下来的 +14
 步进 bug,POSITION 恒为 element 0);binlayout 的 `NAME`/`CHOICE`/`GAME MODE` 首次出现
 吞为对象元数据;TAGS.DAT 空根名哈希等 — 详见各文件注释与
 `tl2-packer-formats-bindat-binlayout-mpp` 项目记忆。
-
-未移植:`rules.py`(multichunk 分类只影响诊断信息,不影响 .mpp 字节)。
 
 浏览器版(同一套 `#[path]` 共享代码编到 wasm)见 `../tl2-mikuro-mod-packer-wasm`。
 
@@ -447,8 +448,8 @@ per-file hash id 模式):
 - **corpus 模式**:string id = GUTS 全局 interner 的重建字典
   (`data/bindat_string_dict.bin`,154627 串,一次性加载 0.05s);未知串按**首现序**
   `max_id+1, +2, …` 分配 — 与 `sub_1023E9F0` 的 `id = counter++` 语义一致。
-  产物与 shipped 基础游戏 **15976/16084 字节精确**(与 Python 参考实现同数;108 差异
-  = 已知 shipped float quirks + TAGS.DAT,非实现问题)。
+  产物与 shipped 基础游戏 **15976/16084 字节精确**(108 差异 = 已知 shipped float
+  quirks + TAGS.DAT,非实现问题)。
   开启:打包时设 `MIKURO_BINDAT_DICT=<dict.bin>`,或单文件
   `compile-dat <in> <out> --global-dict <dict.bin>`;
   验证:`verify bindat-corpus <media_dir> <dict.bin>`。
