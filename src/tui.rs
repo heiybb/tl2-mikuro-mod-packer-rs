@@ -10,6 +10,7 @@
 //! Binary-only: this module is never part of the library the wasm front-end
 //! reuses via `#[path]`, so its ratatui dependency stays off the wasm target.
 
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -18,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -771,8 +772,25 @@ struct App {
     follow: bool, // Output tab auto-scroll to tail
     out_scroll: u16,
     help_scroll: u16,
+    // Last scroll maximum each scrollable pane rendered at. Only the renderer
+    // knows it (it needs the line count AND the viewport height), but the key
+    // handler is where it has to be enforced — see `scroll_by`. Cell, not a
+    // plain field, because `draw` takes `&App`.
+    out_max: Cell<u16>,
+    help_max: Cell<u16>,
     lang: Lang,
     strings: Strings,
+}
+
+/// Move a scroll offset, clamped to what is actually scrollable.
+///
+/// Clamping ONLY at render time (`offset.min(max)`) looks right and is not:
+/// the stored offset keeps climbing while the view is already pinned at the
+/// bottom, so holding Down for a second leaves it tens of lines past the end,
+/// and every one of those invisible steps has to be paid back one keypress at
+/// a time before the first visible move in the other direction.
+fn scroll_by(cur: u16, delta: i32, max: u16) -> u16 {
+    (cur as i32 + delta).clamp(0, max as i32) as u16
 }
 
 impl App {
@@ -793,6 +811,8 @@ impl App {
             follow: true,
             out_scroll: 0,
             help_scroll: 0,
+            out_max: Cell::new(0),
+            help_max: Cell::new(0),
             lang,
             strings,
         }
@@ -816,6 +836,25 @@ impl App {
     /// header shows which language is live.
     fn cycle_lang(&mut self) {
         self.set_lang(self.lang.next());
+    }
+
+    fn scroll_help(&mut self, delta: i32) {
+        self.help_scroll = scroll_by(self.help_scroll, delta, self.help_max.get());
+    }
+
+    fn scroll_out(&mut self, delta: i32) {
+        self.out_scroll = scroll_by(self.out_scroll, delta, self.out_max.get());
+    }
+
+    /// Drop out of tail-follow, keeping the view where it is. Without the
+    /// hand-off the stored offset is whatever it was before following began
+    /// (usually 0), so the first Up key would teleport to the top of the log
+    /// instead of scrolling back one line from the tail.
+    fn unfollow(&mut self) {
+        if self.follow {
+            self.follow = false;
+            self.out_scroll = self.out_max.get();
+        }
     }
 
     fn is_packing(&self) -> bool {
@@ -911,7 +950,17 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
         if k.kind != KeyEventKind::Press {
             continue;
         }
-        match k.code {
+        if let Some(code) = handle_key(app, k) {
+            return Ok(code);
+        }
+    }
+}
+
+/// One keypress. `Some(code)` means quit. Split out of the loop so the tests
+/// can drive real keys against a real rendered frame — scroll clamping depends
+/// on what the last frame published, which a hand-poked field cannot show.
+fn handle_key(app: &mut App, k: KeyEvent) -> Option<ExitCode> {
+    match k.code {
             KeyCode::Tab => app.tab = (app.tab + 1) % TAB_COUNT,
             KeyCode::BackTab => app.tab = (app.tab + TAB_COUNT - 1) % TAB_COUNT,
             // Direct tab keys: faster than cycling once there are three.
@@ -924,37 +973,38 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
             KeyCode::Char('q') | KeyCode::Esc => {
                 // Ignore quit while a run is going (the child would orphan).
                 if !app.is_packing() {
-                    return Ok(ExitCode::SUCCESS);
+                    return Some(ExitCode::SUCCESS);
                 }
             }
             _ if app.tab == TAB_OUTPUT => match k.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    app.follow = false;
-                    app.out_scroll = app.out_scroll.saturating_sub(1);
+                    app.unfollow();
+                    app.scroll_out(-1);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    app.follow = false;
-                    app.out_scroll = app.out_scroll.saturating_add(1);
+                    app.unfollow();
+                    app.scroll_out(1);
                 }
                 KeyCode::PageUp => {
-                    app.follow = false;
-                    app.out_scroll = app.out_scroll.saturating_sub(10);
+                    app.unfollow();
+                    app.scroll_out(-10);
                 }
-                KeyCode::PageDown => app.out_scroll = app.out_scroll.saturating_add(10),
+                KeyCode::PageDown => app.scroll_out(10),
+                KeyCode::Home => {
+                    app.follow = false;
+                    app.out_scroll = 0;
+                }
                 KeyCode::End | KeyCode::Char('G') => app.follow = true,
                 KeyCode::Char('c') => app.clear_log(),
                 _ => {}
             },
             _ if app.tab == TAB_HELP => match k.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.help_scroll = app.help_scroll.saturating_sub(1)
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.help_scroll = app.help_scroll.saturating_add(1)
-                }
-                KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
-                KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(10),
+                KeyCode::Up | KeyCode::Char('k') => app.scroll_help(-1),
+                KeyCode::Down | KeyCode::Char('j') => app.scroll_help(1),
+                KeyCode::PageUp => app.scroll_help(-10),
+                KeyCode::PageDown => app.scroll_help(10),
                 KeyCode::Home => app.help_scroll = 0,
+                KeyCode::End => app.help_scroll = app.help_max.get(),
                 _ => {}
             },
             _ if !app.is_packing() => match k.code {
@@ -974,8 +1024,8 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
                 _ => {}
             },
             _ => {}
-        }
     }
+    None
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -1235,6 +1285,7 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
     let total = log.len() as u16;
     let inner_h = area.height.saturating_sub(2); // minus the border
     let max_scroll = total.saturating_sub(inner_h);
+    app.out_max.set(max_scroll); // the key handler clamps against this
     let scroll = if app.follow {
         max_scroll
     } else {
@@ -1432,6 +1483,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let total = lines.len() as u16;
     let inner_h = area.height.saturating_sub(2);
     let max_scroll = total.saturating_sub(inner_h);
+    app.help_max.set(max_scroll); // the key handler clamps against this
     let scroll = app.help_scroll.min(max_scroll);
     let title = if max_scroll > 0 {
         format!(" Help · {}/{} ", scroll, max_scroll)
@@ -1988,6 +2040,69 @@ mod tests {
                   "decompile-layout", "extract-base", "unpack-base", "--deploy", "--mpp"] {
             assert!(text.contains(c), "CLI {c:?} not documented");
         }
+    }
+
+    /// Reversing direction at either end of a scrollable pane must move on the
+    /// FIRST keypress.
+    ///
+    /// The bug this guards: the offset was clamped only when drawing, so
+    /// holding Down at the bottom kept incrementing a counter the view no
+    /// longer followed. After a second of key-repeat it sat tens of lines past
+    /// the end, and Up had to burn one keypress per phantom line before
+    /// anything moved. Both panes shared the defect, so both are checked here,
+    /// through the real key handler and against a real frame — the clamp reads
+    /// the maximum the last frame published.
+    #[test]
+    fn reversing_at_either_end_moves_immediately() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let press = |app: &mut App, code: KeyCode, times: usize, terminal: &mut Terminal<TestBackend>| {
+            for _ in 0..times {
+                terminal.draw(|f| draw(f, app)).unwrap();
+                assert!(handle_key(app, KeyEvent::from(code)).is_none());
+            }
+            terminal.draw(|f| draw(f, app)).unwrap();
+        };
+
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        app.set_lang(Lang::En);
+        // Short enough that the help page overflows it by a lot.
+        let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
+
+        // HELP — the tab the bug was reported on.
+        app.tab = TAB_HELP;
+        press(&mut app, KeyCode::Down, 400, &mut terminal); // "held the key down"
+        let bottom = app.help_scroll;
+        assert_eq!(bottom, app.help_max.get(), "Down parks exactly at the end");
+        assert!(bottom > 0 && bottom < 400, "help really does overflow (got {bottom})");
+        press(&mut app, KeyCode::Up, 1, &mut terminal);
+        assert_eq!(app.help_scroll, bottom - 1, "one Up scrolls one line back");
+
+        press(&mut app, KeyCode::Up, 400, &mut terminal); // and back to the top
+        assert_eq!(app.help_scroll, 0, "Up parks exactly at the top");
+        press(&mut app, KeyCode::Down, 1, &mut terminal);
+        assert_eq!(app.help_scroll, 1, "one Down scrolls one line forward");
+
+        // OUTPUT — same defect, plus the tail-follow hand-off.
+        app.tab = TAB_OUTPUT;
+        for i in 0..200 {
+            logln(&app.log, &format!("line {i}"));
+        }
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let tail = app.out_max.get();
+        assert!(tail > 0, "the log overflows the viewport");
+        assert!(app.follow, "a fresh app follows the tail");
+        // Leaving follow keeps the position: the view was at the tail, so Up
+        // steps back from the tail — not to line 0, which is what a stale
+        // offset would have done.
+        press(&mut app, KeyCode::Up, 1, &mut terminal);
+        assert_eq!(app.out_scroll, tail - 1, "Up leaves follow at the tail, not the top");
+
+        press(&mut app, KeyCode::Down, 400, &mut terminal);
+        assert_eq!(app.out_scroll, tail, "Down parks exactly at the end");
+        press(&mut app, KeyCode::Up, 1, &mut terminal);
+        assert_eq!(app.out_scroll, tail - 1, "one Up scrolls one line back");
     }
 
     /// An empty picker must say what it looked for instead of showing a blank
