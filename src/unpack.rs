@@ -40,6 +40,9 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rayon::prelude::*;
 
 use crate::bindat_decompile;
 use crate::binlayout_decompile;
@@ -93,6 +96,20 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
+impl Report {
+    /// Fold one worker's tally into this one.
+    fn merge(&mut self, o: Report) {
+        self.files += o.files;
+        self.dats += o.dats;
+        self.layouts += o.layouts;
+        self.copied += o.copied;
+        self.bytes += o.bytes;
+        self.unknown_names.extend(o.unknown_names);
+        self.generated.extend(o.generated);
+        self.warnings.extend(o.warnings);
+    }
+}
+
 /// Unpack a `.MOD` into `out_dir` (which becomes a directory the packer accepts
 /// as a mod source: `MOD.DAT` + `MEDIA/…`).
 pub fn unpack_mod(mod_path: &Path, out_dir: &Path, opt: &Options) -> Result<Report, String> {
@@ -100,15 +117,20 @@ pub fn unpack_mod(mod_path: &Path, out_dir: &Path, opt: &Options) -> Result<Repo
 }
 
 /// `unpack_mod`, calling `progress(done, total)` after each file — an 11k-file
-/// mod takes long enough that a silent run looks hung.
+/// mod takes long enough that a silent run looks hung. Extraction is parallel,
+/// so the callback is shared across workers: it must be `Fn + Sync` and do its
+/// own throttling/locking (`done` is a monotonic counter, not an index).
 pub fn unpack_mod_with_progress(
     mod_path: &Path,
     out_dir: &Path,
     opt: &Options,
-    progress: impl FnMut(usize, usize),
+    progress: impl Fn(usize, usize) + Sync,
 ) -> Result<Report, String> {
     let mut r = PakReader::open_mod(mod_path)?;
     let mut report = Report::default();
+    // MOD.DAT goes out before the entry pass creates the MEDIA tree, so the
+    // root has to exist first (`write_file` assumes its parent is there).
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
     if opt.write_mod_dat {
         if let Some(h) = r.header() {
             let stem = mod_path
@@ -130,7 +152,7 @@ pub fn unpack_pak(
     pak_path: &Path,
     out_dir: &Path,
     opt: &Options,
-    progress: impl FnMut(usize, usize),
+    progress: impl Fn(usize, usize) + Sync,
 ) -> Result<Report, String> {
     let mut r = PakReader::open_pak(pak_path)?;
     let mut report = Report::default();
@@ -139,12 +161,23 @@ pub fn unpack_pak(
 }
 
 /// Extract every (selected) entry, decompiling as it goes.
+///
+/// Runs wide. Unpacking is dominated by per-file filesystem cost, not CPU —
+/// measured at a flat ~1.0 ms/file on Windows regardless of mod size or content
+/// type (file create + write + Defender), so the work is spread over rayon and
+/// each worker gets its OWN `BlockReader` (a block read is a seek plus a read,
+/// which cannot be shared, but the container is immutable so independent
+/// readers over it are fine).
+///
+/// Output is independent per entry, so parallelism cannot change what gets
+/// written; the only order-sensitive state is the report, which is merged
+/// deterministically at the end.
 pub fn unpack_entries(
     r: &mut PakReader,
     out_dir: &Path,
     opt: &Options,
     report: &mut Report,
-    mut progress: impl FnMut(usize, usize),
+    progress: impl Fn(usize, usize) + Sync,
 ) -> Result<(), String> {
     let want = opt.filter.as_ref().map(|f| f.to_uppercase());
     let entries: Vec<Entry> = r
@@ -157,28 +190,74 @@ pub fn unpack_entries(
         .cloned()
         .collect();
     let total = entries.len();
-    for (i, e) in entries.iter().enumerate() {
-        // Manifest paths are '/'-separated and already rooted at MEDIA/, which
-        // is exactly the layout a mod source directory wants.
-        let payload = r.read_entry(e)?;
-        let c = convert(&e.path, payload, opt, report);
-        let rel = sanitize_rel(&format!("{}{}", e.path, c.suffix))?;
-        let dst = out_dir.join(rel);
-        match c.kind {
-            Kind::Dat => report.dats += 1,
-            Kind::Layout => report.layouts += 1,
-            Kind::Copy => report.copied += 1,
-        }
-        report.files += 1;
-        report.bytes += c.bytes.len() as u64;
-        if e.ftime == 0 {
-            report.generated.push(e.path.clone());
-        }
-        write_file(&dst, &c.bytes, opt.restore_times.then_some(e.ftime))?;
-        progress(i + 1, total);
+
+    // Manifest paths are '/'-separated and already rooted at MEDIA/, which is
+    // exactly the layout a mod source directory wants. Resolve (and vet) every
+    // destination up front so the hot loop neither re-parses paths nor pays a
+    // create_dir_all per file — one pass over the DISTINCT parents instead,
+    // which on a 36k-file mod is a few hundred calls rather than 36 thousand.
+    let mut dsts: Vec<PathBuf> = Vec::with_capacity(entries.len());
+    for e in &entries {
+        dsts.push(out_dir.join(sanitize_rel(&e.path)?));
     }
+    let mut parents: BTreeSet<&Path> = BTreeSet::new();
+    for d in &dsts {
+        if let Some(p) = d.parent() {
+            parents.insert(p);
+        }
+    }
+    for p in parents {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+
+    let done = AtomicUsize::new(0);
+    // One shard of the report per chunk; merged in a fixed order afterwards.
+    let shards: Vec<Result<Report, String>> = entries
+        .par_chunks(CHUNK)
+        .zip(dsts.par_chunks(CHUNK))
+        .map(|(chunk, dst_chunk)| {
+            let mut blocks = r.block_reader()?;
+            let mut rep = Report::default();
+            for (e, dst) in chunk.iter().zip(dst_chunk) {
+                let payload = blocks.read_entry(e)?;
+                let c = convert(&e.path, payload, opt, &mut rep);
+                // A payload that would not decompile is parked under its
+                // compiled name, which lands in the same directory.
+                let dst = if c.suffix.is_empty() {
+                    dst.clone()
+                } else {
+                    let mut n = dst.as_os_str().to_owned();
+                    n.push(c.suffix);
+                    PathBuf::from(n)
+                };
+                match c.kind {
+                    Kind::Dat => rep.dats += 1,
+                    Kind::Layout => rep.layouts += 1,
+                    Kind::Copy => rep.copied += 1,
+                }
+                rep.files += 1;
+                rep.bytes += c.bytes.len() as u64;
+                if e.ftime == 0 {
+                    rep.generated.push(e.path.clone());
+                }
+                write_file(&dst, &c.bytes, opt.restore_times.then_some(e.ftime))?;
+                progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+            }
+            Ok(rep)
+        })
+        .collect();
+
+    for shard in shards {
+        report.merge(shard?);
+    }
+    // Chunks finish out of order; restore manifest order for anything listed.
+    report.generated.sort();
     Ok(())
 }
+
+/// Entries per rayon task. Big enough that opening a `BlockReader` (one file
+/// open) is amortised, small enough that the tail does not idle the pool.
+const CHUNK: usize = 64;
 
 enum Kind {
     Dat,
@@ -324,11 +403,14 @@ fn sanitize_rel(path: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Write one extracted file. The parent directory is pre-created by the caller,
+/// and the timestamp is set through the SAME handle the data went out on —
+/// re-opening the file just to stamp it doubles the open count, which on a
+/// 36k-file mod is the difference between one syscall storm and two.
 fn write_file(dst: &Path, data: &[u8], ftime: Option<u64>) -> Result<(), String> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    std::fs::write(dst, data).map_err(|e| format!("{}: {e}", dst.display()))?;
+    use std::io::Write;
+    let mut f = std::fs::File::create(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    f.write_all(data).map_err(|e| format!("{}: {e}", dst.display()))?;
     if let Some(ft) = ftime {
         if let Some(t) = filetime_to_system(ft) {
             // Best-effort: a filesystem that cannot store the time is not a
@@ -336,9 +418,7 @@ fn write_file(dst: &Path, data: &[u8], ftime: Option<u64>) -> Result<(), String>
             // FILETIME 0 → 1601 stamp is dropped — `filestat_set_times` takes
             // UNSIGNED nanoseconds since 1970, so a pre-epoch time has no
             // representation there and those files keep the host's clock.)
-            if let Ok(f) = std::fs::File::options().write(true).open(dst) {
-                let _ = f.set_modified(t);
-            }
+            let _ = f.set_modified(t);
         }
     }
     Ok(())

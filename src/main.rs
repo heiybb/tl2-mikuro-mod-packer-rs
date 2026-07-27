@@ -397,12 +397,15 @@ fn run_unpack(input: &str, out_dir: &str, flags: &[String]) -> ExitCode {
         .unwrap_or(false);
 
     // Progress: files are wildly uneven in size (a 40 MB mesh next to a 200 byte
-    // DAT), so tick on a timer rather than every Nth file.
+    // DAT), so tick on a timer rather than every Nth file. Extraction is
+    // parallel, so the throttle state lives behind a mutex — which also keeps
+    // two workers from interleaving a line.
     let t0 = std::time::Instant::now();
-    let mut last = std::time::Instant::now();
-    let mut tick = |done: usize, total: usize| {
+    let last = std::sync::Mutex::new(std::time::Instant::now());
+    let tick = |done: usize, total: usize| {
+        let Ok(mut last) = last.lock() else { return };
         if done == total || last.elapsed().as_millis() >= 500 {
-            last = std::time::Instant::now();
+            *last = std::time::Instant::now();
             let pct = if total > 0 { done * 100 / total } else { 100 };
             print!("\r  {done}/{total} files ({pct}%)   ");
             use std::io::Write;
@@ -412,9 +415,9 @@ fn run_unpack(input: &str, out_dir: &str, flags: &[String]) -> ExitCode {
 
     println!("Unpacking {input} → {out_dir}");
     let res = if is_pak {
-        unpack_pak(src, dst, &opt, &mut tick)
+        unpack_pak(src, dst, &opt, &tick)
     } else {
-        unpack_mod_with_progress(src, dst, &opt, &mut tick)
+        unpack_mod_with_progress(src, dst, &opt, &tick)
     };
     println!();
     match res {

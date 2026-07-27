@@ -187,7 +187,11 @@ pub fn parse_manifest(b: &[u8]) -> Result<Manifest, String> {
 }
 
 /// An open archive: the data file plus its parsed manifest.
-pub struct PakReader {
+/// Reads and inflates data blocks. Split out from `PakReader` so an unpack can
+/// hand each worker its OWN handle + inflater: a block read is a seek plus a
+/// read, which cannot be shared across threads, but the container is immutable
+/// so any number of independent readers over it is safe.
+pub struct BlockReader {
     file: std::fs::File,
     /// Absolute file offset where the data section starts (0 for a `.PAK`,
     /// `off_data` for a `.MOD`).
@@ -195,10 +199,23 @@ pub struct PakReader {
     /// Absolute file offset where the data section ENDS (`off_man` for a `.MOD`,
     /// EOF for a `.PAK`) — every block length is validated against it.
     data_end: u64,
+    decomp: libdeflater::Decompressor,
+}
+
+impl BlockReader {
+    pub fn open(path: &Path, data_base: u64, data_end: u64) -> Result<Self, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Self { file, data_base, data_end, decomp: libdeflater::Decompressor::new() })
+    }
+}
+
+pub struct PakReader {
+    /// The container path, so `block_reader()` can open independent handles.
+    src: PathBuf,
+    blocks: BlockReader,
     manifest: Manifest,
     /// The mod header — `Some` only for a `.MOD` (a `.PAK` has none).
     header: Option<Header>,
-    decomp: libdeflater::Decompressor,
 }
 
 impl PakReader {
@@ -210,17 +227,13 @@ impl PakReader {
         let man_bytes = std::fs::read(&man_path)
             .map_err(|e| format!("{}: {e}", man_path.display()))?;
         let manifest = parse_manifest(&man_bytes)?;
-        let file = std::fs::File::open(pak_path)
-            .map_err(|e| format!("{}: {e}", pak_path.display()))?;
         // A .PAK is data all the way to EOF (its manifest is the sibling .MAN).
-        let data_end = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+        let data_end = std::fs::metadata(pak_path).map(|m| m.len()).unwrap_or(u64::MAX);
         Ok(Self {
-            file,
-            data_base: 0,
-            data_end,
+            src: pak_path.to_path_buf(),
+            blocks: BlockReader::open(pak_path, 0, data_end)?,
             manifest,
             header: None,
-            decomp: libdeflater::Decompressor::new(),
         })
     }
 
@@ -258,18 +271,23 @@ impl PakReader {
         header.mhash = manifest.mhash;
         header.fc = manifest.file_count;
         manifest.root = header.root.clone();
+        drop(file);
         Ok(Self {
-            file,
-            data_base: off_data,
-            data_end: off_man,
+            src: mod_path.to_path_buf(),
+            blocks: BlockReader::open(mod_path, off_data, off_man)?,
             manifest,
             header: Some(header),
-            decomp: libdeflater::Decompressor::new(),
         })
     }
 
     pub fn root(&self) -> &str {
         &self.manifest.root
+    }
+
+    /// A fresh, independent reader over the same data section — one per worker
+    /// thread when extracting in parallel.
+    pub fn block_reader(&self) -> Result<BlockReader, String> {
+        BlockReader::open(&self.src, self.blocks.data_base, self.blocks.data_end)
     }
 
     /// The parsed `.MOD` header (`None` for a `DATA.PAK`, which has none).
@@ -281,6 +299,13 @@ impl PakReader {
         &self.manifest.files
     }
 
+    /// Read + inflate one entry's bytes.
+    pub fn read_entry(&mut self, e: &Entry) -> Result<Vec<u8>, String> {
+        self.blocks.read_entry(e)
+    }
+}
+
+impl BlockReader {
     /// Read + inflate one entry's bytes.
     pub fn read_entry(&mut self, e: &Entry) -> Result<Vec<u8>, String> {
         // A placeholder record (the packer's `Item::Placeholder`) carries no
@@ -336,7 +361,9 @@ impl PakReader {
             Ok(out)
         }
     }
+}
 
+impl PakReader {
     /// Provision the base data a full mod pack needs into `cache_dir` (used as
     /// `TL2_MEDIA_DIR`): the compiled base DATs the pipeline reads as TEXT —
     /// `LEVELSETS/*.DAT` (MPP piece tables + ROOMPIECES.RAW) and `UNITS/*.DAT`

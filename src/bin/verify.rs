@@ -246,10 +246,11 @@ fn verify_unpack(mod_path: &Path) {
             std::env::set_var("TL2_MOD_GAMEVER", format!("0x{:016X}", h.gamever));
         }
     }
-    let mut last = std::time::Instant::now();
+    let last = std::sync::Mutex::new(std::time::Instant::now());
     let rep = match unpack_mod_with_progress(mod_path, &tree, &Options::default(), |d, t| {
+        let Ok(mut last) = last.lock() else { return };
         if d == t || last.elapsed().as_millis() >= 500 {
-            last = std::time::Instant::now();
+            *last = std::time::Instant::now();
             print!("\r  unpacking {d}/{t}   ");
             use std::io::Write;
             let _ = std::io::stdout().flush();
