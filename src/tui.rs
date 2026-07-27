@@ -2369,56 +2369,6 @@ mod tests {
         assert!(wrapped.contains(&"Mod29".to_string()), "wrapped to the last row and showed it");
     }
 
-    /// SCRATCH — diagnosing the picker's scroll behaviour with more rows than
-    /// fit. Prints what is visible as the cursor walks down a long list.
-    #[test]
-    #[ignore = "diagnostic"]
-    fn scratch_long_list_scroll() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let rows: Vec<ModEntry> = (0..30)
-            .map(|i| ModEntry {
-                title: format!("Mod{i:02}"),
-                file_name: format!("M{i:02}"),
-                dir: PathBuf::from("/x"),
-                has_layouts: false,
-                action: Action::Pack,
-                origin: Origin::Local,
-            })
-            .collect();
-        let mut app = App::new(rows, Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
-        app.set_lang(Lang::En);
-        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
-        let mut show = |app: &App, terminal: &mut Terminal<TestBackend>, tag: &str| {
-            terminal.draw(|f| draw(f, app)).unwrap();
-            let text = buffer_text(terminal.backend().buffer());
-            let visible: Vec<&str> = text
-                .lines()
-                .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("Mod0") || w.starts_with("Mod1") || w.starts_with("Mod2")))
-                .collect();
-            eprintln!(
-                "step {tag:>7} sel={:>4?} offset={} visible={:?}",
-                app.pack.state.selected(),
-                app.pack.state.offset(),
-                visible
-            );
-        };
-        for i in 0..14 {
-            show(&app, &mut terminal, &format!("dn{i}"));
-            handle_key(&mut app, KeyEvent::from(KeyCode::Down));
-        }
-        for i in 0..4 {
-            show(&app, &mut terminal, &format!("up{i}"));
-            handle_key(&mut app, KeyEvent::from(KeyCode::Up));
-        }
-        // Wrap-around: from the first row, Up should land on the LAST row.
-        app.pack.state.select(Some(0));
-        show(&app, &mut terminal, "top");
-        handle_key(&mut app, KeyEvent::from(KeyCode::Up));
-        show(&app, &mut terminal, "wrap");
-    }
-
     /// Ctrl+C must quit, not clear the log. In raw mode it is an ordinary
     /// keypress; unanswered, the app cannot be exited with it at all, and on the
     /// Output tab it fell through to the bare `c` = clear binding.
