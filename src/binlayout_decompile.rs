@@ -522,18 +522,19 @@ fn prop_line(out: &mut String, depth: usize, tag: &str, key: &str, val: &str) {
 /// be emitted BEFORE it or the two values would swap on recompile.
 const DG_KEYS_ALSO_IN_STREAM: [&str; 2] = ["CHOICE", "GAME MODE"];
 
-/// Emit the datagroup copy of a key the stream also carries (see above). Runs
-/// before the stream props; everything else waits for `emit_dg_props`.
-fn emit_dg_props_early(out: &mut String, depth: usize, f: &DgFields, stream_keys: &[&str]) {
-    if stream_keys.contains(&"CHOICE") {
-        if let Some(c) = choice_name(f.choice) {
-            prop_line(out, depth, "STRING", "CHOICE", c);
-        }
-    }
-    if stream_keys.contains(&"GAME MODE") {
-        if let Some(g) = gamemode_name(f.game_mode) {
-            prop_line(out, depth, "STRING", "GAME MODE", g);
-        }
+/// Emit the datagroup copy of a key the stream also carries, immediately BEFORE
+/// the stream copy (which is where the editor puts it, and where the "first
+/// occurrence is the metadata" rule assigns it to the datagroup rather than to
+/// the property block). Returns whether anything was written.
+fn emit_dg_twin(out: &mut String, depth: usize, f: &DgFields, key: &str) -> bool {
+    match key {
+        "CHOICE" => choice_name(f.choice)
+            .map(|c| prop_line(out, depth, "STRING", "CHOICE", c))
+            .is_some(),
+        "GAME MODE" => gamemode_name(f.game_mode)
+            .map(|g| prop_line(out, depth, "STRING", "GAME MODE", g))
+            .is_some(),
+        _ => false,
     }
 }
 
@@ -574,13 +575,17 @@ fn emit_dg_props(out: &mut String, depth: usize, f: &DgFields, stream_keys: &[&s
             prop_line(out, depth, "STRING", "GAME MODE", g);
         }
     }
+    // The two theme lists are written differently by the editor, consistently
+    // enough across the shipped corpus to reproduce: ACTIVE THEMES never ends in
+    // a comma (1197/1197) while DEACTIVE THEMES does (173/174). The compiler
+    // drops empty parts either way, so this is spelling only.
     if !f.active.is_empty() {
         let v: Vec<String> = f.active.iter().map(|i| i.to_string()).collect();
         prop_line(out, depth, "STRING", "ACTIVE THEMES", &v.join(","));
     }
     if !f.deactive.is_empty() {
         let v: Vec<String> = f.deactive.iter().map(|i| i.to_string()).collect();
-        prop_line(out, depth, "STRING", "DEACTIVE THEMES", &v.join(","));
+        prop_line(out, depth, "STRING", "DEACTIVE THEMES", &format!("{},", v.join(",")));
     }
 }
 
@@ -654,10 +659,15 @@ fn emit_object(out: &mut String, depth: usize, o: &Obj, parent_id: i64) {
         prop_line(out, d, "INTEGER64", "ID", &o.oid.to_string());
     }
     let stream_keys: Vec<&str> = o.props.iter().map(|p| p.key).collect();
-    if let Some(f) = &o.dg {
-        emit_dg_props_early(out, d, f, &stream_keys);
-    }
     for p in &o.props {
+        // A key that is BOTH a datagroup field and a schema property appears
+        // twice in the source; the datagroup copy goes directly in front of the
+        // stream one (see `emit_dg_twin`).
+        if DG_KEYS_ALSO_IN_STREAM.contains(&p.key) {
+            if let Some(f) = &o.dg {
+                emit_dg_twin(out, d, f, p.key);
+            }
+        }
         if p.vals.len() == 1 {
             prop_line(out, d, p.tag, p.key, &p.vals[0]);
         } else {
