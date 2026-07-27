@@ -20,9 +20,9 @@ mod tui;
 
 fn usage() -> ExitCode {
     eprintln!("Usage: tl2-mikuro-mod-packer [--in-place|--temp-copy] [--mpp {{re,dll,none}}] [--raw {{auto,none}}] [--deploy] <mod_directory>");
-    eprintln!("  (default)    Convert in memory, pack without copying MEDIA (fastest, non-mutating)");
-    eprintln!("  --in-place   Write converted files into MEDIA, then pack");
-    eprintln!("  --temp-copy  Copy MEDIA to a temp dir, convert there, then pack");
+    eprintln!("  (no flag)    Compile in memory — nothing but the .MOD is written (default)");
+    eprintln!("  --in-place   ALSO leave the compiled .BINDAT/.BINLAYOUT in your MEDIA tree");
+    eprintln!("  --temp-copy  Compile on disk in a throwaway copy; your MEDIA stays clean");
     eprintln!("  --deploy     Output straight to TL2's default mods dir as <MOD_FILE_NAME>.MOD");
     eprintln!("  --mpp re     Offline .MPP generator (DEFAULT; robust, ~99.7% cell-accurate)");
     eprintln!("  --mpp dll    Byte-exact .MPP via the real EditorGuts.dll (needs editor env)");

@@ -1357,10 +1357,12 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             "<mod_dir> [--deploy]",
             tr("pack_a_mod_folder"),
         ),
-        cmd(
-            "   --in-place | --temp-copy",
-            tr("write_converted_files_out_default_in_memory"),
-        ),
+        // These three are one decision — "where do the compiled .BINDAT /
+        // .BINLAYOUT files go?" — so spell out all three answers, including
+        // the default you get by passing nothing.
+        cmd("   (no flag)", tr("mode_default")),
+        cmd("   --in-place", tr("mode_in_place")),
+        cmd("   --temp-copy", tr("mode_temp_copy")),
         cmd(
             "   --mpp re|dll|none",
             tr("walk_grid_backend_default_re"),
