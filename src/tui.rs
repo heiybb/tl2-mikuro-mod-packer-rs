@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use tl2_mikuro_mod_packer_rs::pak::PakReader;
@@ -1094,9 +1094,9 @@ fn draw(f: &mut Frame, app: &App) {
     // blank row between each panel — the three blocks used to touch, which read
     // as one boxed-in slab rather than three surfaces.
     let areas = Layout::vertical([
-        Constraint::Length(3), // header / tabs
+        Constraint::Length(4), // header: border, gap, tab row, border
         Constraint::Length(1), // ── breathing room
-        Constraint::Min(3),    // body (picker or output)
+        Constraint::Min(4),    // body (picker or output)
         Constraint::Length(1), // ── breathing room
         Constraint::Length(3), // footer
     ])
@@ -1130,6 +1130,18 @@ fn panel(title: Span<'_>, border: Color) -> Block<'_> {
         .padding(Padding::horizontal(1))
         .title(title)
 }
+
+/// `panel` plus a blank row under the title. A panel title sits ON the top
+/// border, so without it the first line of content is glued to the heading and
+/// the two read as one block of text. Costs one row, which only the 3-row
+/// footer cannot spare — it keeps `panel`.
+fn panel_body(title: Span<'_>, border: Color) -> Block<'_> {
+    panel(title, border).padding(Padding::new(1, 1, 1, 0))
+}
+
+/// Rows `panel_body` spends on borders and the title gap — subtract from a
+/// panel's height to get how many lines of content actually fit.
+const PANEL_CHROME: u16 = 3;
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     // Tabs carry their own row count, so the label alone tells you whether a
@@ -1205,16 +1217,21 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::raw("   "));
     spans.push(Span::styled(status, status_style));
     let line = Line::from(spans);
+    // NO `Wrap { trim: true }` here. Trimming strips a line's leading spaces —
+    // which are INSIDE the first tab's coloured span, so the leftmost tab lost
+    // half its padding and sat visibly tighter than every other tab. Wrapping
+    // bought nothing anyway: the block is one row tall, so a wrapped second
+    // line would never be drawn, and over-long headers are already handled by
+    // dropping segments above.
     let p = Paragraph::new(line)
-        .block(panel(
+        .block(panel_body(
             Span::styled(
                 " Mikuro Torchlight II Mod Packer ",
                 Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
             ),
             theme::LINE_HI,
         ))
-        .style(Style::default().fg(theme::TEXT).bg(theme::PANEL))
-        .wrap(Wrap { trim: true });
+        .style(Style::default().fg(theme::TEXT).bg(theme::PANEL));
     f.render_widget(p, area);
 }
 
@@ -1270,7 +1287,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
             ]
         };
         let p = Paragraph::new(msg)
-            .block(panel(title, theme::LINE))
+            .block(panel_body(title, theme::LINE))
             .style(Style::default().bg(theme::PANEL));
         f.render_widget(p, area);
         return;
@@ -1322,7 +1339,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let list = List::new(items)
-        .block(panel(title, theme::LINE))
+        .block(panel_body(title, theme::LINE))
         .highlight_style(
             Style::default()
                 .bg(theme::LINE_HI)
@@ -1345,7 +1362,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
 fn draw_output(f: &mut Frame, area: Rect, app: &App) {
     let log = app.log.lock().map(|v| v.clone()).unwrap_or_default();
     let total = log.len() as u16;
-    let inner_h = area.height.saturating_sub(2); // minus the border
+    let inner_h = area.height.saturating_sub(PANEL_CHROME);
     let max_scroll = total.saturating_sub(inner_h);
     app.out_max.set(max_scroll); // the key handler clamps against this
     let scroll = if app.follow {
@@ -1380,7 +1397,7 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
         )
     };
     let p = Paragraph::new(log.join("\n"))
-        .block(panel(Span::styled(title, tstyle), theme::LINE))
+        .block(panel_body(Span::styled(title, tstyle), theme::LINE))
         .style(Style::default().fg(theme::TEXT).bg(theme::PANEL))
         .scroll((scroll, 0));
     f.render_widget(p, area);
@@ -1544,7 +1561,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let lines = help_lines(app);
     let total = lines.len() as u16;
-    let inner_h = area.height.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(PANEL_CHROME);
     let max_scroll = total.saturating_sub(inner_h);
     app.help_max.set(max_scroll); // the key handler clamps against this
     let scroll = app.help_scroll.min(max_scroll);
@@ -1554,7 +1571,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         " Help ".to_string()
     };
     let p = Paragraph::new(lines)
-        .block(panel(
+        .block(panel_body(
             Span::styled(title, Style::default().fg(theme::MUTED)),
             theme::LINE,
         ))
@@ -1978,7 +1995,12 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(w, 18)).unwrap();
             terminal.draw(|f| draw(f, &app)).unwrap();
             let text = buffer_text(terminal.backend().buffer());
-            let header = text.lines().nth(2).unwrap_or_default().to_string();
+            // The tab row, wherever the header's internal spacing puts it.
+            let header = text
+                .lines()
+                .find(|l| l.contains("СБОРКА"))
+                .unwrap_or_default()
+                .to_string();
             assert!(
                 header.contains("выбрано 0/12"),
                 "at {w} cols the status is clipped out of the header: {header:?}"
@@ -2261,6 +2283,58 @@ mod tests {
         assert!(bgs.contains(&theme::EMBER), "ember-backed active tab");
         assert!(fgs.contains(&theme::EMBER), "ember accent text");
         assert!(fgs.contains(&theme::TEXT), "primary parchment text");
+
+        // Every tab is padded by two spaces on each side, INSIDE its coloured
+        // span. The header used to render with `Wrap { trim: true }`, which
+        // strips a line's leading whitespace — so the leftmost tab lost its two
+        // and sat visibly tighter than the rest. Check the padding is painted,
+        // not just present in the string.
+        let (tx, ty) = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buf[(x, y)].symbol() == "P" && buf[(x, y)].style().bg == Some(theme::EMBER)
+            })
+            .expect("active PACK tab is drawn");
+        for back in 1..=2u16 {
+            let cell = &buf[(tx - back, ty)];
+            assert_eq!(cell.symbol(), " ", "tab padding cell");
+            assert_eq!(cell.style().bg, Some(theme::EMBER), "…and it is inside the tab");
+        }
+        // Two rows: the title sits on the top border, then a blank line, so the
+        // tabs are not glued to the heading.
+        assert!(ty >= 2, "tab row is below the title AND a blank row (y={ty})");
+    }
+
+    /// Panels put a blank row between the title on their border and the first
+    /// line of content, so heading and body do not read as one block.
+    #[test]
+    fn panels_breathe_under_their_title() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        app.set_lang(Lang::En);
+        app.tab = TAB_HELP;
+        let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        let lines: Vec<&str> = text.lines().collect();
+        let title_row = lines
+            .iter()
+            .position(|l| l.contains("Help"))
+            .expect("help panel title");
+        // "Blank" means blank INSIDE the panel — the border glyphs stay.
+        let empty = |l: &str| l.chars().all(|c| c == ' ' || c == '│');
+        assert!(
+            empty(lines[title_row + 1]),
+            "blank row under the panel title, got {:?}",
+            lines[title_row + 1]
+        );
+        assert!(
+            !empty(lines[title_row + 2]),
+            "content starts right after it, got {:?}",
+            lines[title_row + 2]
+        );
     }
 
     /// Read the rendered buffer back as text.
