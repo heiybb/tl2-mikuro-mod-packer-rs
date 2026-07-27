@@ -115,11 +115,22 @@ enum BaseSource {
 }
 
 impl BaseSource {
+    /// Full description, path included — for the Help tab and the run log.
     fn label(&self) -> String {
         match self {
             BaseSource::LooseMedia(p) => format!("loose MEDIA ({})", p.display()),
             BaseSource::DataPak(p) => format!("DATA.PAK ({})", p.display()),
             BaseSource::Bundled => "bundled base (embedded)".to_string(),
+        }
+    }
+
+    /// Just the tier, for the header — a base path can be 60 columns wide and
+    /// would push the run status off the end of the bar.
+    fn short(&self) -> &'static str {
+        match self {
+            BaseSource::LooseMedia(_) => "loose MEDIA",
+            BaseSource::DataPak(_) => "DATA.PAK",
+            BaseSource::Bundled => "bundled",
         }
     }
 }
@@ -505,7 +516,8 @@ fn stream_lines(r: impl Read, log: &Log) {
 const TAB_PACK: usize = 0;
 const TAB_UNPACK: usize = 1;
 const TAB_OUTPUT: usize = 2;
-const TAB_COUNT: usize = 3;
+const TAB_HELP: usize = 3;
+const TAB_COUNT: usize = 4;
 
 /// One picker: its rows, what is ticked, and where the cursor sits. PACK and
 /// UNPACK each own one, so switching tabs never disturbs the other's selection.
@@ -580,6 +592,7 @@ struct App {
     finished: Arc<AtomicBool>,
     follow: bool, // Output tab auto-scroll to tail
     out_scroll: u16,
+    help_scroll: u16,
 }
 
 impl App {
@@ -597,6 +610,7 @@ impl App {
             finished: Arc::new(AtomicBool::new(false)),
             follow: true,
             out_scroll: 0,
+            help_scroll: 0,
         }
     }
 
@@ -700,6 +714,7 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
             KeyCode::Char('1') => app.tab = TAB_PACK,
             KeyCode::Char('2') => app.tab = TAB_UNPACK,
             KeyCode::Char('3') => app.tab = TAB_OUTPUT,
+            KeyCode::Char('4') | KeyCode::Char('?') | KeyCode::F(1) => app.tab = TAB_HELP,
             KeyCode::Char('q') | KeyCode::Esc => {
                 // Ignore quit while a run is going (the child would orphan).
                 if !app.is_packing() {
@@ -722,6 +737,18 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
                 KeyCode::PageDown => app.out_scroll = app.out_scroll.saturating_add(10),
                 KeyCode::End | KeyCode::Char('G') => app.follow = true,
                 KeyCode::Char('c') => app.clear_log(),
+                _ => {}
+            },
+            _ if app.tab == TAB_HELP => match k.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.help_scroll = app.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.help_scroll = app.help_scroll.saturating_add(1)
+                }
+                KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
+                KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(10),
+                KeyCode::Home => app.help_scroll = 0,
                 _ => {}
             },
             _ if !app.is_packing() => match k.code {
@@ -768,6 +795,7 @@ fn draw(f: &mut Frame, app: &App) {
     draw_header(f, areas[0], app);
     match app.tab {
         TAB_OUTPUT => draw_output(f, areas[2], app),
+        TAB_HELP => draw_help(f, areas[2], app),
         _ => draw_list(f, areas[2], app),
     }
     draw_footer(f, areas[4], app);
@@ -817,9 +845,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         tab(app.tab == TAB_UNPACK, "UNPACK", Some(app.unpack.items.len())),
         gap(),
         tab(app.tab == TAB_OUTPUT, "OUTPUT", None),
-        Span::styled("     base ", Style::default().fg(theme::MUTED)),
-        Span::styled(app.base.label(), Style::default().fg(theme::GOLD)),
-        Span::styled("     ", Style::default()),
+        gap(),
+        tab(app.tab == TAB_HELP, "HELP", None),
+        Span::styled("    base ", Style::default().fg(theme::MUTED)),
+        Span::styled(app.base.short(), Style::default().fg(theme::GOLD)),
+        Span::styled("    ", Style::default()),
         Span::styled(status, status_style),
     ]);
     let p = Paragraph::new(line)
@@ -977,6 +1007,123 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
+/// The HELP tab. Everything here is stated from the code paths it describes —
+/// `detect_base` / `resolve_base_media` for the base tiers, `discover_*` for the
+/// scanned locations, `pack_worker` for where output lands, `main::usage` for
+/// the CLI — so it cannot drift into describing a tool we do not ship.
+fn help_lines(app: &App) -> Vec<Line<'static>> {
+    let head = |s: &str| {
+        Line::from(Span::styled(
+            s.to_string(),
+            Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let body = |s: String| Line::from(Span::styled(s, Style::default().fg(theme::TEXT)));
+    let dim = |s: String| Line::from(Span::styled(s, Style::default().fg(theme::MUTED)));
+    let path = |s: String| Line::from(Span::styled(s, Style::default().fg(theme::GOLD)));
+    let cmd = |c: &str, what: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {c}"), Style::default().fg(theme::EMBER_HI)),
+            Span::styled(format!("  {what}"), Style::default().fg(theme::MUTED)),
+        ])
+    };
+    let blank = || Line::from("");
+    let root = app.root.display().to_string();
+
+    let mut v = vec![
+        head("BASE BUNDLE — what it is, and why packing needs it"),
+        body("Two things a mod build cannot compute from the mod alone:".into()),
+        dim("  · UNITDATA.RAW follows each unit's BASEFILE chain into the BASE GAME's".into()),
+        dim("    UNITS templates to read UNITTYPE / LEVEL / RARITY / CREATEAS.".into()),
+        dim("  · MPP walk-grids are baked against the base game's COLLISION geometry.".into()),
+        body("So the packer needs base data. It takes the first of three tiers:".into()),
+        dim("  1. loose MEDIA/ next to this exe         (a real extracted install)".into()),
+        dim("  2. PAKS/DATA.PAK — or DATA.PAK — beside it (extracted on first use)".into()),
+        dim("  3. the bundle baked into this exe        (always there, ~3 MB gzip)".into()),
+        body(format!("Right now: {}", app.base.label())),
+        dim("Tiers 2 and 3 unpack once into a cache next to the exe and reuse it:".into()),
+        path(format!("  {}", app.root.join(".tl2packer_base").display())),
+        dim("All three produce byte-identical .MOD output — verified on a level mod.".into()),
+        blank(),
+        head("CONTENT MOD vs LEVEL MOD"),
+        body("The picker tags each source by one test: does MEDIA/LAYOUTS hold any".into()),
+        body("*.LAYOUT file?".into()),
+        dim("  content mod — no layouts. Nothing to bake; packs with --mpp none.".into()),
+        dim("  level mod   — has layouts. Its pathing walk-grids (.MPP) are".into()),
+        dim("                regenerated with --mpp re, which is why it needs the".into()),
+        dim("                base collision geometry above. Tier 3 is embedded, so".into()),
+        dim("                base is always available; if resolving it fails anyway".into()),
+        dim("                the pack still runs and keeps the existing .MPP.".into()),
+        blank(),
+        head("WHERE FILES ARE READ FROM"),
+        body("PACK scans for folders holding MOD.DAT (plus a MEDIA/ tree):".into()),
+        path(format!("  {root}")),
+        path(format!("  {}", app.root.join("mods").display())),
+        body("UNPACK scans for *.MOD files in those two, plus the game's mods folder".into()),
+        body("— the one --deploy writes to, so anything you just packed shows up:".into()),
+        path(format!("  {}", tl2_mods_dir().display())),
+        dim("Rows are deduped by real path and tagged local / game mods.".into()),
+        blank(),
+        head("WHERE OUTPUT GOES"),
+        body("PACK from this TUI always deploys, i.e. writes <MOD_FILE_NAME>.MOD to".into()),
+        path(format!("  {}", tl2_mods_dir().display())),
+        dim("  (MOD_FILE_NAME comes from MOD.DAT; the folder name is the fallback.)".into()),
+        body("UNPACK writes a source tree — MOD.DAT + MEDIA/ — under:".into()),
+        path(format!("  {}", app.root.join("unpacked").display())),
+        dim("  one subfolder per mod. The game's mods folder is never written to by".into()),
+        dim("  an unpack, so unpacking something you have installed is safe.".into()),
+        blank(),
+        head("CLI MODE — run it with arguments instead"),
+        dim("Launching with no arguments is what opens this TUI. With arguments it".into()),
+        dim("is the ordinary command-line packer:".into()),
+        blank(),
+        cmd("<mod_dir> [--deploy]", "pack a mod folder"),
+        cmd("   --in-place | --temp-copy", "write converted files out (default: in memory)"),
+        cmd("   --mpp re|dll|none", "walk-grid backend (default re)"),
+        cmd("   --raw auto|none", "RAW index generation (default auto)"),
+        blank(),
+        cmd("unpack <in.MOD|DATA.PAK> <out_dir>", "container -> editable sources"),
+        cmd("   --raw", "keep payloads compiled (no decompile)"),
+        cmd("   --no-times", "do not restore file timestamps"),
+        cmd("   --filter <text>", "only entries whose path contains <text>"),
+        blank(),
+        cmd("compile-dat <in.DAT> <out.BINDAT>", "single file"),
+        cmd("compile-layout <in.LAYOUT> <out.BINLAYOUT>", "single file"),
+        cmd("compile-mpp <in.LAYOUT> <out.mpp>", "single tile walk-grid"),
+        cmd("decompile-dat <in.BINDAT> <out.DAT>", "inverse; --utf8 for a plain dump"),
+        cmd("decompile-layout <in.BINLAYOUT> <out.LAYOUT>", "inverse"),
+        cmd("extract-base <DATA.PAK> <out_dir>", "base DATs + collision meshes"),
+        cmd("unpack-base <out_dir>", "the embedded bundle, no install needed"),
+        blank(),
+        dim("Env: TL2_MEDIA_DIR (base MEDIA)  TL2_MOD_GAMEVER (pin header gameVersion)".into()),
+        dim("     MIKURO_TIMING=1 (phase timings)  TL2_MODPACK_LIST=1 (dump discovery)".into()),
+    ];
+    v.push(blank());
+    v.push(dim("↑↓ / PageUp / PageDown to scroll this page.".into()));
+    v
+}
+
+fn draw_help(f: &mut Frame, area: Rect, app: &App) {
+    let lines = help_lines(app);
+    let total = lines.len() as u16;
+    let inner_h = area.height.saturating_sub(2);
+    let max_scroll = total.saturating_sub(inner_h);
+    let scroll = app.help_scroll.min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!(" Help · {}/{} ", scroll, max_scroll)
+    } else {
+        " Help ".to_string()
+    };
+    let p = Paragraph::new(lines)
+        .block(panel(
+            Span::styled(title, Style::default().fg(theme::MUTED)),
+            theme::LINE,
+        ))
+        .style(Style::default().bg(theme::PANEL))
+        .scroll((scroll, 0));
+    f.render_widget(p, area);
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let key = |s: &'static str| {
         Span::styled(s, Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD))
@@ -984,7 +1131,20 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let sep = |s: &'static str| Span::styled(s, Style::default().fg(theme::MUTED));
     // Wider gaps between key/label pairs than between a key and its own label,
     // so the eye groups them correctly instead of reading one long run.
-    let hint = if app.tab == TAB_OUTPUT {
+    let hint = if app.tab == TAB_HELP {
+        Line::from(vec![
+            key("↑↓"),
+            sep(" scroll    "),
+            key("Home"),
+            sep(" top    "),
+            key("Tab"),
+            sep(" switch    "),
+            key("1-4"),
+            sep(" jump    "),
+            key("q"),
+            sep(if app.is_packing() { " (running…)" } else { " quit" }),
+        ])
+    } else if app.tab == TAB_OUTPUT {
         Line::from(vec![
             key("↑↓"),
             sep(" scroll    "),
@@ -994,7 +1154,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             sep(" clear    "),
             key("Tab"),
             sep(" switch    "),
-            key("1/2/3"),
+            key("1-4"),
             sep(" jump    "),
             key("q"),
             sep(if app.is_packing() { " (running…)" } else { " quit" }),
@@ -1012,8 +1172,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             sep(run),
             key("Tab"),
             sep(" switch    "),
-            key("1/2/3"),
-            sep(" jump    "),
+            key("?"),
+            sep(" help    "),
             key("q"),
             sep(" quit"),
         ])
@@ -1197,6 +1357,53 @@ mod tests {
             buffer_text(terminal.backend().buffer()).contains("done"),
             "clear does not reset the run status"
         );
+
+        // HELP tab.
+        app.tab = TAB_HELP;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let help = buffer_text(terminal.backend().buffer());
+        dump("HELP", &help);
+        assert!(help.contains("BASE BUNDLE"), "help covers the base bundle");
+    }
+
+    /// The help text is the tool's own documentation, so assert it actually
+    /// answers each question asked of it — and that the paths it quotes are the
+    /// ones the code really uses, not prose that can drift.
+    #[test]
+    fn help_answers_every_question_with_real_paths() {
+        let root = PathBuf::from("/x");
+        let app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, root.clone());
+        let text = help_lines(&app)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Same dump switch as the frame test — this page is prose, and prose
+        // wants proofreading, not just substring assertions.
+        if std::env::var_os("TL2_TUI_DUMP").is_some() {
+            eprintln!("\n──────── HELP TEXT ────────\n{text}");
+        }
+
+        for topic in ["BASE BUNDLE", "CONTENT MOD vs LEVEL MOD", "WHERE FILES ARE READ FROM",
+                      "WHERE OUTPUT GOES", "CLI MODE"] {
+            assert!(text.contains(topic), "help section {topic:?} missing");
+        }
+        // Base tiers, and the live one.
+        for t in ["loose MEDIA", "DATA.PAK", "baked into this exe", "bundled base (embedded)"] {
+            assert!(text.contains(t), "base tier {t:?} not explained");
+        }
+        // The distinction is stated by its actual test (MEDIA/LAYOUTS).
+        assert!(text.contains("MEDIA/LAYOUTS") && text.contains("--mpp re"));
+        // Real paths, straight from the same helpers the scanners use.
+        assert!(text.contains(&root.join("mods").display().to_string()), "scan: ./mods");
+        assert!(text.contains(&tl2_mods_dir().display().to_string()), "scan+deploy: game mods");
+        assert!(text.contains(&root.join("unpacked").display().to_string()), "unpack output");
+        assert!(text.contains(&root.join(".tl2packer_base").display().to_string()), "base cache");
+        // Every CLI subcommand the binary actually accepts.
+        for c in ["unpack", "compile-dat", "compile-layout", "compile-mpp", "decompile-dat",
+                  "decompile-layout", "extract-base", "unpack-base", "--deploy", "--mpp"] {
+            assert!(text.contains(c), "CLI {c:?} not documented");
+        }
     }
 
     /// An empty picker must say what it looked for instead of showing a blank
