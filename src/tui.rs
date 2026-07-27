@@ -1016,8 +1016,11 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Option<ExitCode> {
         };
     }
     match k.code {
-            KeyCode::Tab => app.tab = (app.tab + 1) % TAB_COUNT,
-            KeyCode::BackTab => app.tab = (app.tab + TAB_COUNT - 1) % TAB_COUNT,
+            // ←→ is what the footer advertises: it has room for one hint, and an
+            // arrow pair needs no explaining. Tab/BackTab and the number keys go
+            // on working for whoever reaches for those first.
+            KeyCode::Tab | KeyCode::Right => app.tab = (app.tab + 1) % TAB_COUNT,
+            KeyCode::BackTab | KeyCode::Left => app.tab = (app.tab + TAB_COUNT - 1) % TAB_COUNT,
             // Direct tab keys: faster than cycling once there are three.
             KeyCode::Char('1') => app.tab = TAB_PACK,
             KeyCode::Char('2') => app.tab = TAB_UNPACK,
@@ -1580,86 +1583,117 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
+/// One footer entry: the key you press, what it does, and whether the line can
+/// be shortened by leaving it out.
+struct Hint {
+    key: String,
+    label: String,
+    color: Color,
+    /// True when the entry can be dropped on a narrow terminal. The keys that
+    /// cannot: moving, running, changing tab, changing language, quitting.
+    optional: bool,
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    // Both take the text by reference and own it in the Span: the labels now
-    // come from the string catalogue, which is borrowed from `app`.
-    let key = |s: &str| {
-        Span::styled(
-            s.to_string(),
-            Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
-        )
-    };
-    let sep = |s: &str| Span::styled(s.to_string(), Style::default().fg(theme::MUTED));
-    // Wider gaps between key/label pairs than between a key and its own label,
-    // so the eye groups them correctly instead of reading one long run.
     let tr = |key: &str| app.tr(key);
     let quit = if app.is_packing() {
         tr("running_2")
     } else {
         tr("quit")
     };
+    // The catalogue pads its footer labels on BOTH sides — a leading space held
+    // the key apart from its own label, trailing ones held the entries apart.
+    // Spacing is decided here now (it has to shrink on a narrow terminal), so
+    // the padding is trimmed back off.
+    let hint = |k: &str, label: &str, optional: bool| Hint {
+        key: k.to_string(),
+        label: label.trim().to_string(),
+        color: theme::MUTED,
+        optional,
+    };
+    // Changing tab is the one action available on EVERY tab, and the pickers
+    // advertised no way to do it at all — the number keys work but are invisible,
+    // and `Tab` reads as a character rather than a key. `←→` explains itself.
+    let tabs = || hint("←→", tr("switch"), false);
     // The language switch is on every tab: someone can land in a script they
     // cannot read, and the key must be reachable without understanding the UI.
     // The label is the NEXT language's own tag, so it reads the same to anyone.
-    let lang_hint = |v: &mut Vec<Span<'static>>| {
-        v.push(key("l"));
-        v.push(Span::styled(
-            format!(" {}    ", app.lang.next().tag()),
-            Style::default().fg(theme::MAGIC),
-        ));
+    let lang = || Hint {
+        key: "l".to_string(),
+        label: app.lang.next().tag().to_string(),
+        color: theme::MAGIC,
+        optional: false,
     };
-    let hint = if app.tab == TAB_HELP {
-        let mut v = vec![
-            key("↑↓"),
-            sep(tr("scroll")),
-            key("Home"),
-            sep(tr("top")),
-            key("Tab"),
-            sep(tr("switch")),
-        ];
-        lang_hint(&mut v);
-        v.push(key("q"));
-        v.push(sep(quit));
-        Line::from(v)
+
+    let mut items: Vec<Hint> = if app.tab == TAB_HELP {
+        vec![
+            hint("↑↓", tr("scroll"), false),
+            hint("Home", tr("top"), true),
+            tabs(),
+            lang(),
+        ]
     } else if app.tab == TAB_OUTPUT {
-        let mut v = vec![
-            key("↑↓"),
-            sep(tr("scroll_2")),
-            key("End"),
-            sep(tr("follow")),
-            key("c"),
-            sep(tr("clear")),
-            key("Tab"),
-            sep(tr("switch_2")),
-        ];
-        lang_hint(&mut v);
-        v.push(key("q"));
-        v.push(sep(quit));
-        Line::from(v)
+        vec![
+            hint("↑↓", tr("scroll_2"), false),
+            hint("End", tr("follow"), true),
+            hint("c", tr("clear"), true),
+            tabs(),
+            lang(),
+        ]
     } else {
-        let run = if app.tab == TAB_UNPACK {
-            tr("unpack_2")
-        } else {
-            tr("pack_2")
-        };
-        let mut v = vec![
-            key("↑↓"),
-            sep(tr("move")),
-            key("Space"),
-            sep(tr("select")),
-            key("a"),
-            sep(tr("all")),
-            key("Enter"),
-            sep(run),
-            key("?"),
-            sep(tr("help_2")),
-        ];
-        lang_hint(&mut v);
-        v.push(key("q"));
-        v.push(sep(quit));
-        Line::from(v)
+        let run = if app.tab == TAB_UNPACK { tr("unpack_2") } else { tr("pack_2") };
+        vec![
+            hint("↑↓", tr("move"), false),
+            hint("Space", tr("select"), false),
+            hint("a", tr("all"), true),
+            hint("Enter", run, false),
+            tabs(),
+            hint("?", tr("help_2"), true),
+            lang(),
+        ]
     };
-    let p = Paragraph::new(hint)
+    items.push(hint("q", quit, false));
+
+    // Fit the line: first close the gaps from 4 columns down to 2, then start
+    // leaving out the entries marked optional, last one first. A footer that
+    // silently clips is worse than a shorter one — the keys at the END are the
+    // ones you cannot discover any other way (language, quit).
+    let inner = area.width.saturating_sub(4) as usize;
+    let width = |items: &[Hint], gap: usize| -> usize {
+        items
+            .iter()
+            .map(|h| disp_width(&h.key) + 1 + disp_width(&h.label))
+            .sum::<usize>()
+            + gap * items.len().saturating_sub(1)
+    };
+    let mut gap = 4;
+    while gap > 2 && width(&items, gap) > inner {
+        gap -= 1;
+    }
+    while width(&items, gap) > inner {
+        match items.iter().rposition(|h| h.optional) {
+            Some(i) => {
+                items.remove(i);
+            }
+            None => break, // nothing left to give; the terminal is simply tiny
+        }
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, h) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" ".repeat(gap)));
+        }
+        spans.push(Span::styled(
+            h.key.clone(),
+            Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", h.label),
+            Style::default().fg(h.color),
+        ));
+    }
+    let p = Paragraph::new(Line::from(spans))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2577,6 +2611,57 @@ mod tests {
         let wrapped = visible(&app, &mut terminal);
         assert_eq!(app.pack.state.selected(), Some(29));
         assert!(wrapped.contains(&"Mod29".to_string()), "wrapped to the last row and showed it");
+    }
+
+    /// The footer must never clip. It is the only place several keys are named
+    /// at all, and the ones at the END — change language, quit — are exactly the
+    /// ones nothing else advertises, so a line that silently ran off the edge
+    /// took those with it. Russian at 80 columns is the tight case: the labels
+    /// are the longest and 80×25 is what a default console window gives you.
+    #[test]
+    fn the_footer_fits_every_language_at_80_columns() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let packs = || {
+            vec![ModEntry {
+                title: "Some Mod".into(),
+                file_name: "SOME_MOD".into(),
+                dir: PathBuf::from("/x/SomeMod"),
+                has_layouts: true,
+                action: Action::Pack,
+                origin: Origin::Local,
+            }]
+        };
+        for lang in [Lang::En, Lang::Zh, Lang::Ru] {
+            let mut app =
+                App::new(packs(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+            app.set_lang(lang);
+            for width in [80u16, 96, 120] {
+                for tab in [TAB_PACK, TAB_UNPACK, TAB_OUTPUT, TAB_HELP] {
+                    app.tab = tab;
+                    let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+                    terminal.draw(|f| draw(f, &app)).unwrap();
+                    let text = buffer_text(terminal.backend().buffer());
+                    let footer = text
+                        .lines()
+                        .rev()
+                        .find(|l| l.contains('q'))
+                        .unwrap_or_default()
+                        .to_string();
+                    for want in ["←→", "l ", "q "] {
+                        assert!(
+                            footer.contains(want),
+                            "{lang:?} tab {tab} at {width} cols lost {want:?}: {footer:?}"
+                        );
+                    }
+                    assert!(
+                        footer.contains(app.lang.next().tag()),
+                        "{lang:?} tab {tab} at {width} cols lost the language switch: {footer:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Ctrl+C must quit, not clear the log. In raw mode it is an ordinary
