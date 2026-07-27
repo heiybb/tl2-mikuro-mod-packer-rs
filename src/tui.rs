@@ -20,13 +20,13 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use tl2_mikuro_mod_packer_rs::pak::PakReader;
-use tl2_mikuro_mod_packer_rs::packer::read_mod_metadata;
+use tl2_mikuro_mod_packer_rs::packer::{read_mod_metadata, tl2_mods_dir};
 
 /// Emberworks palette (余烬工坊) mapped to truecolor terminal colors — the same
 /// tokens the web site uses, so the packer reads as the same brand. Semantics:
@@ -79,6 +79,27 @@ struct ModEntry {
     /// pathing (MPP) would want base collision geometry to regenerate.
     has_layouts: bool,
     action: Action,
+    /// Where the row was found — shown on unpack rows, where the same mod can
+    /// sit both next to the exe and in the game's deployed mods folder.
+    origin: Origin,
+}
+
+/// Which of the scanned locations a row came from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Origin {
+    /// Next to the exe (or its `mods/` subfolder).
+    Local,
+    /// The game's deployed mods folder under Documents — what `--deploy` writes.
+    Deployed,
+}
+
+impl Origin {
+    fn label(self) -> &'static str {
+        match self {
+            Origin::Local => "local",
+            Origin::Deployed => "game mods",
+        }
+    }
 }
 
 /// Where the base game MEDIA can come from, in priority order.
@@ -144,12 +165,13 @@ fn mod_entry_for(dir: &Path) -> Option<ModEntry> {
         dir: dir.to_path_buf(),
         has_layouts,
         action: Action::Pack,
+        origin: Origin::Local,
     })
 }
 
 /// A built `.MOD` file the picker can unpack. The title comes from the
 /// container header, so the row reads the same as the folder it came from.
-fn mod_file_entry_for(path: &Path) -> Option<ModEntry> {
+fn mod_file_entry_for(path: &Path, origin: Origin) -> Option<ModEntry> {
     let stem = path.file_stem()?.to_string_lossy().to_string();
     let title = PakReader::open_mod(path)
         .ok()
@@ -162,6 +184,7 @@ fn mod_file_entry_for(path: &Path) -> Option<ModEntry> {
         dir: path.to_path_buf(),
         has_layouts: false,
         action: Action::Unpack,
+        origin,
     })
 }
 
@@ -188,43 +211,73 @@ fn has_layout_file(dir: &Path) -> bool {
     false
 }
 
-/// Discover work under `root`: its immediate subdirs (the "dropped into the
-/// challenger-continent folder" case) plus `root/mods/*` (the "dropped into the
-/// game folder" case). A subdir with MOD.DAT is a source to PACK; a `.MOD` file
-/// is a container to UNPACK. Deduped by path, packs first, then by title.
-fn discover_mods(root: &Path) -> Vec<ModEntry> {
+/// Mod SOURCES to pack: subdirs holding a MOD.DAT, under `root` (the "dropped
+/// into the challenger-continent folder" case) and `root/mods/*` (the "dropped
+/// into the game folder" case). Deduped by path, sorted by title.
+fn discover_pack_sources(root: &Path) -> Vec<ModEntry> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    let mut scan = |base: &Path| {
-        if let Ok(rd) = std::fs::read_dir(base) {
-            for e in rd.flatten() {
-                let p = e.path();
-                let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
-                if !seen.insert(key) {
-                    continue;
-                }
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Some(m) = mod_entry_for(&p) {
-                        out.push(m);
-                    }
-                } else if p
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("MOD"))
-                    .unwrap_or(false)
-                {
-                    if let Some(m) = mod_file_entry_for(&p) {
-                        out.push(m);
-                    }
-                }
+    for base in [root.to_path_buf(), root.join("mods")] {
+        let Ok(rd) = std::fs::read_dir(&base) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if !seen.insert(std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone())) {
+                continue;
+            }
+            if let Some(m) = mod_entry_for(&p) {
+                out.push(m);
             }
         }
-    };
-    scan(root);
-    scan(&root.join("mods"));
+    }
+    out.sort_by_key(|m| m.title.to_lowercase());
+    out
+}
+
+/// Built `.MOD` files to unpack. Three places, because that covers where a
+/// `.MOD` actually ends up: next to the exe, in `./mods`, and — the one that
+/// matters most — the game's deployed mods folder under Documents, which is
+/// exactly where `--deploy` (and this TUI's own pack runs) write to.
+/// Deduped by canonical path, so a file reachable two ways is listed once.
+fn discover_mod_files(root: &Path) -> Vec<ModEntry> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let deployed = tl2_mods_dir();
+    let places = [
+        (root.to_path_buf(), Origin::Local),
+        (root.join("mods"), Origin::Local),
+        (deployed, Origin::Deployed),
+    ];
+    for (base, origin) in places {
+        let Ok(rd) = std::fs::read_dir(&base) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let is_mod = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("MOD"))
+                .unwrap_or(false);
+            if !is_mod {
+                continue;
+            }
+            if !seen.insert(std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone())) {
+                continue;
+            }
+            if let Some(m) = mod_file_entry_for(&p, origin) {
+                out.push(m);
+            }
+        }
+    }
+    // Local files first (you are most likely to want the one you just built by
+    // hand), then the deployed set; alphabetical within each.
     out.sort_by(|a, b| {
-        (a.action == Action::Unpack, a.title.to_lowercase())
-            .cmp(&(b.action == Action::Unpack, b.title.to_lowercase()))
+        (a.origin == Origin::Deployed, a.title.to_lowercase())
+            .cmp(&(b.origin == Origin::Deployed, b.title.to_lowercase()))
     });
     out
 }
@@ -241,49 +294,48 @@ fn pause() {
 pub fn run() -> ExitCode {
     let root = app_root();
     let base = detect_base(&root);
-    let mods = discover_mods(&root);
+    let packs = discover_pack_sources(&root);
+    let unpacks = discover_mod_files(&root);
 
     // Non-interactive discovery dump (diagnostics / CI): list what the TUI would
     // show, then exit without touching the terminal.
     if std::env::var_os("TL2_MODPACK_LIST").is_some() {
         println!("root: {}", root.display());
         println!("base: {}", base.label());
-        println!("mods: {}", mods.len());
-        for m in &mods {
-            match m.action {
-                Action::Pack => println!(
-                    "  - pack   {}  [out={}.MOD]  {}",
-                    m.title,
-                    m.file_name,
-                    if m.has_layouts { "level" } else { "content" }
-                ),
-                Action::Unpack => println!(
-                    "  - unpack {}  [src={}]",
-                    m.title,
-                    m.dir.display()
-                ),
-            }
+        println!("pack sources: {}", packs.len());
+        for m in &packs {
+            println!(
+                "  - pack   {}  [out={}.MOD]  {}",
+                m.title,
+                m.file_name,
+                if m.has_layouts { "level" } else { "content" }
+            );
+        }
+        println!("mod files: {}", unpacks.len());
+        for m in &unpacks {
+            println!("  - unpack {}  [{}]  {}", m.title, m.origin.label(), m.dir.display());
         }
         return ExitCode::SUCCESS;
     }
 
-    if mods.is_empty() {
+    if packs.is_empty() && unpacks.is_empty() {
         println!("Mikuro Torchlight II Mod Packer");
         println!();
         println!("Nothing to pack or unpack under:");
         println!("  {}", root.display());
         println!("  {}", root.join("mods").display());
+        println!("  {}", tl2_mods_dir().display());
         println!();
         println!("A mod source is a folder containing MOD.DAT (and a MEDIA/ tree);");
-        println!("a built .MOD file next to this exe can be unpacked back into one.");
+        println!("a built .MOD file in any of those places can be unpacked back into one.");
         println!("Put this exe in your game folder, or in a folder of mod sources.");
         pause();
         return ExitCode::FAILURE;
     }
 
-    // Interactive app: pick mods, pack them in-app (output streams to the
+    // Interactive app: pick mods, run them in-app (output streams to the
     // Output tab, the app stays open on it when done).
-    match run_app(mods, base, root) {
+    match run_app(packs, unpacks, base, root) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("TUI error: {e}");
@@ -447,46 +499,34 @@ fn stream_lines(r: impl Read, log: &Log) {
 
 // ── ratatui selection screen ───────────────────────────────────────────────
 
-struct App {
-    mods: Vec<ModEntry>,
-    base: BaseSource,
-    root: PathBuf,
+/// Tab indices. PACK and UNPACK are independent pickers; OUTPUT is the shared
+/// run log. Ordering is deliberate — the two things you DO, then the thing you
+/// WATCH.
+const TAB_PACK: usize = 0;
+const TAB_UNPACK: usize = 1;
+const TAB_OUTPUT: usize = 2;
+const TAB_COUNT: usize = 3;
+
+/// One picker: its rows, what is ticked, and where the cursor sits. PACK and
+/// UNPACK each own one, so switching tabs never disturbs the other's selection.
+struct Pane {
+    items: Vec<ModEntry>,
     picked: Vec<bool>,
     state: ListState,
-    tab: usize, // 0 = Mods, 1 = Output
-    log: Log,
-    packing: Arc<AtomicBool>,
-    finished: Arc<AtomicBool>,
-    follow: bool, // Output tab auto-scroll to tail
-    out_scroll: u16,
 }
 
-impl App {
-    fn new(mods: Vec<ModEntry>, base: BaseSource, root: PathBuf) -> Self {
+impl Pane {
+    fn new(items: Vec<ModEntry>) -> Self {
         let mut state = ListState::default();
-        state.select(Some(0));
-        let n = mods.len();
-        App {
-            mods,
-            base,
-            root,
-            picked: vec![false; n],
-            state,
-            tab: 0,
-            log: Arc::new(Mutex::new(Vec::new())),
-            packing: Arc::new(AtomicBool::new(false)),
-            finished: Arc::new(AtomicBool::new(false)),
-            follow: true,
-            out_scroll: 0,
+        if !items.is_empty() {
+            state.select(Some(0));
         }
-    }
-
-    fn is_packing(&self) -> bool {
-        self.packing.load(Ordering::Relaxed)
+        let n = items.len();
+        Pane { items, picked: vec![false; n], state }
     }
 
     fn move_by(&mut self, delta: isize) {
-        let n = self.mods.len() as isize;
+        let n = self.items.len() as isize;
         if n == 0 {
             return;
         }
@@ -496,18 +536,24 @@ impl App {
 
     fn toggle_current(&mut self) {
         if let Some(i) = self.state.selected() {
-            self.picked[i] = !self.picked[i];
+            if i < self.picked.len() {
+                self.picked[i] = !self.picked[i];
+            }
         }
     }
 
     fn toggle_all(&mut self) {
-        let all_on = self.picked.iter().all(|&b| b);
+        let all_on = !self.picked.is_empty() && self.picked.iter().all(|&b| b);
         for b in &mut self.picked {
             *b = !all_on;
         }
     }
 
-    /// Selected indices; if none toggled, the row under the cursor.
+    fn picked_count(&self) -> usize {
+        self.picked.iter().filter(|&&b| b).count()
+    }
+
+    /// Selected indices; if none ticked, the row under the cursor.
     fn resolved(&self) -> Vec<usize> {
         let explicit: Vec<usize> = self
             .picked
@@ -521,17 +567,71 @@ impl App {
         }
         self.state.selected().into_iter().collect()
     }
+}
 
-    /// Spawn the packing worker and switch to the Output tab.
-    fn start_packing(&mut self) {
-        let picks = self.resolved();
+struct App {
+    pack: Pane,
+    unpack: Pane,
+    base: BaseSource,
+    root: PathBuf,
+    tab: usize,
+    log: Log,
+    packing: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    follow: bool, // Output tab auto-scroll to tail
+    out_scroll: u16,
+}
+
+impl App {
+    fn new(packs: Vec<ModEntry>, unpacks: Vec<ModEntry>, base: BaseSource, root: PathBuf) -> Self {
+        // Open on whichever picker actually has rows.
+        let tab = if packs.is_empty() && !unpacks.is_empty() { TAB_UNPACK } else { TAB_PACK };
+        App {
+            pack: Pane::new(packs),
+            unpack: Pane::new(unpacks),
+            base,
+            root,
+            tab,
+            log: Arc::new(Mutex::new(Vec::new())),
+            packing: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+            follow: true,
+            out_scroll: 0,
+        }
+    }
+
+    fn is_packing(&self) -> bool {
+        self.packing.load(Ordering::Relaxed)
+    }
+
+    /// The picker the current tab shows (`None` on the Output tab).
+    fn pane(&self) -> Option<&Pane> {
+        match self.tab {
+            TAB_PACK => Some(&self.pack),
+            TAB_UNPACK => Some(&self.unpack),
+            _ => None,
+        }
+    }
+
+    fn pane_mut(&mut self) -> Option<&mut Pane> {
+        match self.tab {
+            TAB_PACK => Some(&mut self.pack),
+            TAB_UNPACK => Some(&mut self.unpack),
+            _ => None,
+        }
+    }
+
+    /// Spawn the worker for the ACTIVE picker and switch to Output.
+    fn start_run(&mut self) {
+        let Some(pane) = self.pane() else { return };
+        let picks = pane.resolved();
         if picks.is_empty() {
             return;
         }
         let jobs: Vec<Job> = picks
             .iter()
             .map(|&i| {
-                let m = &self.mods[i];
+                let m = &pane.items[i];
                 Job {
                     title: m.title.clone(),
                     file_name: m.file_name.clone(),
@@ -541,7 +641,7 @@ impl App {
                 }
             })
             .collect();
-        self.tab = 1;
+        self.tab = TAB_OUTPUT;
         self.follow = true;
         self.packing.store(true, Ordering::Relaxed);
         let (base, root, log) = (self.base.clone(), self.root.clone(), self.log.clone());
@@ -554,9 +654,14 @@ impl App {
     }
 }
 
-fn run_app(mods: Vec<ModEntry>, base: BaseSource, root: PathBuf) -> std::io::Result<ExitCode> {
+fn run_app(
+    packs: Vec<ModEntry>,
+    unpacks: Vec<ModEntry>,
+    base: BaseSource,
+    root: PathBuf,
+) -> std::io::Result<ExitCode> {
     let mut terminal = ratatui::init();
-    let mut app = App::new(mods, base, root);
+    let mut app = App::new(packs, unpacks, base, root);
     let res = app_loop(&mut terminal, &mut app);
     ratatui::restore();
     res
@@ -577,14 +682,19 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
             continue;
         }
         match k.code {
-            KeyCode::Tab | KeyCode::BackTab => app.tab = 1 - app.tab,
+            KeyCode::Tab => app.tab = (app.tab + 1) % TAB_COUNT,
+            KeyCode::BackTab => app.tab = (app.tab + TAB_COUNT - 1) % TAB_COUNT,
+            // Direct tab keys: faster than cycling once there are three.
+            KeyCode::Char('1') => app.tab = TAB_PACK,
+            KeyCode::Char('2') => app.tab = TAB_UNPACK,
+            KeyCode::Char('3') => app.tab = TAB_OUTPUT,
             KeyCode::Char('q') | KeyCode::Esc => {
-                // Ignore quit while a pack is running (the child would orphan).
+                // Ignore quit while a run is going (the child would orphan).
                 if !app.is_packing() {
                     return Ok(ExitCode::SUCCESS);
                 }
             }
-            _ if app.tab == 1 => match k.code {
+            _ if app.tab == TAB_OUTPUT => match k.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.follow = false;
                     app.out_scroll = app.out_scroll.saturating_sub(1);
@@ -602,11 +712,19 @@ fn app_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<Ex
                 _ => {}
             },
             _ if !app.is_packing() => match k.code {
-                KeyCode::Up | KeyCode::Char('k') => app.move_by(-1),
-                KeyCode::Down | KeyCode::Char('j') => app.move_by(1),
-                KeyCode::Char(' ') => app.toggle_current(),
-                KeyCode::Char('a') => app.toggle_all(),
-                KeyCode::Enter => app.start_packing(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(p) = app.pane_mut() { p.move_by(-1) }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(p) = app.pane_mut() { p.move_by(1) }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(p) = app.pane_mut() { p.toggle_current() }
+                }
+                KeyCode::Char('a') => {
+                    if let Some(p) = app.pane_mut() { p.toggle_all() }
+                }
+                KeyCode::Enter => app.start_run(),
                 _ => {}
             },
             _ => {}
@@ -621,10 +739,14 @@ fn draw(f: &mut Frame, app: &App) {
         f.area(),
     );
     // 1-cell furnace-black inset so the panels sit inside a thin brand frame
-    // (editorial whitespace) instead of bleeding to the terminal edge.
+    // (editorial whitespace) instead of bleeding to the terminal edge, plus a
+    // blank row between each panel — the three blocks used to touch, which read
+    // as one boxed-in slab rather than three surfaces.
     let areas = Layout::vertical([
         Constraint::Length(3), // header / tabs
-        Constraint::Min(3),    // body (mods list or output)
+        Constraint::Length(1), // ── breathing room
+        Constraint::Min(3),    // body (picker or output)
+        Constraint::Length(1), // ── breathing room
         Constraint::Length(3), // footer
     ])
     .margin(1)
@@ -632,65 +754,147 @@ fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, areas[0], app);
     match app.tab {
-        1 => draw_output(f, areas[1], app),
-        _ => draw_list(f, areas[1], app),
+        TAB_OUTPUT => draw_output(f, areas[2], app),
+        _ => draw_list(f, areas[2], app),
     }
-    draw_footer(f, areas[2], app);
+    draw_footer(f, areas[4], app);
+}
+
+/// Panel inner padding: one column each side so text never kisses the border.
+fn panel(title: Span<'_>, border: Color) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(theme::PANEL))
+        .padding(Padding::horizontal(1))
+        .title(title)
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let tab = |on: bool, label: &'static str| {
+    // Tabs carry their own row count, so the label alone tells you whether a
+    // picker has anything in it before you switch to it.
+    let tab = |on: bool, label: &str, count: Option<usize>| {
+        let text = match count {
+            Some(n) => format!("  {label} {n}  "),
+            None => format!("  {label}  "),
+        };
         let style = if on {
             Style::default().fg(theme::BG).bg(theme::EMBER).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::FAINT)
+            Style::default().fg(theme::MUTED).bg(theme::LINE)
         };
-        Span::styled(format!(" {label} "), style)
+        Span::styled(text, style)
     };
-    let picked = app.picked.iter().filter(|&&b| b).count();
     let (status, status_style) = if app.is_packing() {
-        ("packing…".to_string(), Style::default().fg(theme::GOLD).add_modifier(Modifier::BOLD))
+        ("running…".to_string(), Style::default().fg(theme::GOLD).add_modifier(Modifier::BOLD))
     } else if app.finished.load(Ordering::Relaxed) {
         ("done".to_string(), Style::default().fg(theme::SET).add_modifier(Modifier::BOLD))
+    } else if let Some(p) = app.pane() {
+        (
+            format!("selected {}/{}", p.picked_count(), p.items.len()),
+            Style::default().fg(theme::EMBER),
+        )
     } else {
-        (format!("selected: {picked}/{}", app.mods.len()), Style::default().fg(theme::EMBER))
+        (String::new(), Style::default())
     };
+    let gap = || Span::raw("  ");
     let line = Line::from(vec![
-        tab(app.tab == 0, "Mods"),
-        Span::raw(" "),
-        tab(app.tab == 1, "Output"),
-        Span::styled("    base ", Style::default().fg(theme::MUTED)),
+        tab(app.tab == TAB_PACK, "PACK", Some(app.pack.items.len())),
+        gap(),
+        tab(app.tab == TAB_UNPACK, "UNPACK", Some(app.unpack.items.len())),
+        gap(),
+        tab(app.tab == TAB_OUTPUT, "OUTPUT", None),
+        Span::styled("     base ", Style::default().fg(theme::MUTED)),
         Span::styled(app.base.label(), Style::default().fg(theme::GOLD)),
-        Span::raw("    "),
+        Span::styled("     ", Style::default()),
         Span::styled(status, status_style),
     ]);
     let p = Paragraph::new(line)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::LINE_HI))
-                .style(Style::default().bg(theme::PANEL))
-                .title(Span::styled(
-                    " Mikuro Torchlight II Mod Packer ",
-                    Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
-                )),
-        )
+        .block(panel(
+            Span::styled(
+                " Mikuro Torchlight II Mod Packer ",
+                Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
+            ),
+            theme::LINE_HI,
+        ))
         .style(Style::default().fg(theme::TEXT).bg(theme::PANEL))
         .wrap(Wrap { trim: true });
     f.render_widget(p, area);
 }
 
 fn draw_list(f: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app
-        .mods
+    let unpacking = app.tab == TAB_UNPACK;
+    let Some(pane) = app.pane() else { return };
+    let title = Span::styled(
+        if unpacking {
+            " unpack · Space select · Enter run "
+        } else {
+            " pack · Space select · Enter run "
+        },
+        Style::default().fg(theme::MUTED),
+    );
+
+    // Empty picker: say what was looked for and where, rather than an empty box.
+    if pane.items.is_empty() {
+        let msg = if unpacking {
+            vec![
+                Line::from(Span::styled(
+                    "No .MOD files found.",
+                    Style::default().fg(theme::MUTED),
+                )),
+                Line::from(""),
+                Line::from(Span::styled("Looked in:", Style::default().fg(theme::FAINT))),
+                Line::from(Span::styled(
+                    format!("  {}", app.root.display()),
+                    Style::default().fg(theme::FAINT),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", app.root.join("mods").display()),
+                    Style::default().fg(theme::FAINT),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", tl2_mods_dir().display()),
+                    Style::default().fg(theme::FAINT),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    "No mod sources found.",
+                    Style::default().fg(theme::MUTED),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "A source is a folder holding MOD.DAT and a MEDIA/ tree.",
+                    Style::default().fg(theme::FAINT),
+                )),
+            ]
+        };
+        let p = Paragraph::new(msg)
+            .block(panel(title, theme::LINE))
+            .style(Style::default().bg(theme::PANEL));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = pane
+        .items
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let mark = if app.picked[i] { "[x] " } else { "[ ] " };
+            let on = pane.picked[i];
+            let mark = if on { "[x] " } else { "[ ] " };
             let tag = match (m.action, m.has_layouts) {
-                (Action::Unpack, _) => {
-                    Span::styled("  (.MOD → unpack)", Style::default().fg(theme::GOLD))
-                }
+                // On the unpack tab every row is a .MOD, so the useful tag is
+                // WHERE it came from, not what it is.
+                (Action::Unpack, _) => Span::styled(
+                    format!("  ({})", m.origin.label()),
+                    Style::default().fg(if m.origin == Origin::Deployed {
+                        theme::GOLD
+                    } else {
+                        theme::FAINT
+                    }),
+                ),
                 (Action::Pack, true) => {
                     Span::styled("  (level mod)", Style::default().fg(theme::MAGIC))
                 }
@@ -698,12 +902,12 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled("  (content mod)", Style::default().fg(theme::FAINT))
                 }
             };
-            let mark_style = if app.picked[i] {
+            let mark_style = if on {
                 Style::default().fg(theme::SET).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::FAINT)
             };
-            let title_style = if app.picked[i] {
+            let title_style = if on {
                 Style::default().fg(theme::TEXT)
             } else {
                 Style::default().fg(theme::MUTED)
@@ -717,16 +921,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::LINE))
-                .style(Style::default().bg(theme::PANEL))
-                .title(Span::styled(
-                    " mods · Space select · Enter pack/unpack ",
-                    Style::default().fg(theme::MUTED),
-                )),
-        )
+        .block(panel(title, theme::LINE))
         .highlight_style(
             Style::default()
                 .bg(theme::LINE_HI)
@@ -735,7 +930,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         )
         .highlight_symbol("▶ ");
 
-    let mut state = app.state.clone();
+    let mut state = pane.state.clone();
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -758,13 +953,7 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
         )
     };
     let p = Paragraph::new(log.join("\n"))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::LINE))
-                .style(Style::default().bg(theme::PANEL))
-                .title(Span::styled(title, tstyle)),
-        )
+        .block(panel(Span::styled(title, tstyle), theme::LINE))
         .style(Style::default().fg(theme::TEXT).bg(theme::PANEL))
         .scroll((scroll, 0));
     f.render_widget(p, area);
@@ -775,29 +964,36 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(s, Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD))
     };
     let sep = |s: &'static str| Span::styled(s, Style::default().fg(theme::MUTED));
-    let hint = if app.tab == 1 {
+    // Wider gaps between key/label pairs than between a key and its own label,
+    // so the eye groups them correctly instead of reading one long run.
+    let hint = if app.tab == TAB_OUTPUT {
         Line::from(vec![
             key("↑↓"),
-            sep(" scroll   "),
+            sep(" scroll    "),
             key("End"),
-            sep(" follow   "),
+            sep(" follow    "),
             key("Tab"),
-            sep(" mods   "),
+            sep(" switch    "),
+            key("1/2/3"),
+            sep(" jump    "),
             key("q"),
-            sep(if app.is_packing() { " (packing…)" } else { " quit" }),
+            sep(if app.is_packing() { " (running…)" } else { " quit" }),
         ])
     } else {
+        let run = if app.tab == TAB_UNPACK { " unpack    " } else { " pack    " };
         Line::from(vec![
             key("↑↓"),
-            sep(" move   "),
+            sep(" move    "),
             key("Space"),
-            sep(" select   "),
+            sep(" select    "),
             key("a"),
-            sep(" all   "),
+            sep(" all    "),
             key("Enter"),
-            sep(" run   "),
+            sep(run),
             key("Tab"),
-            sep(" output   "),
+            sep(" switch    "),
+            key("1/2/3"),
+            sep(" jump    "),
             key("q"),
             sep(" quit"),
         ])
@@ -807,7 +1003,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::LINE))
-                .style(Style::default().bg(theme::PANEL)),
+                .style(Style::default().bg(theme::PANEL))
+                .padding(Padding::horizontal(1)),
         )
         .style(Style::default().bg(theme::PANEL));
     f.render_widget(p, area);
@@ -841,25 +1038,32 @@ mod tests {
         // A plain folder with no MOD.DAT must be ignored.
         std::fs::create_dir_all(root.join("NotAMod").join("stuff")).unwrap();
 
-        // A built .MOD is discovered too — as an UNPACK row, listed after the
-        // pack sources. (This one is not a readable container, so the title
-        // falls back to the file stem; discovery must still offer it.)
+        // Built .MOD files are a SEPARATE list now (the UNPACK tab), not rows
+        // mixed into the pack picker. (Neither is a readable container, so the
+        // title falls back to the file stem; discovery must still offer them.)
         std::fs::write(root.join("DeltaBuilt.MOD"), b"not really a container").unwrap();
+        std::fs::write(root.join("mods").join("EpsilonBuilt.MOD"), b"nor is this").unwrap();
 
-        let mods = discover_mods(&root);
-        let titles: Vec<&str> = mods.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(
-            titles,
-            vec!["AlphaContent", "BetaLevel", "GammaNested", "DeltaBuilt"],
-            "packs first (by title), then unpacks"
-        );
-        let delta = mods.iter().find(|m| m.title == "DeltaBuilt").unwrap();
-        assert_eq!(delta.action, Action::Unpack);
-        assert!(mods.iter().filter(|m| m.action == Action::Pack).count() == 3);
-        let beta = mods.iter().find(|m| m.title == "BetaLevel").unwrap();
+        let packs = discover_pack_sources(&root);
+        let titles: Vec<&str> = packs.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["AlphaContent", "BetaLevel", "GammaNested"]);
+        assert!(packs.iter().all(|m| m.action == Action::Pack), "pack list holds only sources");
+        let beta = packs.iter().find(|m| m.title == "BetaLevel").unwrap();
         assert!(beta.has_layouts, "BetaLevel has a *.LAYOUT");
-        let alpha = mods.iter().find(|m| m.title == "AlphaContent").unwrap();
+        let alpha = packs.iter().find(|m| m.title == "AlphaContent").unwrap();
         assert!(!alpha.has_layouts, "AlphaContent has no layouts");
+
+        let unpacks = discover_mod_files(&root);
+        let names: Vec<&str> = unpacks
+            .iter()
+            .filter(|m| m.origin == Origin::Local)
+            .map(|m| m.title.as_str())
+            .collect();
+        assert_eq!(names, vec!["DeltaBuilt", "EpsilonBuilt"], "root and ./mods both scanned");
+        assert!(unpacks.iter().all(|m| m.action == Action::Unpack), "unpack list holds only .MOD");
+        // The deployed game mods folder is scanned too; whatever it holds on
+        // this machine must be tagged as such and must not collide with local.
+        assert!(unpacks.iter().filter(|m| m.origin == Origin::Local).count() == 2);
 
         // No loose MEDIA and no DATA.PAK → the always-embedded bundle tier.
         assert!(matches!(detect_base(&root), BaseSource::Bundled));
@@ -875,13 +1079,14 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mods = vec![
+        let packs = vec![
             ModEntry {
                 title: "Alpha Content".into(),
                 file_name: "ALPHA".into(),
                 dir: PathBuf::from("/x/Alpha"),
                 has_layouts: false,
                 action: Action::Pack,
+                origin: Origin::Local,
             },
             ModEntry {
                 title: "Beta Level".into(),
@@ -889,39 +1094,91 @@ mod tests {
                 dir: PathBuf::from("/x/Beta"),
                 has_layouts: true,
                 action: Action::Pack,
-            },
-            ModEntry {
-                title: "Gamma Built".into(),
-                file_name: "GAMMA".into(),
-                dir: PathBuf::from("/x/GAMMA.MOD"),
-                has_layouts: false,
-                action: Action::Unpack,
+                origin: Origin::Local,
             },
         ];
-        let mut app = App::new(mods, BaseSource::Bundled, PathBuf::from("/x"));
-        app.toggle_current(); // pick Alpha (row under cursor)
+        let unpacks = vec![ModEntry {
+            title: "Gamma Built".into(),
+            file_name: "GAMMA".into(),
+            dir: PathBuf::from("/x/GAMMA.MOD"),
+            has_layouts: false,
+            action: Action::Unpack,
+            origin: Origin::Deployed,
+        }];
+        let mut app = App::new(packs, unpacks, BaseSource::Bundled, PathBuf::from("/x"));
+        app.pack.toggle_current(); // pick Alpha (row under cursor)
 
-        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
-        // Mods tab.
+        // Layout work is visual: `TL2_TUI_DUMP=1 cargo test --bin
+        // tl2-mikuro-mod-packer renders_picker_frame -- --nocapture` prints each
+        // frame so spacing can be eyeballed without launching a terminal.
+        let dump = |label: &str, text: &str| {
+            if std::env::var_os("TL2_TUI_DUMP").is_some() {
+                eprintln!("\n──────── {label} ────────\n{text}");
+            }
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
+        // PACK tab.
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
+        dump("PACK", &text);
         assert!(text.contains("Mikuro Torchlight II Mod Packer"), "header brand");
-        assert!(text.contains("Mods") && text.contains("Output"), "tab bar");
+        for t in ["PACK", "UNPACK", "OUTPUT"] {
+            assert!(text.contains(t), "tab bar shows {t}");
+        }
+        assert!(
+            text.find("PACK").unwrap() < text.find("UNPACK").unwrap()
+                && text.find("UNPACK").unwrap() < text.find("OUTPUT").unwrap(),
+            "tab order is PACK / UNPACK / OUTPUT"
+        );
         assert!(text.contains("Alpha Content"), "mod row");
         assert!(text.contains("Beta Level"), "mod row");
         assert!(text.contains("(level mod)"), "level tag");
-        assert!(text.contains("Gamma Built") && text.contains("unpack"), "unpack row + tag");
+        assert!(!text.contains("Gamma Built"), "unpack rows are NOT in the pack picker");
         assert!(text.contains("[x]"), "selected mark");
-        assert!(text.contains("selected: 1/3"), "count");
+        assert!(text.contains("selected 1/2"), "count is per-pane");
         assert!(text.contains("Enter"), "footer hint");
 
-        // Output tab renders the (empty) log pane.
-        app.tab = 1;
+        // UNPACK tab: its own rows, its own untouched selection.
+        app.tab = TAB_UNPACK;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let un = buffer_text(terminal.backend().buffer());
+        dump("UNPACK", &un);
+        assert!(un.contains("Gamma Built"), "unpack row");
+        assert!(un.contains("game mods"), "origin tag for a deployed .MOD");
+        assert!(!un.contains("Alpha Content"), "pack rows are NOT in the unpack picker");
+        assert!(un.contains("selected 0/1"), "switching tabs kept PACK's tick to itself");
+
+        // OUTPUT tab renders the log pane.
+        app.tab = TAB_OUTPUT;
         logln(&app.log, "hello from worker");
         terminal.draw(|f| draw(f, &app)).unwrap();
         let out = buffer_text(terminal.backend().buffer());
+        dump("OUTPUT", &out);
         assert!(out.contains("Output"), "output tab title");
         assert!(out.contains("hello from worker"), "log line rendered");
+    }
+
+    /// An empty picker must say what it looked for instead of showing a blank
+    /// box — the unpack tab in particular is empty for anyone who has not built
+    /// a mod yet, and the three scanned locations are the useful answer.
+    #[test]
+    fn empty_picker_explains_itself() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("No mod sources found"), "pack empty state");
+
+        let mut app = app;
+        app.tab = TAB_UNPACK;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("No .MOD files found"), "unpack empty state");
+        assert!(text.contains("Looked in"), "and where it looked");
     }
 
     /// Regression guard: the rendered frame actually uses the Emberworks palette
@@ -932,15 +1189,16 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mods = vec![ModEntry {
+        let packs = vec![ModEntry {
             title: "Alpha".into(),
             file_name: "A".into(),
             dir: PathBuf::from("/x/A"),
             has_layouts: false,
             action: Action::Pack,
+            origin: Origin::Local,
         }];
-        let app = App::new(mods, BaseSource::Bundled, PathBuf::from("/x"));
-        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        let app = App::new(packs, Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let buf = terminal.backend().buffer();
 
