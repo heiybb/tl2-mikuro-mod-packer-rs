@@ -133,14 +133,6 @@ tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,none}] [--raw {aut
 所以"字节精确"从来就不是一个存在的目标,诚实的标尺是 native-vs-native。
 这也是只保留离线后端的原因。
 
-**真正该避免的是反过来那个坑。** 关卡 mod 的源树通常**没有** `.mpp`(它本来就是构建产物),
-这时用 `--mpp none` 打包,自定义瓦片会**完全没有走格**,玩家在上面走不动。
-只要 mod 里有 layout,就让默认的 `re` 开着。
-
-一个量级参考:线上的**挑战者大陆 组件04 里有 173 张本后端烘出来的走格** ——
-它的源树里 `.mpp` 数量是 0,所以那 173 张全是这里烘的。
-支撑上述结论的实测数据见[后文 MPP 两节](#mpp-accuracy)。
-
 ### base 数据(为什么打包需要它)
 
 有两件事光看 mod 自己算不出来:
@@ -370,8 +362,6 @@ rollingHash + mhash 自洽;唯一字节差异 = zlib 压缩流(libdeflate,Rust �
 - 原生表中的 地图拓展(242.98s)与 POE(52.72s)源副本已删除,无法复测,未计入合计。
 - MPP 口径差异:原生 = EditorRegenPathingData(字节精确);Rust = 离线 `re` 后端
   (≈99.7% cell 精确,已知天花板 —— 实际可走性已到浮点地板,见下)。
-
-<a id="mpp-accuracy"></a>
 
 ### MPP 全语料 A/B(`verify mpp-corpus`,2026-07-04)
 

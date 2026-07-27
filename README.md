@@ -154,16 +154,6 @@ is not deterministic — its region box flips between 1100 and 1125 cells from r
 run — so "byte-exact" was never a target that existed, and the honest ruler is
 native-vs-native. That is why the offline backend is the only one shipped.
 
-**The failure mode actually worth avoiding is the opposite one.** A level mod's
-source tree normally holds no `.mpp` of its own — they are build output — so packing
-it with `--mpp none` ships custom tiles with **no walk-grid at all**, and players
-cannot move on them. Leave the default on for anything with layouts.
-
-For scale: the live 挑战者大陆 component 04 ships **173 grids produced by this
-backend** — its source tree contains zero `.mpp`, so every one of them was baked
-here. The measurements behind all of this are in
-[the MPP sections below](#mpp-accuracy).
-
 ### Base data (why packing needs it)
 
 Two things a build cannot compute from the mod alone:
@@ -424,8 +414,6 @@ These 5 Rust runs used the **same source copies as the native benchmark**
 - MPP is not like-for-like: native = EditorRegenPathingData (byte-exact); Rust = the
   offline `re` backend (≈99.7% cell-accurate, a known ceiling — actual walkability is
   at the float floor, see below).
-
-<a id="mpp-accuracy"></a>
 
 ### Whole-corpus MPP A/B (`verify mpp-corpus`, 2026-07-04)
 
