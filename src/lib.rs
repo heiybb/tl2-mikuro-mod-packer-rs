@@ -21,6 +21,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod bindat;
 pub mod bindat_decompile;
+pub mod dat_keys;
 pub mod binlayout;
 pub mod binlayout_decompile;
 pub mod mpp;

@@ -14,28 +14,16 @@
 //! for unpacking a `.MOD` back to editable sources.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::LazyLock;
 
 use crate::rghash::rg_hash_str;
 
-/// hash → key/section name, built once from the embedded dictionary.
-static REVERSE: LazyLock<HashMap<u32, &'static str>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-    for line in include_str!("../data/dat_keys.txt").lines() {
-        let name = line.trim_end_matches('\r');
-        if !name.is_empty() {
-            m.entry(rg_hash_str(name)).or_insert(name);
-        }
-    }
-    m
-});
-
 /// Resolve a name hash to text, falling back to a stable `UNK_<hex>` token
-/// (valid as both a section name and a key for the DAT parsers).
+/// (valid as both a section name and a key for the DAT parsers). The decompiler itself
+/// always goes through [`name_of_hinted`]; this is the un-hinted form the tests pin.
+#[cfg(test)]
 fn name_of(hash: u32) -> String {
-    REVERSE
-        .get(&hash)
-        .map(|s| s.to_string())
+    crate::dat_keys::lookup(hash)
+        .map(|(s, _)| s.to_string())
         .unwrap_or_else(|| format!("UNK_{hash:08X}"))
 }
 
@@ -49,11 +37,23 @@ fn name_of(hash: u32) -> String {
 /// That is also how GUTS gets those names back — its interner has seen every
 /// string the editor ever loaded.
 fn name_of_hinted(hash: u32, hints: &HashMap<u32, String>, unknown: &mut BTreeSet<String>) -> String {
-    if let Some(n) = REVERSE.get(&hash) {
-        return n.to_string();
+    // Order matters. An AUTHORITATIVE dictionary hit (a name actually observed in a
+    // key position, an engine literal, a verified curated entry) outranks everything.
+    // A hint outranks the GENERIC tiers, because a hint is the basename of the very
+    // file being unpacked while `t5_basename` is a global table of every filename in
+    // the corpus -- when both answer, the specific one is right. Only then the generic
+    // tiers, and only then `UNK_`.
+    let dict = crate::dat_keys::lookup(hash);
+    if let Some((n, tier)) = dict {
+        if tier.is_authoritative() {
+            return n.to_string();
+        }
     }
     if let Some(n) = hints.get(&hash) {
         return n.clone();
+    }
+    if let Some((n, _)) = dict {
+        return n.to_string();
     }
     let n = format!("UNK_{hash:08X}");
     unknown.insert(n.clone());
@@ -200,7 +200,7 @@ pub fn decompile_bindat_reported(data: &[u8]) -> Result<Decompiled, String> {
 /// the embedded dictionary cannot reverse a hash — pass the file's own basename
 /// (and anything else you know) to recover a mod's private section names.
 pub fn decompile_bindat_hinted(data: &[u8], hints: &[&str]) -> Result<Decompiled, String> {
-    let hint_map: HashMap<u32, String> = hints
+    let mut hint_map: HashMap<u32, String> = hints
         .iter()
         .filter(|h| !h.is_empty())
         .map(|h| (rg_hash_str(h), h.to_string()))
@@ -216,6 +216,21 @@ pub fn decompile_bindat_hinted(data: &[u8], hints: &[&str]) -> Result<Decompiled
         let s = c.utf16(len)?;
         strs.insert(sid, s);
     }
+    // The file's OWN string table is the strongest hint available and it costs nothing:
+    // a key name a mod invented is very often also written somewhere as a value
+    // (`<STRING>CHILD:ENHANCER`, `<STRING>NAME:MONK FIST`). A hint can never be wrong --
+    // it is only consulted when its rghash equals the hash being named.
+    for v in strs.values() {
+        if v.is_empty() || v.len() > 64 {
+            continue;
+        }
+        hint_map.entry(rg_hash_str(v)).or_insert_with(|| v.clone());
+        let up = v.to_uppercase();
+        if up != *v {
+            hint_map.entry(rg_hash_str(&up)).or_insert(up);
+        }
+    }
+
     let mut out = String::new();
     let mut unknown = BTreeSet::new();
     while c.p < data.len() {
@@ -243,14 +258,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reverse_dictionary_has_no_collisions_and_core_keys() {
-        // Every embedded name must resolve to itself (built with .or_insert, so
-        // a collision would have silently dropped one — assert none happened).
-        let raw = include_str!("../data/dat_keys.txt");
-        let n = raw.lines().filter(|l| !l.trim().is_empty()).count();
-        assert_eq!(REVERSE.len(), n, "reverse dict has hash collisions");
+    fn reverse_dictionary_core_keys() {
         for k in ["PIECE", "TILESET", "NAME", "GUID", "COLLISIONFILE", "NEVERBAKE"] {
             assert_eq!(name_of(rg_hash_str(k)), k, "core key {k} must reverse");
+        }
+    }
+
+    /// A hint must beat a GENERIC dictionary tier but lose to an authoritative one.
+    /// Backwards, a global filename table would shadow the basename of the file that is
+    /// actually being unpacked.
+    #[test]
+    fn hint_outranks_generic_tier_only() {
+        let mut unknown = BTreeSet::new();
+        let h = rg_hash_str("NAME");
+        assert!(crate::dat_keys::lookup(h).unwrap().1.is_authoritative());
+        let mut hints = HashMap::new();
+        hints.insert(h, "NOT_THIS".to_string());
+        assert_eq!(name_of_hinted(h, &hints, &mut unknown), "NAME");
+
+        let novel = rg_hash_str("ZZ_NOT_IN_ANY_TIER_XYZZY_42");
+        if crate::dat_keys::lookup(novel).is_none() {
+            let mut h2 = HashMap::new();
+            h2.insert(novel, "FROM_HINT".to_string());
+            assert_eq!(name_of_hinted(novel, &h2, &mut unknown), "FROM_HINT");
+            assert_eq!(
+                name_of_hinted(novel, &HashMap::new(), &mut unknown),
+                format!("UNK_{novel:08X}")
+            );
         }
     }
 
@@ -267,7 +301,7 @@ mod tests {
         // to no numbered family the dictionary generates.
         const NOVEL: &str = "MIKURO_NOVEL_SECTION_QQ";
         assert!(
-            !REVERSE.contains_key(&rg_hash_str(NOVEL)),
+            crate::dat_keys::lookup(rg_hash_str(NOVEL)).is_none(),
             "test premise: {NOVEL} must be outside the dictionary"
         );
         let src = &format!(
