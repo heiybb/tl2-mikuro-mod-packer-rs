@@ -47,6 +47,9 @@ mod theme {
     pub const GOLD: Color = Color::Rgb(0xD8, 0xB2, 0x6A); // meta / in-progress
     pub const MAGIC: Color = Color::Rgb(0x6F, 0xA8, 0xFF); // tagged / level mod
     pub const SET: Color = Color::Rgb(0x7C, 0xC9, 0x6E); // ok / done / selected mark
+    /// A name the dictionary could not recover. Same warm red as the web
+    /// front-end's `.bad` class, so the two surfaces read alike.
+    pub const WARN: Color = Color::Rgb(0xE0, 0x59, 0x2E);
 }
 
 // ── UI language ────────────────────────────────────────────────────────────
@@ -1399,7 +1402,23 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::MUTED),
         )
     };
-    let p = Paragraph::new(log.join("\n"))
+    // Per-line, not one blob: a line carrying a `UNK_` placeholder is a name the
+    // dictionary could not recover, and it must stand out — the digits are load-bearing
+    // (they recompile to the original hash) and must never be hand-edited.
+    let body: Vec<Line> = log
+        .iter()
+        .map(|l| {
+            if l.contains(tl2_mikuro_mod_packer_rs::dat_keys::UNK_PREFIX) {
+                Line::styled(
+                    l.clone(),
+                    Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Line::raw(l.clone())
+            }
+        })
+        .collect();
+    let p = Paragraph::new(body)
         .block(panel_body(Span::styled(title, tstyle), theme::LINE))
         .style(Style::default().fg(theme::TEXT).bg(theme::PANEL))
         .scroll((scroll, 0));
@@ -2416,6 +2435,52 @@ mod tests {
     /// Regression guard: the rendered frame actually uses the Emberworks palette
     /// (not just that it compiles) — furnace-black frame, panel fill, ember accent
     /// and the ember-backed active tab all show up in the buffer's styles.
+    /// An unrecoverable key name has to be visually unmissable: the `UNK_<hex>` digits
+    /// recompile to the original hash, so a user who "tidies them up" silently detaches
+    /// the section from the key the engine looks for, with no error anywhere.
+    #[test]
+    fn unresolvable_hash_lines_are_red() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        app.set_lang(Lang::En);
+        app.tab = TAB_OUTPUT;
+        logln(&app.log, "  unpacked 12 files (3 DAT), 400 bytes".to_string());
+        logln(&app.log, "      UNK_9DF54BFD  (MEDIA/UNITS/ITEMS/RING.DAT)".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let mut warn_row = None;
+        let mut plain_row = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains("UNK_9DF54BFD") {
+                warn_row = Some(y);
+            } else if row.contains("unpacked 12 files") {
+                plain_row = Some(y);
+            }
+        }
+        let wy = warn_row.expect("the UNK_ line must be on screen");
+        let py = plain_row.expect("the ordinary line must be on screen");
+        let cell_at = |y: u16, needle: &str| {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            let col = row.find(needle).unwrap() as u16;
+            buf[(col, y)].style()
+        };
+        assert_eq!(
+            cell_at(wy, "UNK_").fg,
+            Some(theme::WARN),
+            "the placeholder must be painted with the warning colour"
+        );
+        assert_ne!(
+            cell_at(py, "unpacked").fg,
+            Some(theme::WARN),
+            "ordinary log lines must stay unpainted"
+        );
+    }
+
     #[test]
     fn renders_with_emberworks_palette() {
         use ratatui::backend::TestBackend;

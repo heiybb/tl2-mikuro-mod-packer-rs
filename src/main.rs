@@ -145,7 +145,10 @@ fn main() -> ExitCode {
                             "  note: {} name(s) had no dictionary entry and kept a raw-hash \
                              placeholder (do NOT edit the digits): {}",
                             d.unknown_names.len(),
-                            d.unknown_names.iter().take(8).cloned().collect::<Vec<_>>().join(" ")
+                            tl2_mikuro_mod_packer_rs::dat_keys::paint_warn(
+                                &d.unknown_names.iter().take(8).cloned().collect::<Vec<_>>().join(" "),
+                                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                            )
                         );
                     }
                     ExitCode::SUCCESS
@@ -437,8 +440,9 @@ fn run_unpack(input: &str, out_dir: &str, flags: &[String]) -> ExitCode {
                      edit the digits:",
                     rep.unknown_names.len()
                 );
+                let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
                 for n in rep.unknown_names.iter().take(10) {
-                    println!("      {n}");
+                    println!("      {}", tl2_mikuro_mod_packer_rs::dat_keys::paint_warn(n, tty));
                 }
                 if rep.unknown_names.len() > 10 {
                     println!("      … and {} more", rep.unknown_names.len() - 10);

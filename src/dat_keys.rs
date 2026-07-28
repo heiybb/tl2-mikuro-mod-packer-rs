@@ -223,6 +223,25 @@ pub fn lookup(hash: u32) -> Option<(&'static str, Tier)> {
     KEYS.get(hash)
 }
 
+/// The marker every surface agrees on for a name that could not be recovered.
+/// The TUI and the browser page both colour a line red on finding this substring,
+/// so the placeholder text itself is the contract -- no side channel to keep in sync.
+pub const UNK_PREFIX: &str = "UNK_";
+
+/// Wrap `s` in ANSI red, but ONLY when the stream is a terminal.
+///
+/// This has to be conditional. The TUI runs the CLI as a child process and pipes its
+/// stdout into a ratatui `Paragraph`, which does not interpret escape sequences -- an
+/// unconditional colour would paint `[31m` into the log as literal garbage. Piped
+/// output stays plain and the TUI colours it itself by matching [`UNK_PREFIX`].
+pub fn paint_warn(s: &str, is_tty: bool) -> String {
+    if is_tty {
+        format!("\x1b[1;31m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Number of distinct hashes the table can reverse.
 pub fn len() -> usize {
     KEYS.len()
