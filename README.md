@@ -2,11 +2,11 @@
 
 *[中文](README.zh-CN.md) · [Русский](README.ru.md)*
 
-A **`.MOD` packer and unpacker** for Torchlight 2 — a single executable, with no
+A **`.MOD` packer and unpacker** for Torchlight 2: a single executable, with no
 need for the game's editor (GUTS).
 
-- **Pack** — compile a mod source folder (`MOD.DAT` + `MEDIA/`) into a `.MOD` the game reads.
-- **Unpack** — turn a `.MOD` (or the base game's `DATA.PAK`) back into an **editable text source tree**.
+- **Pack**: compile a mod source folder (`MOD.DAT` + `MEDIA/`) into a `.MOD` the game reads.
+- **Unpack**: turn a `.MOD` (or the base game's `DATA.PAK`) back into an **editable text source tree**.
 
 All three binary formats (BINDAT / BINLAYOUT / MPP) are compilers written from
 scratch: parse text → serialise binary, never reading an existing binary, so an
@@ -19,7 +19,7 @@ The Python reference implementation `mikuro_mod_packer` is archived at GitHub
 
 > **Want the whole story?** How the container is assembled, what each of the five
 > binary formats actually is, which single hash the game validates, how the pathing
-> grid is baked — plus the real mechanism behind the classic failures (ticked in the
+> grid is baked, plus the real mechanism behind the classic failures (ticked in the
 > launcher but nothing happens / a portrait turned into some other image / players
 > can't move after a level transition):
 > **[What's Actually Inside a .MOD](https://tl2-mod.chr.moe/en/devlog/tl2-mod-packing-full-analysis/)**
@@ -27,9 +27,9 @@ The Python reference implementation `mikuro_mod_packer` is archived at GitHub
 
 ---
 
-## How fast — against the game's own editor
+## Speed against the game's own editor
 
-Building the whole 挑战者大陆 series — ten components, 173k files — takes the official
+Building the whole 挑战者大陆 series (ten components, 173k files) takes the official
 GUTS editor **983 seconds**; this packer takes **46**. Per component the speedup runs
 from 2× to 43×, and the widest gaps are exactly where the editor bakes pathing grids.
 
@@ -59,7 +59,7 @@ These 5 Rust runs used the **same source copies as the native benchmark**
 - 地图拓展 (242.98s) and POE (52.72s) appear in the native table but their source
   copies were deleted and cannot be re-measured, so they are excluded from the total.
 - MPP is not like-for-like: native = EditorRegenPathingData (byte-exact); Rust = the
-  offline `re` backend (≈99.7% cell-accurate, a known ceiling — actual walkability is
+  offline `re` backend (≈99.7% cell-accurate, a known ceiling; actual walkability is
   at the float floor; see [Are the baked walk-grids safe to ship?](#walkgrid)).
 
 ---
@@ -84,7 +84,7 @@ Three ways to drive it, depending on what you want:
 ## A walk through the interface
 
 Started with no arguments, it opens on the picker. The images below are the real
-frames the program draws, in English — the [Chinese](README.zh-CN.md) and
+frames the program draws, in English; the [Chinese](README.zh-CN.md) and
 [Russian](README.ru.md) READMEs show the same walkthrough in their own language.
 Notice what is *not* translated: mod names, paths, and every CLI flag, because
 those are what you type.
@@ -93,13 +93,13 @@ those are what you type.
 
 ![The PACK tab: two mod sources, one ticked](docs/img/tui-en-pack.png)
 
-Every folder holding `MOD.DAT` shows up here — from the exe's own folder, its
+Every folder holding `MOD.DAT` shows up here: from the exe's own folder, its
 `mods\` subfolder, and the folder itself if that is where you dropped the exe.
 `↑↓` moves, `Space` ticks, `a` ticks everything, `Enter` starts. With nothing
 ticked, `Enter` packs the row under the cursor.
 
-Each row is tagged `level mod` or `content mod`. One test decides it — does
-`MEDIA/LAYOUTS` hold any `*.LAYOUT`? — and that decides whether the pathing
+Each row is tagged `level mod` or `content mod`. One test decides it: does
+`MEDIA/LAYOUTS` hold any `*.LAYOUT`? That decides whether the pathing
 walk-grids get baked, which is the slow part of a build.
 
 ### 2 · Watch it run
@@ -108,14 +108,14 @@ walk-grids get baked, which is the slow part of a build.
 
 The view switches to OUTPUT and streams the packer's own log line by line, so a
 long build never looks like it hung. `↑↓` scrolls (which stops the auto-follow),
-`End` re-follows the tail, `c` clears the transcript, `q` quits — but not while a
+`End` re-follows the tail, `c` clears the transcript, `q` quits, but not while a
 run is going, so a child process is never orphaned.
 
 ### 3 · Unpack, the other direction
 
 ![The UNPACK tab: a local .MOD and a deployed one](docs/img/tui-en-unpack.png)
 
-`.MOD` files found next to the exe, in `.\mods`, and — the one that matters — in
+`.MOD` files found next to the exe, in `.\mods`, and (the one that matters) in
 the game's own mods folder, each row tagged `local` or `game mods` so you can tell
 your fresh build from what is installed. Output lands in `unpacked\<name>\` next
 to the exe. **The game's mods folder is never written to by an unpack**, so taking
@@ -147,13 +147,13 @@ Four things happen, in order (`convert_all`):
 Then the container is written: header + data section + manifest, plus the two
 hashes the game validates (rollingHash, manifest mhash).
 
-### Where the compiled files land — pick one
+### Where the compiled files land: pick one
 
 This is the only question `--in-place` / `--temp-copy` answer:
 
 | Flag | Behaviour |
 | --- | --- |
-| none (default) | Compile in memory — **nothing but the `.MOD` is written** |
+| none (default) | Compile in memory; **nothing but the `.MOD` is written** |
 | `--in-place` | **ALSO** leave the `.BINDAT` / `.BINLAYOUT` in your `MEDIA/` tree |
 | `--temp-copy` | Compile on disk in a throwaway copy; your folder stays clean |
 
@@ -185,12 +185,12 @@ out of context.
 `--mpp re` bakes the grids offline instead of driving the editor, and lands at
 ~99.7% of cells byte-identical to a native bake. That number counts **cosmetic**
 differences: a cell is `0` walkable, `1` wall, `255` void, and the pathfinder treats
-1 and 255 alike — both impassable. Counting only what a player can feel (1 ≡ 255),
+1 and 255 alike: both impassable. Counting only what a player can feel (1 ≡ 255),
 agreement is **99.89%**, and the worst tile measured is at the noise floor rather
 than above it: our bake differs from a native one in 0.106% of its cells, while two
 *native* bakes of that same tile differ from each other in 0.097%. The native baker
-is not deterministic — its region box flips between 1100 and 1125 cells from run to
-run — so "byte-exact" was never a target that existed, and the honest ruler is
+is not deterministic: its region box flips between 1100 and 1125 cells from run to
+run, so "byte-exact" was never a target that existed, and the honest ruler is
 native-vs-native. That is why the offline backend is the only one shipped.
 
 ### Base data (why packing needs it)
@@ -204,11 +204,11 @@ Two things a build cannot compute from the mod alone:
 So the packer needs base data, and takes the first of three tiers it finds:
 
 1. a loose `MEDIA/` next to the exe (a real extracted install)
-2. `PAKS/DATA.PAK` — or `DATA.PAK` — beside it (extracted on first use)
+2. `PAKS/DATA.PAK` (or `DATA.PAK`) beside it (extracted on first use)
 3. **the bundle baked into the exe** (always there, ~3 MB gzip)
 
 Tiers 2 and 3 unpack once into a `.tl2packer_base\` cache next to the exe and
-reuse it. **All three produce byte-identical `.MOD` output** — verified on a level mod.
+reuse it. **All three produce byte-identical `.MOD` output**, verified on a level mod.
 
 ---
 
@@ -235,10 +235,10 @@ binaries.
 tl2-mikuro-mod-packer.exe unpack <in.MOD|DATA.PAK> <out_dir> [--raw] [--no-times] [--filter <text>]
 ```
 
-- `--raw` — do not decompile; write the payloads verbatim (`.DAT` stays BINDAT).
+- `--raw`: do not decompile; write the payloads verbatim (`.DAT` stays BINDAT).
   Use it when you want to see what is really stored.
-- `--no-times` — do not restore the file timestamps from the manifest.
-- `--filter <text>` — only entries whose path contains the text (case-insensitive),
+- `--no-times`: do not restore the file timestamps from the manifest.
+- `--filter <text>`: only entries whose path contains the text (case-insensitive),
   e.g. `--filter SKILLS`.
 
 What comes out **is a mod source folder**: edit it and pack it straight back. The
@@ -253,19 +253,19 @@ It finishes by printing `note:` lines. None of them are errors, all are worth re
 | --- | --- |
 | `gameVersion 0x… is not stored in MOD.DAT` | Packing reads it from the installed `Torchlight2.exe`; MOD.DAT has no such field. To reproduce the original, set `TL2_MOD_GAMEVER=0x…` before repacking |
 | `recovered: UNK_<HEX8> -> NAME (tier)` | **A win, printed green.** That hash was NOT in the key table the game shipped with; the extended dictionary or the file's own context named it anyway. The tier says which source, so you know how much to trust it |
-| `UNK_<HEX8>` placeholder names | **Printed red.** A DAT key name nothing could reverse. It **compiles back to the same hash** (the game reads it fine), but the readable name is gone. ⚠️ Never hand-edit the digits in `UNK_` — those ARE the hash |
-| `container lists N duplicate paths` | The container listed one path more than once (common in third-party mods). The last record wins — the same result serial extraction produced |
+| `UNK_<HEX8>` placeholder names | **Printed red.** A DAT key name nothing could reverse. It **compiles back to the same hash** (the game reads it fine), but the readable name is gone. ⚠️ Never hand-edit the digits in `UNK_`: those ARE the hash |
+| `container lists N duplicate paths` | The container listed one path more than once (common in third-party mods). The last record wins, the same result serial extraction produced |
 | `BINLAYOUT flag byte is 0x36, not the usual 0x04` | Packed by some other tool. A repack writes `0x04` |
 | `will not decompile …; kept as FOO.LAYOUT.BINLAYOUT` | Decompilation failed; the payload is kept verbatim under the compiled name. A repack will not include that entry until a text source exists |
 
 ### Recovering key names the shipped table never had
 
 A BINDAT stores every key and section name **only as a 32-bit `rghash`**. Unpacking has to
-reverse that, and whatever it cannot reverse comes out as `UNK_<HEX8>` — the data survives
+reverse that, and whatever it cannot reverse comes out as `UNK_<HEX8>`. The data survives
 (the placeholder recompiles to the same hash) but the readable name is gone for good.
 
 `rghash` is `h = len(s); for c in s: h = rotl32(h,5) ^ ord(c)`, which is **affine over
-GF(2)** — no non-linearity at all. Inverting it is Gaussian elimination, microseconds. That
+GF(2)**, with no non-linearity at all. Inverting it is Gaussian elimination, microseconds. That
 is not the problem: a 32-bit output has ~1e15 preimages for a 16-character name, so the
 answer set explodes long before compute runs out. The only thing that helps is knowing which
 preimage is plausible, so the table is built by **harvesting names from everywhere they are
@@ -281,7 +281,7 @@ still written down**, merged highest-trust first:
 | `t6_dat_value` | 181,057 | identifier-shaped DAT values and path segments |
 
 465,361 entries, shipped as a 1.31 MB front-coded + DEFLATE blob. A false positive costs
-almost nothing — a name nobody looks up is dead weight — so the net is cast as wide as it
+almost nothing (a name nobody looks up is dead weight), so the net is cast as wide as it
 usefully goes. The one real cost is a hash **slot** being occupied: a key present in no tier
 can land on a taken slot and come back with a plausible wrong name instead of an honest
 `UNK_`, which nothing flags. At this size that is 1 in 9,229. Tiers are therefore merged
@@ -293,7 +293,7 @@ its whole string table** are tried as hints. A mod's section name is very often 
 filename (`UNITTYPES/MERCHANT_PETS.DAT` opens `[MERCHANT_PETS]`), and a key it invented is
 often also written somewhere as a value.
 
-**Measured** on 20 third-party mods (熊猫联纵 ×10 + 绿洲联盟 ×10 — 98,008 files, 54,985 DATs):
+**Measured** on 20 third-party mods (熊猫联纵 ×10 + 绿洲联盟 ×10; 98,008 files, 54,985 DATs):
 
 | dictionary | `UNK_` lines | distinct hashes |
 | --- | ---: | ---: |
@@ -303,17 +303,17 @@ often also written somewhere as a value.
 
 Zero regressions and zero wrong names: every hash the old table could reverse still reverses
 to the **identical** name (pinned by `dat_keys::superset_of_legacy_dat_keys`). 8 of the 10
-names newly recovered came from tier 2 — `DISALLOWPVP`, `FORCEPVP`, `UNITREWARD`,
-`REPEATABLE`, `MAXCREATE`, `MINCREATE` — keys the engine reads but no shipped DAT ever
+names newly recovered came from tier 2: `DISALLOWPVP`, `FORCEPVP`, `UNITREWARD`,
+`REPEATABLE`, `MAXCREATE`, `MINCREATE`, keys the engine reads but no shipped DAT ever
 writes, so they exist nowhere except inside the exe.
 
-Two things worth knowing about what is left:
+Two things about what is left:
 
 - `UNK_00000000` is `rghash("")`. It is an **empty key name** in the source data, not a lost
-  one — no dictionary will ever "fix" it.
+  one, and no dictionary will ever "fix" it.
 - Not every number is a hash. One mod source carried 147 numeric key names, 64 of which
   formed dense consecutive runs (`800332576/577/578/579…`). `rghash` is uniform over 2^32,
-  so consecutive values cannot be hashes — those are sequential IDs, and any tool that
+  so consecutive values cannot be hashes: those are sequential IDs, and any tool that
   "recovers" a name for them is inventing one.
 
 `TL2_LEGACY_DAT_KEYS=1` rebuilds the table from the old flat list, so the two can be diffed
@@ -329,7 +329,7 @@ on real data rather than taken on faith. `NO_COLOR` / `FORCE_COLOR` override the
 
 Three things the FIRST round cannot restore (inherent to the mechanism, not lost
 data): **gameVersion** (see the table above), **key names outside the dictionary**
-(emitted as `UNK_`), and the **manifest order of generated `MEDIA/*.RAW` files** —
+(emitted as `UNK_`), and the **manifest order of generated `MEDIA/*.RAW` files**:
 they have no source file, so the packer appends them after the disk scan; once an
 unpack puts them on disk, the next scan picks them up in sorted position. The entry
 set, the contents and both validation hashes are unaffected, and **from the second
@@ -344,7 +344,7 @@ off. The field is informational only.
 1. Manifest paths go through `sanitize_rel`: `..`, drive letters and backslashes are
    refused, so **a write outside the target directory is impossible**.
 2. **A payload that will not decompile is never written under the source name.** It
-   is parked as `FOO.LAYOUT.BINLAYOUT` with a warning — because `content_for` would
+   is parked as `FOO.LAYOUT.BINLAYOUT` with a warning, because `content_for` would
    otherwise "compile" whatever sits at the source name, and compiling a binary blob
    as layout text yields an **empty 8-byte layout**. That is what silently destroying
    data would look like.
@@ -365,9 +365,9 @@ you get a ratatui interface with four tabs:
 
 Where it looks:
 
-- PACK — the exe's own folder and its `mods\` subfolder (**that first folder counts
+- PACK: the exe's own folder and its `mods\` subfolder (**that first folder counts
   itself** if it holds `MOD.DAT`)
-- UNPACK — those two, **plus the game's mods folder** (where `--deploy` writes, so
+- UNPACK: those two, **plus the game's mods folder** (where `--deploy` writes, so
   anything you just packed is right there)
 
 Where it writes: PACK always deploys to the game's mods folder. UNPACK writes to
@@ -430,15 +430,15 @@ plain-text dump for reading.
 | MPP (offline `re`) | 13 varied tiles (cliff / landmark alias / boss / town / exit / cave / vault) vs the reference implementation | **13/13 identical** |
 | Whole `.MOD` | Three real mods, container against container | header + manifest structurally identical; **all 1856 / 35864 / 11205 files match on decompressed content, CRC and ftime**; rollingHash + mhash self-consistent (the two hashes the game checks) |
 | BINLAYOUT decompile fixed point | our BINLAYOUT → decompile → recompile | **8986/8986 byte-exact** |
-| same, fed the shipped binaries | shipped BINLAYOUT → decompile → compile | **8967/8986** — the 19 failures are **exactly** the 19 that compilation itself cannot reproduce; the decompiler adds none |
+| same, fed the shipped binaries | shipped BINLAYOUT → decompile → compile | **8967/8986**; the 19 failures are **exactly** the 19 that compilation itself cannot reproduce; the decompiler adds none |
 
 The only byte difference between our container and another packer's is the zlib
-stream — a different compression backend. The game inflates, so it cannot tell, and
+stream, a different compression backend. The game inflates, so it cannot tell, and
 our output is slightly smaller.
 
 `src/binlayout_decompile.rs` reaches a fixed point because BINLAYOUT carries its full
 structure: the **same embedded schema** (`data/binlayout_schema.json`) names everything
-in reverse — unlike BINDAT, which needs a dictionary. What the compiler discards is
+in reverse, unlike BINDAT, which needs a dictionary. What the compiler discards is
 rebuilt to the standard of "recompiles byte-identically": `PARENTID` is recovered from
 the object tree; a Group's `CHOICE` / `GAME MODE` / `TAG` / `RANDOMIZATION` / `NUMBER` /
 `NO TAG FOUND` / `LEVEL UNIQUE` / `ACTIVE|DEACTIVE THEMES` exist only in the trailing
@@ -446,12 +446,13 @@ datagroup and are paired back onto the Group objects structurally; defaults
 (RANDOMIZATION 1, NUMBER 1, no TAG) are emitted only when they are not the default.
 Default orientations (`FORWARD` Z==1 / `RIGHT` X==1 / `UP` Y==1, skipped at compile
 time) are **deliberately not restored**: shipped `.LAYOUT` sources do not write them
-either, and inventing one **asserts** an orientation to every downstream reader — a
+either, and inventing one **asserts** an orientation to every downstream reader; a
 reader deriving `UP` from `FORWARD × RIGHT` would take the fake value.
 
-## Throughput — the whole 挑战者大陆 series, 10 components (2026-07-04, 16 cores, warm cache, outputs verified file-by-file)
+## Throughput: the whole 挑战者大陆 series, 10 components (2026-07-04, 16 cores, warm cache, outputs verified file-by-file)
 
-After optimisation (parallel Pass-A content reads + the libdeflate backend + concurrent, lock-free RAW):
+Content reads run parallel in Pass A, compression goes through libdeflate, and RAW
+indexes build concurrently and lock-free:
 
 | Component | Time | .MOD size |
 | --- | --: | --: |
@@ -477,9 +478,8 @@ Windows per-file open cost (tens of thousands of small AFFIXES/SKILLS reads, alr
 spread across threads; Defender's real-time scanning is the main driver) and the MPP
 classifier (~1.9s per 170 tiles). There is little more to win.
 
-On the unpack side: going parallel took it from 1.02 to 0.23 ms/file — 87764 files in
-19.7s instead of 82.4s (**4.2×**) — with output verified byte-identical to the serial
-build (content + mtime, across 73848 files).
+Unpacking runs at 0.23 ms/file: 87764 files in 19.7s, parallel across cores, with
+output verified byte-identical to a serial run (content + mtime, across 73848 files).
 
 ### Whole-corpus MPP A/B (`verify mpp-corpus`, 2026-07-04)
 
@@ -492,7 +492,7 @@ cells: 95,773,940   diff: 276,839   accuracy: 99.7109%
 ```
 
 **The diff count matches the reference implementation's archived figure
-(276839 / 95.7M) cell for cell** — an operation-by-operation port of the f64 kernels
+(276839 / 95.7M) cell for cell**: an operation-by-operation port of the f64 kernels
 is cell-for-cell equivalent at corpus scale. These **vanilla-corpus** numbers are unaffected by the mod fixes below
 (vanilla has no Layout-Link-to-base and no clone chains; both fixes change zero bytes
 across all 1293 tiles).
@@ -513,7 +513,7 @@ from 挑战者「通用素材01」. That found and fixed two **MPP+LAYOUT couple
    (`compute_world` extends the existing Room-Piece clone bookkeeping to `Layout Link*`).
    DARKWOODS has Layout-Link-under-Layout-Link clone chains (local scale 2–3 per level,
    ×72); the native bake's box of 1100×1626 **requires** no inheritance (full inheritance
-   blows it up to 1776×2050) — established from native output, not by trial and error.
+   blows it up to 1776×2050), established from native output, not by trial and error.
 
 Result across the 17 tiles vs a fresh native bake: **99.7232% → 99.7718%** aggregate,
 12 improved and 0 regressed (DARKWOODS −3171, DARKWOODS111 −3167, NETHER −2426); the
@@ -533,9 +533,8 @@ native-vs-native, not byte-exact-vs-one-bake.**
 "de-cosmetically" (1 ≡ 255): **99.8934%** aggregate, THECROSSING **99.8938% ≈ its own
 float floor of 0.0965%**. About half of the raw-byte residual is 255↔1 void/wall
 labelling inside tree clusters (no effect on walkability within a tile, only at tile
-seams); the rest is irreducible float. **In other words the grid's real walkability
-already matches native to the float floor — which is why the offline backend is the
-only one kept.**
+seams); the rest is irreducible float. **The grid's real walkability already matches
+native to the float floor.**
 
 The vanilla-corpus residual above (276839 cells) is the same information-theoretic
 floor (native cliff/multichunk nondeterminism + per-instance runtime nocollide); no
@@ -562,18 +561,18 @@ element (an inherited +14 stride bug; POSITION is always element 0); binlayout s
 the first occurrence of `NAME` / `CHOICE` / `GAME MODE` as object metadata; TAGS.DAT's
 empty root-name hash. See the comments in each file.
 
-For the browser build — the same code shared via `#[path]`, compiled to wasm — see
+For the browser build (the same code shared via `#[path]`, compiled to wasm), see
 `../tl2-mikuro-mod-packer-wasm`.
 
 ## BINDAT's two id modes (since 2026-07-04)
 
-After a function-by-function audit of EditorGuts, `sub_10289A40`'s **exact** behaviour
-is implemented as well, alongside the per-file hash id mode:
+BINDAT string ids can be assigned two ways. The second reproduces `sub_10289A40`'s
+exact behaviour, established by a function-by-function audit of EditorGuts:
 
-- **hash mode (default)** — string id = per-file RGHash + linear probing. No corpus
+- **hash mode (default)**: string id = per-file RGHash + linear probing. No corpus
   dependency, naturally parallel, and verified against how the game parses the in-file
   table. Production packing uses this.
-- **corpus mode** — string id comes from a rebuilt dictionary of the GUTS global interner
+- **corpus mode**: string id comes from a rebuilt dictionary of the GUTS global interner
   (`data/bindat_string_dict.bin`, 154627 strings, 0.05s to load once); unknown strings get
   `max_id+1, +2, …` in **first-appearance order**, matching `sub_1023E9F0`'s `id = counter++`.
   Output is **15976/16084 byte-exact** against the shipped base game (the 108 differences are known shipped
