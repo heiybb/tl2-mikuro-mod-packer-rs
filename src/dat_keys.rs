@@ -228,6 +228,20 @@ pub fn lookup(hash: u32) -> Option<(&'static str, Tier)> {
 /// so the placeholder text itself is the contract -- no side channel to keep in sync.
 pub const UNK_PREFIX: &str = "UNK_";
 
+/// The matching marker for a name that WAS unknown to the shipped table and got solved
+/// anyway. Same contract as [`UNK_PREFIX`]: the text is the signal, every surface just
+/// matches it. Deliberately free of `UNK_` so the red rule can never fire on a green line.
+pub const RECOVERED_MARKER: &str = "recovered:";
+
+/// Wrap `s` in ANSI green under the same TTY rule as [`paint_warn`].
+pub fn paint_ok(s: &str, is_tty: bool) -> String {
+    if is_tty {
+        format!("\x1b[1;32m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Wrap `s` in ANSI red, but ONLY when the stream is a terminal.
 ///
 /// This has to be conditional. The TUI runs the CLI as a child process and pipes its

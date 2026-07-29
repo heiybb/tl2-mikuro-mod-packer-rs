@@ -86,6 +86,9 @@ pub struct Report {
     pub bytes: u64,
     /// `UNK_<HEX8>` placeholders emitted, with the files that produced them.
     pub unknown_names: BTreeSet<String>,
+    /// Names that a source beyond the shipped table supplied — each one WAS an
+    /// unknown hash and got solved. Reported so a success is visible, not silent.
+    pub recovered_names: BTreeSet<String>,
     /// Entries the original pack SYNTHESIZED rather than read from disk (a
     /// FILETIME of 0 is the packer's marker) — the generated `.RAW` indexes.
     /// They are written out like everything else; this just names them, since
@@ -105,6 +108,7 @@ impl Report {
         self.copied += o.copied;
         self.bytes += o.bytes;
         self.unknown_names.extend(o.unknown_names);
+        self.recovered_names.extend(o.recovered_names);
         self.generated.extend(o.generated);
         self.warnings.extend(o.warnings);
     }
@@ -349,6 +353,9 @@ fn convert(path: &str, payload: Vec<u8>, opt: &Options, report: &mut Report) -> 
             Ok(d) => {
                 for n in &d.unknown_names {
                     report.unknown_names.insert(format!("{n}  ({path})"));
+                }
+                for n in &d.recovered_names {
+                    report.recovered_names.insert(n.clone());
                 }
                 return Converted {
                     bytes: bindat_decompile::to_dat_bytes(&d.text),

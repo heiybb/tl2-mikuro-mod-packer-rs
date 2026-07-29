@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::dat_keys::RECOVERED_MARKER;
 use crate::rghash::rg_hash_str;
 
 /// Resolve a name hash to text, falling back to a stable `UNK_<hex>` token
@@ -36,23 +37,39 @@ fn name_of(hash: u32) -> String {
 /// which the embedded dictionary cannot know but the caller can simply hand over.
 /// That is also how GUTS gets those names back — its interner has seen every
 /// string the editor ever loaded.
-fn name_of_hinted(hash: u32, hints: &HashMap<u32, String>, unknown: &mut BTreeSet<String>) -> String {
+fn name_of_hinted(
+    hash: u32,
+    hints: &HashMap<u32, String>,
+    unknown: &mut BTreeSet<String>,
+    recovered: &mut BTreeSet<String>,
+) -> String {
     // Order matters. An AUTHORITATIVE dictionary hit (a name actually observed in a
     // key position, an engine literal, a verified curated entry) outranks everything.
     // A hint outranks the GENERIC tiers, because a hint is the basename of the very
     // file being unpacked while `t5_basename` is a global table of every filename in
     // the corpus -- when both answer, the specific one is right. Only then the generic
     // tiers, and only then `UNK_`.
+    //
+    // Anything named by a source OTHER than t1 would have been a bare `UNK_<hex>` under
+    // the dictionary this replaced. That is worth saying out loud rather than silently
+    // succeeding: it tells a reader which names came from the shipped table and which
+    // ones the extended table (or the file's own context) rescued -- and, if one of them
+    // ever looks wrong, exactly which tier to distrust.
     let dict = crate::dat_keys::lookup(hash);
     if let Some((n, tier)) = dict {
         if tier.is_authoritative() {
+            if tier != crate::dat_keys::Tier::DatKey {
+                recovered.insert(format!("{RECOVERED_MARKER} {n}  (0x{hash:08X}, {})", tier.as_str()));
+            }
             return n.to_string();
         }
     }
     if let Some(n) = hints.get(&hash) {
+        recovered.insert(format!("{RECOVERED_MARKER} {n}  (0x{hash:08X}, hint)"));
         return n.clone();
     }
-    if let Some((n, _)) = dict {
+    if let Some((n, tier)) = dict {
+        recovered.insert(format!("{RECOVERED_MARKER} {n}  (0x{hash:08X}, {})", tier.as_str()));
         return n.to_string();
     }
     let n = format!("UNK_{hash:08X}");
@@ -126,12 +143,13 @@ fn emit_node(
     strs: &HashMap<u32, String>,
     out: &mut String,
     unknown: &mut BTreeSet<String>,
+    recovered: &mut BTreeSet<String>,
     hints: &HashMap<u32, String>,
     depth: usize,
 ) -> Result<(), String> {
     let name_hash = c.u32()?;
     let nprops = c.u32()?;
-    let name = name_of_hinted(name_hash, hints, unknown);
+    let name = name_of_hinted(name_hash, hints, unknown, recovered);
     // Tab-indent by nesting depth — that is what the shipped .DAT sources and
     // GUTS' own unpacker emit, so a decompiled file reads (and diffs) like one.
     let indent = |out: &mut String, d: usize| {
@@ -164,14 +182,14 @@ fn emit_node(
         out.push('<');
         out.push_str(type_tag(tc));
         out.push('>');
-        out.push_str(&name_of_hinted(key_hash, hints, unknown));
+        out.push_str(&name_of_hinted(key_hash, hints, unknown, recovered));
         out.push(':');
         out.push_str(&value);
         out.push_str("\r\n");
     }
     let nchildren = c.u32()?;
     for _ in 0..nchildren {
-        emit_node(c, strs, out, unknown, hints, depth + 1)?;
+        emit_node(c, strs, out, unknown, recovered, hints, depth + 1)?;
     }
     indent(out, depth);
     out.push_str("[/");
@@ -187,6 +205,11 @@ pub struct Decompiled {
     /// the ORIGINAL hash (`bindat::raw_hash_token`), so the data survives — but
     /// the readable name is gone, which is worth telling the user about.
     pub unknown_names: BTreeSet<String>,
+    /// Names a source BEYOND the shipped `t1` table supplied — an engine literal, the
+    /// curated dictionary, a generated family, a filename, a value, or the file's own
+    /// context. Each of these was a `UNK_<hex>` before; surfacing them is how a reader
+    /// sees that a hash WAS unknown and got solved, instead of it just quietly working.
+    pub recovered_names: BTreeSet<String>,
 }
 
 /// Decompile BINDAT bytes into the text `.DAT` they were compiled from
@@ -233,10 +256,11 @@ pub fn decompile_bindat_hinted(data: &[u8], hints: &[&str]) -> Result<Decompiled
 
     let mut out = String::new();
     let mut unknown = BTreeSet::new();
+    let mut recovered = BTreeSet::new();
     while c.p < data.len() {
-        emit_node(&mut c, &strs, &mut out, &mut unknown, &hint_map, 0)?;
+        emit_node(&mut c, &strs, &mut out, &mut unknown, &mut recovered, &hint_map, 0)?;
     }
-    Ok(Decompiled { text: out, unknown_names: unknown })
+    Ok(Decompiled { text: out, unknown_names: unknown, recovered_names: recovered })
 }
 
 /// Decompile BINDAT bytes into the text `.DAT` they were compiled from.
@@ -270,19 +294,24 @@ mod tests {
     #[test]
     fn hint_outranks_generic_tier_only() {
         let mut unknown = BTreeSet::new();
+        let mut rec = BTreeSet::new();
         let h = rg_hash_str("NAME");
         assert!(crate::dat_keys::lookup(h).unwrap().1.is_authoritative());
         let mut hints = HashMap::new();
         hints.insert(h, "NOT_THIS".to_string());
-        assert_eq!(name_of_hinted(h, &hints, &mut unknown), "NAME");
+        assert_eq!(name_of_hinted(h, &hints, &mut unknown, &mut rec), "NAME");
 
         let novel = rg_hash_str("ZZ_NOT_IN_ANY_TIER_XYZZY_42");
         if crate::dat_keys::lookup(novel).is_none() {
             let mut h2 = HashMap::new();
             h2.insert(novel, "FROM_HINT".to_string());
-            assert_eq!(name_of_hinted(novel, &h2, &mut unknown), "FROM_HINT");
+            assert_eq!(name_of_hinted(novel, &h2, &mut unknown, &mut rec), "FROM_HINT");
+            assert!(
+                rec.iter().any(|r| r.contains("FROM_HINT") && r.contains("hint")),
+                "a hint rescue must be reported as recovered, not pass silently: {rec:?}"
+            );
             assert_eq!(
-                name_of_hinted(novel, &HashMap::new(), &mut unknown),
+                name_of_hinted(novel, &HashMap::new(), &mut unknown, &mut rec),
                 format!("UNK_{novel:08X}")
             );
         }

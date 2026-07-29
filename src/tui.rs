@@ -1413,6 +1413,10 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
                     l.clone(),
                     Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
                 )
+            } else if l.contains(tl2_mikuro_mod_packer_rs::dat_keys::RECOVERED_MARKER) {
+                // A hash that WAS unknown and got named anyway. Green so the win reads as
+                // a win — otherwise the user only ever sees the failures.
+                Line::styled(l.clone(), Style::default().fg(theme::SET))
             } else {
                 Line::raw(l.clone())
             }
@@ -2439,7 +2443,7 @@ mod tests {
     /// recompile to the original hash, so a user who "tidies them up" silently detaches
     /// the section from the key the engine looks for, with no error anywhere.
     #[test]
-    fn unresolvable_hash_lines_are_red() {
+    fn unresolved_is_red_and_recovered_is_green() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -2448,6 +2452,7 @@ mod tests {
         app.tab = TAB_OUTPUT;
         logln(&app.log, "  unpacked 12 files (3 DAT), 400 bytes".to_string());
         logln(&app.log, "      UNK_9DF54BFD  (MEDIA/UNITS/ITEMS/RING.DAT)".to_string());
+        logln(&app.log, "      recovered: DISALLOWPVP  (0x9843BB8B, t2_engine_ident)".to_string());
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -2478,6 +2483,27 @@ mod tests {
             cell_at(py, "unpacked").fg,
             Some(theme::WARN),
             "ordinary log lines must stay unpainted"
+        );
+
+        // The other half of the story: a hash that WAS unknown and got named anyway is
+        // green, so the user reads "this was solved" rather than only ever seeing losses.
+        let mut rec_row = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains("recovered:") {
+                rec_row = Some(y);
+            }
+        }
+        let ry = rec_row.expect("the recovered line must be on screen");
+        assert_eq!(
+            cell_at(ry, "recovered:").fg,
+            Some(theme::SET),
+            "a recovered name must be painted green"
+        );
+        assert_ne!(
+            cell_at(ry, "recovered:").fg,
+            Some(theme::WARN),
+            "and must never be mistaken for a failure"
         );
     }
 

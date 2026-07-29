@@ -140,6 +140,16 @@ fn main() -> ExitCode {
                     };
                     std::fs::write(&argv[2], bytes).expect("write output");
                     println!("decompiled → {}", argv[2]);
+                    if !d.recovered_names.is_empty() {
+                        println!(
+                            "  recovered {} name(s) beyond the shipped key table: {}",
+                            d.recovered_names.len(),
+                            tl2_mikuro_mod_packer_rs::dat_keys::paint_ok(
+                                &d.recovered_names.iter().take(6).cloned().collect::<Vec<_>>().join(" "),
+                                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                            )
+                        );
+                    }
                     if !d.unknown_names.is_empty() {
                         println!(
                             "  note: {} name(s) had no dictionary entry and kept a raw-hash \
@@ -433,6 +443,19 @@ fn run_unpack(input: &str, out_dir: &str, flags: &[String]) -> ExitCode {
             println!("    BINDAT→DAT:       {} files", rep.dats);
             println!("    BINLAYOUT→LAYOUT: {} files", rep.layouts);
             println!("    copied verbatim:  {} files", rep.copied);
+            if !rep.recovered_names.is_empty() {
+                let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+                println!(
+                    "  {} name(s) were NOT in the shipped key table and were recovered                      from the extended dictionary or the file's own context:",
+                    rep.recovered_names.len()
+                );
+                for n in rep.recovered_names.iter().take(10) {
+                    println!("      {}", tl2_mikuro_mod_packer_rs::dat_keys::paint_ok(n, tty));
+                }
+                if rep.recovered_names.len() > 10 {
+                    println!("      … and {} more", rep.recovered_names.len() - 10);
+                }
+            }
             if !rep.unknown_names.is_empty() {
                 println!(
                     "  {} DAT name(s) had no dictionary entry and kept a raw-hash \
