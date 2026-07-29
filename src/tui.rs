@@ -1408,15 +1408,16 @@ fn draw_output(f: &mut Frame, area: Rect, app: &App) {
     let body: Vec<Line> = log
         .iter()
         .map(|l| {
-            if l.contains(tl2_mikuro_mod_packer_rs::dat_keys::UNK_PREFIX) {
+            // RECOVERED is tested FIRST: a recovered line now spells out the placeholder
+            // it would have been (`recovered: UNK_091C391F -> SECOND_STAT`), so it does
+            // contain `UNK_`. Checking the failure rule first would paint every rescue red.
+            if l.contains(tl2_mikuro_mod_packer_rs::dat_keys::RECOVERED_MARKER) {
+                Line::styled(l.clone(), Style::default().fg(theme::SET))
+            } else if l.contains(tl2_mikuro_mod_packer_rs::dat_keys::UNK_PREFIX) {
                 Line::styled(
                     l.clone(),
                     Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
                 )
-            } else if l.contains(tl2_mikuro_mod_packer_rs::dat_keys::RECOVERED_MARKER) {
-                // A hash that WAS unknown and got named anyway. Green so the win reads as
-                // a win — otherwise the user only ever sees the failures.
-                Line::styled(l.clone(), Style::default().fg(theme::SET))
             } else {
                 Line::raw(l.clone())
             }
@@ -2452,7 +2453,7 @@ mod tests {
         app.tab = TAB_OUTPUT;
         logln(&app.log, "  unpacked 12 files (3 DAT), 400 bytes".to_string());
         logln(&app.log, "      UNK_9DF54BFD  (MEDIA/UNITS/ITEMS/RING.DAT)".to_string());
-        logln(&app.log, "      recovered: DISALLOWPVP  (0x9843BB8B, t2_engine_ident)".to_string());
+        logln(&app.log, "      recovered: UNK_9843BB8B -> DISALLOWPVP  (t2_engine_ident)".to_string());
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let buf = terminal.backend().buffer();

@@ -146,7 +146,7 @@ fn main() -> ExitCode {
                             d.recovered_names.len(),
                             tl2_mikuro_mod_packer_rs::dat_keys::paint_ok(
                                 &d.recovered_names.iter().take(6).cloned().collect::<Vec<_>>().join(" "),
-                                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                                tl2_mikuro_mod_packer_rs::dat_keys::want_color(std::io::IsTerminal::is_terminal(&std::io::stdout())),
                             )
                         );
                     }
@@ -157,7 +157,7 @@ fn main() -> ExitCode {
                             d.unknown_names.len(),
                             tl2_mikuro_mod_packer_rs::dat_keys::paint_warn(
                                 &d.unknown_names.iter().take(8).cloned().collect::<Vec<_>>().join(" "),
-                                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                                tl2_mikuro_mod_packer_rs::dat_keys::want_color(std::io::IsTerminal::is_terminal(&std::io::stdout())),
                             )
                         );
                     }
@@ -444,7 +444,7 @@ fn run_unpack(input: &str, out_dir: &str, flags: &[String]) -> ExitCode {
             println!("    BINLAYOUT→LAYOUT: {} files", rep.layouts);
             println!("    copied verbatim:  {} files", rep.copied);
             if !rep.recovered_names.is_empty() {
-                let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+                let tty = tl2_mikuro_mod_packer_rs::dat_keys::want_color(std::io::IsTerminal::is_terminal(&std::io::stdout()));
                 println!(
                     "  {} name(s) were NOT in the shipped key table and were recovered                      from the extended dictionary or the file's own context:",
                     rep.recovered_names.len()
@@ -463,7 +463,7 @@ fn run_unpack(input: &str, out_dir: &str, flags: &[String]) -> ExitCode {
                      edit the digits:",
                     rep.unknown_names.len()
                 );
-                let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+                let tty = tl2_mikuro_mod_packer_rs::dat_keys::want_color(std::io::IsTerminal::is_terminal(&std::io::stdout()));
                 for n in rep.unknown_names.iter().take(10) {
                     println!("      {}", tl2_mikuro_mod_packer_rs::dat_keys::paint_warn(n, tty));
                 }

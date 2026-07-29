@@ -242,12 +242,30 @@ pub fn paint_ok(s: &str, is_tty: bool) -> String {
     }
 }
 
-/// Wrap `s` in ANSI red, but ONLY when the stream is a terminal.
+/// Whether ANSI colour may be emitted, given what `IsTerminal` claimed.
 ///
-/// This has to be conditional. The TUI runs the CLI as a child process and pipes its
-/// stdout into a ratatui `Paragraph`, which does not interpret escape sequences -- an
-/// unconditional colour would paint `[31m` into the log as literal garbage. Piped
-/// output stays plain and the TUI colours it itself by matching [`UNK_PREFIX`].
+/// `is_tty` alone is NOT enough, and the failure is not hypothetical: under
+/// `browser_wasi_shim` a `ConsoleStdout` fd reports as a character device, so the native
+/// check answers "terminal" inside a browser tab and the escape codes land in the page
+/// as literal `[1;32m` / `[0m` text. On wasm the answer is therefore no by default --
+/// every wasm consumer either colours the line itself by matching the markers, or is a
+/// CLI runner where plain text is fine. `FORCE_COLOR` overrides; `NO_COLOR` (the de-facto
+/// standard) wins over everything.
+pub fn want_color(is_tty: bool) -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var_os("FORCE_COLOR").is_some() {
+        return true;
+    }
+    !cfg!(target_family = "wasm") && is_tty
+}
+
+/// Wrap `s` in ANSI red. Callers pass [`want_color`], never a bare `is_terminal()`.
+///
+/// The conditionality matters on the native side too: the TUI runs the CLI as a child
+/// process and pipes its stdout into a ratatui `Paragraph`, which does not interpret
+/// escape sequences. Piped output stays plain and each surface colours it itself.
 pub fn paint_warn(s: &str, is_tty: bool) -> String {
     if is_tty {
         format!("\x1b[1;31m{s}\x1b[0m")
@@ -264,6 +282,17 @@ pub fn len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The colour policy, not the call sites. This regressed in the browser: a
+    /// `ConsoleStdout` fd under browser_wasi_shim reports as a character device, the
+    /// native `IsTerminal` said "terminal", and `[1;32m` was printed into the page.
+    #[test]
+    fn colour_is_off_on_wasm_because_is_terminal_lies_there() {
+        if cfg!(target_family = "wasm") {
+            assert!(!want_color(true), "wasm must never emit ANSI on its own");
+        }
+        assert!(!want_color(false), "a non-tty is never coloured");
+    }
 
     #[test]
     fn decodes_and_reverses() {

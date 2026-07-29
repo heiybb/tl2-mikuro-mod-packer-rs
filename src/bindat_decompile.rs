@@ -59,17 +59,17 @@ fn name_of_hinted(
     if let Some((n, tier)) = dict {
         if tier.is_authoritative() {
             if tier != crate::dat_keys::Tier::DatKey {
-                recovered.insert(format!("{RECOVERED_MARKER} {n}  (0x{hash:08X}, {})", tier.as_str()));
+                recovered.insert(format!("{RECOVERED_MARKER} UNK_{hash:08X} -> {n}  ({})", tier.as_str()));
             }
             return n.to_string();
         }
     }
     if let Some(n) = hints.get(&hash) {
-        recovered.insert(format!("{RECOVERED_MARKER} {n}  (0x{hash:08X}, hint)"));
+        recovered.insert(format!("{RECOVERED_MARKER} UNK_{hash:08X} -> {n}  (hint)"));
         return n.clone();
     }
     if let Some((n, tier)) = dict {
-        recovered.insert(format!("{RECOVERED_MARKER} {n}  (0x{hash:08X}, {})", tier.as_str()));
+        recovered.insert(format!("{RECOVERED_MARKER} UNK_{hash:08X} -> {n}  ({})", tier.as_str()));
         return n.to_string();
     }
     let n = format!("UNK_{hash:08X}");
