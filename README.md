@@ -252,10 +252,72 @@ It finishes by printing `note:` lines. None of them are errors, all are worth re
 | Note | What it means / what to do |
 | --- | --- |
 | `gameVersion 0x… is not stored in MOD.DAT` | Packing reads it from the installed `Torchlight2.exe`; MOD.DAT has no such field. To reproduce the original, set `TL2_MOD_GAMEVER=0x…` before repacking |
-| `UNK_<HEX8>` placeholder names | A DAT key name the dictionary could not reverse. It **compiles back to the same hash** (the game reads it fine), but the readable name is gone. ⚠️ Never hand-edit the digits in `UNK_` — those ARE the hash |
+| `recovered: UNK_<HEX8> -> NAME (tier)` | **A win, printed green.** That hash was NOT in the key table the game shipped with; the extended dictionary or the file's own context named it anyway. The tier says which source, so you know how much to trust it |
+| `UNK_<HEX8>` placeholder names | **Printed red.** A DAT key name nothing could reverse. It **compiles back to the same hash** (the game reads it fine), but the readable name is gone. ⚠️ Never hand-edit the digits in `UNK_` — those ARE the hash |
 | `container lists N duplicate paths` | The container listed one path more than once (common in third-party mods). The last record wins — the same result serial extraction produced |
 | `BINLAYOUT flag byte is 0x36, not the usual 0x04` | Packed by some other tool. A repack writes `0x04` |
 | `will not decompile …; kept as FOO.LAYOUT.BINLAYOUT` | Decompilation failed; the payload is kept verbatim under the compiled name. A repack will not include that entry until a text source exists |
+
+### Recovering key names the shipped table never had
+
+A BINDAT stores every key and section name **only as a 32-bit `rghash`**. Unpacking has to
+reverse that, and whatever it cannot reverse comes out as `UNK_<HEX8>` — the data survives
+(the placeholder recompiles to the same hash) but the readable name is gone for good.
+
+`rghash` is `h = len(s); for c in s: h = rotl32(h,5) ^ ord(c)`, which is **affine over
+GF(2)** — no non-linearity at all. Inverting it is Gaussian elimination, microseconds. That
+is not the problem: a 32-bit output has ~1e15 preimages for a 16-character name, so the
+answer set explodes long before compute runs out. The only thing that helps is knowing which
+preimage is plausible, so the table is built by **harvesting names from everywhere they are
+still written down**, merged highest-trust first:
+
+| tier | entries | source |
+| --- | ---: | --- |
+| `t1_dat_key` | 3,335 | names seen in real DAT key/section positions |
+| `t2_engine_ident` | 3,122 | UTF-16 literals inside `Torchlight2.exe` / `EditorGuts.dll` |
+| `t3_ext_dict` | 6,122 | curated `hash:text` dictionaries, every line re-verified |
+| `t4_enum_family` | 48,248 | generated `NAME_0..300` families |
+| `t5_basename` | 223,477 | every shipped and mod file's basename |
+| `t6_dat_value` | 181,057 | identifier-shaped DAT values and path segments |
+
+465,361 entries, shipped as a 1.31 MB front-coded + DEFLATE blob. A false positive costs
+almost nothing — a name nobody looks up is dead weight — so the net is cast as wide as it
+usefully goes. The one real cost is a hash **slot** being occupied: a key present in no tier
+can land on a taken slot and come back with a plausible wrong name instead of an honest
+`UNK_`, which nothing flags. At this size that is 1 in 9,229. Tiers are therefore merged
+most-trustworthy-first so a junk string can never displace a confirmed key, and the tier
+travels with every hit.
+
+On top of the table, the file being unpacked supplies its own context: its basename **and
+its whole string table** are tried as hints. A mod's section name is very often its own
+filename (`UNITTYPES/MERCHANT_PETS.DAT` opens `[MERCHANT_PETS]`), and a key it invented is
+often also written somewhere as a value.
+
+**Measured** on 20 third-party mods (熊猫联纵 ×10 + 绿洲联盟 ×10 — 98,008 files, 54,985 DATs):
+
+| dictionary | `UNK_` lines | distinct hashes |
+| --- | ---: | ---: |
+| the old 2,888-entry table | 972 | 125 |
+| tiered 465k | 879 | 115 |
+| + the file's own string table as hints | **871** | **111** |
+
+Zero regressions and zero wrong names: every hash the old table could reverse still reverses
+to the **identical** name (pinned by `dat_keys::superset_of_legacy_dat_keys`). 8 of the 10
+names newly recovered came from tier 2 — `DISALLOWPVP`, `FORCEPVP`, `UNITREWARD`,
+`REPEATABLE`, `MAXCREATE`, `MINCREATE` — keys the engine reads but no shipped DAT ever
+writes, so they exist nowhere except inside the exe.
+
+Two things worth knowing about what is left:
+
+- `UNK_00000000` is `rghash("")`. It is an **empty key name** in the source data, not a lost
+  one — no dictionary will ever "fix" it.
+- Not every number is a hash. One mod source carried 147 numeric key names, 64 of which
+  formed dense consecutive runs (`800332576/577/578/579…`). `rghash` is uniform over 2^32,
+  so consecutive values cannot be hashes — those are sequential IDs, and any tool that
+  "recovers" a name for them is inventing one.
+
+`TL2_LEGACY_DAT_KEYS=1` rebuilds the table from the old flat list, so the two can be diffed
+on real data rather than taken on faith. `NO_COLOR` / `FORCE_COLOR` override the red/green.
 
 ### Round-tripping (unpack → repack)
 
