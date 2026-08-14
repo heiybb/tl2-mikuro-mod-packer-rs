@@ -11,8 +11,9 @@ need for the game's editor (GUTS).
 All three binary formats (BINDAT / BINLAYOUT / MPP) are compilers written from
 scratch: parse text → serialise binary, never reading an existing binary, so an
 edit to the text always compiles correctly. The two decompilers are the same in
-reverse. Base game data is baked into the exe as ~3 MB of gzip, so **you can pack
-without the game installed**.
+reverse. Building a **content** mod needs nothing but the mod itself; a **level**
+mod also needs the base game's data, and the exe asks you where that is rather
+than guessing (see [Base data](#base-data-why-packing-needs-it)).
 
 The Python reference implementation `mikuro_mod_packer` is archived at GitHub
 `heiybb/TL2-RE`; this repository is the only implementation in use.
@@ -97,6 +98,10 @@ Every folder holding `MOD.DAT` shows up here: from the exe's own folder, its
 `mods\` subfolder, and the folder itself if that is where you dropped the exe.
 `↑↓` moves, `Space` ticks, `a` ticks everything, `Enter` starts. With nothing
 ticked, `Enter` packs the row under the cursor.
+
+Both lists are scanned when the program starts. `r` scans again, so a mod folder
+you just added, or a `.MOD` you just built or deleted, shows up without a
+restart. Your ticks and the cursor stay where they were.
 
 Each row is tagged `level mod` or `content mod`. One test decides it: does
 `MEDIA/LAYOUTS` hold any `*.LAYOUT`? That decides whether the pathing
@@ -201,14 +206,45 @@ Two things a build cannot compute from the mod alone:
   `UNITS` templates to read `UNITTYPE` / `LEVEL` / `RARITY` / `CREATEAS`.
 - `.MPP` walk-grids are baked against the base game's **collision geometry**.
 
-So the packer needs base data, and takes the first of three tiers it finds:
+So the packer needs base data. It takes the first of these it finds:
 
 1. a loose `MEDIA/` next to the exe (a real extracted install)
 2. `PAKS/DATA.PAK` (or `DATA.PAK`) beside it (extracted on first use)
-3. **the bundle baked into the exe** (always there, ~3 MB gzip)
+3. `TL2_MEDIA_DIR`, if you set it
+4. the tree you picked last time, remembered in `.tl2packer_base_dir`
 
-Tiers 2 and 3 unpack once into a `.tl2packer_base\` cache next to the exe and
-reuse it. **All three produce byte-identical `.MOD` output**, verified on a level mod.
+**If none of those answer, it asks.** It does not search your machine on its own,
+and there is no silent last-resort tier. Both of those used to exist, and both were
+wrong for the same reason: a machine can hold several usable trees — a Steam install
+and a separately unpacked reference tree, say — and picking the wrong one is
+invisible. Layout Links into the base game resolve to nothing, the geometry behind
+them never reaches the walk-grid, the compile still succeeds, and the only symptom
+is ground a player can see and cannot walk on.
+
+When it asks you can let it search — results are listed for you to choose from,
+never applied on their own — or paste a path: the `MEDIA` folder, the game folder,
+or a `DATA.PAK`. A path holding no game data is rejected on the spot. Your answer is
+remembered, re-checked on each launch, and `b` changes it.
+
+Tier 2 extracts once into a `.tl2packer_base\` cache next to the exe (~2.6 s, 102 MB)
+and reuses it. A `.version` stamp inside decides that: bump it and every existing
+cache is rebuilt, which is what stops a cache being reused after it needs to hold
+something new. The stamp is written last, so a run that dies partway leaves an
+unstamped cache the next run rebuilds rather than trusts.
+
+Tiers 1-3 produce byte-identical `.MOD` output — verified across a 173-layout mod,
+173/173 grids identical.
+
+A pack also reports Layout Links whose target it could not resolve:
+
+```
+WARNING: 12 Layout Link(s) across 4 target(s) did not resolve — their geometry is
+         MISSING from the baked grids
+           6 x MEDIA/LEVELSETS/PROPS/EXIT_CHALLENGE.LAYOUT
+```
+
+A handful means dangling references in the mod. Thousands means the base tree is the
+wrong one, or is missing its `.LAYOUT` files.
 
 ---
 
@@ -370,12 +406,16 @@ Where it looks:
 - UNPACK: those two, **plus the game's mods folder** (where `--deploy` writes, so
   anything you just packed is right there)
 
+Both are scanned at startup and again whenever you press `r`, which is what picks
+up a mod folder you added or a `.MOD` you built while the picker was open.
+
 Where it writes: PACK always deploys to the game's mods folder. UNPACK writes to
 `unpacked\<name>\` next to the exe and **never touches the game's mods folder**, so
 unpacking something you have installed is safe.
 
-Keys: `↑↓` move · `Space` select · `a` all · `Enter` run · `Tab` / `1`-`4` switch tab ·
-`?` help · `l` language · `c` clear the log (OUTPUT) · `q` or `Ctrl+C` quit.
+Keys: `↑↓` move · `Space` select · `a` all · `Enter` run · `r` rescan ·
+`b` base game data · `Tab` / `1`-`4` switch tab · `?` help · `l` language ·
+`c` clear the log (OUTPUT) · `q` or `Ctrl+C` quit.
 
 The UI language follows the system language (English / Chinese / Russian);
 `TL2_LANG=en|zh|ru` overrides it, and `l` cycles it live. To fix wording or add a
@@ -392,8 +432,7 @@ tl2-mikuro-mod-packer.exe compile-layout   <in.LAYOUT>    <out.BINLAYOUT>
 tl2-mikuro-mod-packer.exe compile-mpp      <in.LAYOUT>    <out.mpp> [--media <MEDIA>] [--fallback <base MEDIA>]
 tl2-mikuro-mod-packer.exe decompile-dat    <in.BINDAT>    <out.DAT>  [--utf8]
 tl2-mikuro-mod-packer.exe decompile-layout <in.BINLAYOUT> <out.LAYOUT>
-tl2-mikuro-mod-packer.exe extract-base     <DATA.PAK>     <out_dir>   # base LEVELSETS + collision meshes
-tl2-mikuro-mod-packer.exe unpack-base      <out_dir>                  # the embedded base bundle; no install needed
+tl2-mikuro-mod-packer.exe extract-base     <DATA.PAK>     <out_dir>   # base LEVELSETS DATs + collision meshes + link layouts
 
 verify.exe binlayout|binlayout-roundtrip|bindat|raw|mpp|mpp-corpus <media_dir> ...
 verify.exe unpack <mod.MOD>     # unpack → repack → compare every entry's content
@@ -411,7 +450,7 @@ plain-text dump for reading.
 
 | Variable | Effect |
 | --- | --- |
-| `TL2_MEDIA_DIR` | Base game MEDIA path (default `E:\Torchlight 2\MEDIA`) |
+| `TL2_MEDIA_DIR` | Base game MEDIA path. **No default** — unset, the TUI asks and the CLI refuses to bake pathing rather than guess (`--mpp none` packs without it) |
 | `TL2_MOD_GAMEVER` | Override the header's gameVersion (used when round-tripping an unpack) |
 | `TL2_LANG` | TUI language: `en` / `zh` / `ru` |
 | `MIKURO_TIMING` | Print per-phase timings |

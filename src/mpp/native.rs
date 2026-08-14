@@ -5,9 +5,9 @@
 //! per-cell classification is embarrassingly parallel and rayon-parallelized
 //! per row (the enclosure pass stays sequential — it cascades).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use rayon::prelude::*;
 
@@ -68,7 +68,7 @@ pub fn timing_report() -> String {
 /// NEVERBAKE is still force-baked by the editor (SetMesh @0x1023116b sets the
 /// effective-BAKE byte piece[+0x191]=1) — but its nocollide submeshes never wall,
 /// so emitting ONLY the non-nop (real-collision) submeshes reproduces the grid.
-fn neverbake_floor_enabled() -> bool {
+pub fn neverbake_floor_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("MPP_NEVERBAKE_FLOOR").map(|v| v == "1").unwrap_or(true)
@@ -140,8 +140,85 @@ pub fn in_backdrop_group(layout: &Layout, obj_idx: usize, _weighted: bool) -> bo
     walk_ancestors(layout, obj, 16, |o| {
         let choice = o.props.get("CHOICE").map(|s| !s.trim().is_empty()).unwrap_or(false);
         let nonempty = |k: &str| o.props.get(k).map(|s| !s.trim().is_empty()).unwrap_or(false);
-        choice || nonempty("ACTIVE THEMES") || nonempty("DEACTIVE THEMES")
+        choice
+            || nonempty("ACTIVE THEMES")
+            || nonempty("DEACTIVE THEMES")
+            || extra_backdrop_keys().iter().any(|k| nonempty(k))
     })
+}
+
+/// A/B hook for the remaining `sub_1022FF80` string members.
+///
+/// Decompiled (0x1022FF80): walk the parent chain; `dynamic_cast<CRandomGroup>`; hit
+/// if `[+280] != 0` (the CHOICE/weight count), or any of FIVE wstring members at
+/// +372/+400/+428/+456/+484 is non-empty (getters sub_100B6570/65A0/65D0/6600/6630),
+/// or the byte at `[+602]` is set; else recurse to the parent. We cover CHOICE and
+/// the two THEMES keys here, and TAG via `link_under_feature_tagged_group`.
+///
+/// The remaining candidates were tested and NONE helps (baseline 1275/1293 shipped
+/// headers): RANDOMIZATION 1275, NUMBER 1275, DYNAMIC 1275, VISIBLE 1274,
+/// GAME MODE 1273, all five together 1272. So the header residual is not a missing
+/// key here. Hook kept so the next candidate is one env var away.
+fn extra_backdrop_keys() -> &'static [String] {
+    static V: OnceLock<Vec<String>> = OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var("MPP_BACKDROP_KEYS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_uppercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// R47 — a piece under an explicitly hidden group (`<BOOL>VISIBLE:false`) does not
+/// contribute to the region box, but ONLY when it was reached through a Layout Link.
+///
+/// A hidden group inside a linked prop layout is an authoring alternative the editor
+/// never instantiates — e.g. `Group "broken" {VISIBLE=false}` holding the smashed
+/// variant of `Z2DESERT_PROPS/CAVE_BRAZIER.LAYOUT`, parked wherever the artist left
+/// it. A hidden group in the tile's OWN layout is just a viewport toggle and still
+/// bakes. That asymmetry is not a guess; it is what the corpus says.
+///
+/// Note the test is `== false`, NOT "the property is present": `VISIBLE=true` groups
+/// are normal, and a presence-only test scores WORSE (1274 vs 1276).
+///
+/// Evidence (1293 shipped headers, baseline 1276 with R46 on):
+///   link-scoped   **1279**, zero regressions, accuracy unchanged, loses-a-side 0/1279
+///   any ancestor   1275  (fixes the same 3, breaks 4)
+///   parent only    1275
+///   direct only    1272
+/// and the three it fixes — ACT2_CAVES/1X1EXIT_W/1X1_EXIT_W_JT_A,
+/// MAINMENUS/…/MAINMENU_TOWN1_JT, PHASE_BEAST_ROOMS/ACT2Z1/PHASEBEAST_A2Z1_JT_A —
+/// all go to `header MATCHES`, not merely "closer".
+///
+/// The load-bearing cross-check: with the (disproved) R45 BAKE box gate forced ON,
+/// enabling this changes NOTHING (1288 -> 1288). So these 3 are a strict SUBSET of
+/// what R45 was masking — R45 was excluding them for being `BAKE:false` when the real
+/// reason is that they are hidden, two properties that correlate because a hidden
+/// "broken" alternate is naturally also BAKE:false. That is mechanism, not score.
+///
+/// NOT confirmed in the disassembly: the .LAYOUT property table is looked up
+/// indirectly (no xref to the wide "VISIBLE" literal), and the link instantiator
+/// `sub_10206F70` is 61k chars of pseudocode. To confirm, find where a hidden group
+/// suppresses instantiation there. Kill-switch / A/B:
+/// `MPP_HIDDEN_GATE=0|any|parent|direct`.
+pub fn under_hidden_group(layout: &Layout, obj_idx: usize, depth: usize) -> bool {
+    let obj = &layout.objects[obj_idx];
+    walk_ancestors(layout, obj, depth, |o| {
+        o.props
+            .get("VISIBLE")
+            .map(|v| v.trim().eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    })
+}
+
+pub fn hidden_gate_mode() -> &'static str {
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| std::env::var("MPP_HIDDEN_GATE").unwrap_or_else(|_| "link".into()))
+        .as_str()
 }
 
 /// Any ancestor group carrying a non-empty TAG or ACTIVE THEMES => the object
@@ -492,8 +569,89 @@ fn data_override_world(piece_idx: usize, sub: &Layout, data_map: &HashMap<String
 
 // ── collision gather (mirrors native.gather) ──────────────────────────────
 
+/// Diagnostic: where did the triangles under a given spot come from?
+///
+/// The region box and the triangle gather do NOT admit the same pieces (links are
+/// gated differently), so a tile can have floor where its box hull says nothing. When
+/// a cell is walkable and you cannot see why, this names the piece. Off unless
+/// `MPP_TRI_TRACE=1`; single-layout diagnostics only (the collector is global).
+#[derive(Clone, Debug)]
+pub struct TriSource {
+    /// `<INTEGER64>ID` of the Room Piece in the .LAYOUT, so a finding can be edited.
+    pub id: String,
+    pub scale: (f64, f64, f64),
+    pub piece: String,
+    pub mesh: String,
+    pub via: String,
+    pub nop: bool,
+    pub n_tris: usize,
+    pub minx: f64,
+    pub maxx: f64,
+    pub minz: f64,
+    pub maxz: f64,
+}
+
+static TRI_TRACE: Mutex<Vec<TriSource>> = Mutex::new(Vec::new());
+static TRI_VIA: Mutex<String> = Mutex::new(String::new());
+
+/// Layout Link targets that could not be resolved to a file, by `LAYOUT FILE`
+/// value and how many links wanted it.
+static LINK_MISSES: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+/// Record a link whose target file was not found in the mod tree or the base.
+///
+/// The bake skips such a link and keeps going, which is the right runtime
+/// behaviour but a terrible thing to do quietly: every piece behind the link —
+/// including floor — vanishes from the grid, and the only visible result is
+/// terrain the player can see and cannot walk on. This turns that into a number
+/// the pack can print. A base tree missing its `.LAYOUT` files cost one tile
+/// 5010 cells of walkable ground before anything reported it.
+pub fn link_miss_record(layout_file: &str) {
+    if layout_file.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = LINK_MISSES.lock() {
+        *g.entry(layout_file.replace('\\', "/")).or_insert(0) += 1;
+    }
+}
+
+/// Take and clear the unresolved-link tally, most-wanted first.
+pub fn link_miss_report() -> Vec<(String, usize)> {
+    let map = LINK_MISSES.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+    let mut v: Vec<(String, usize)> = map.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
+pub fn tri_trace_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("MPP_TRI_TRACE").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Label applied to subsequent `emit_piece` calls (the Layout Link chain).
+pub fn tri_trace_set_via(via: &str) {
+    if tri_trace_enabled() {
+        if let Ok(mut g) = TRI_VIA.lock() {
+            *g = via.to_string();
+        }
+    }
+}
+
+pub fn tri_trace_take() -> Vec<TriSource> {
+    TRI_TRACE.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+}
+
+/// Diagnostic A/B for the triangle side of the `COLLISION ENABLED` gate, mirroring
+/// `MPP_BOX_CE_GATE` on the box side. Off means "pretend every piece is enabled",
+/// which answers whether a void region would fill in if the flag were flipped back.
+/// The gate is RE-confirmed (@0x10203b62) — this exists to measure, not to relax.
+fn ce_tri_gate_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MPP_TRI_CE_GATE").map(|v| v != "0").unwrap_or(true))
+}
+
 fn emit_piece(piece: &LayoutObject, m: &Mat4, ctx: &Context, tris: &mut Vec<Tri>) {
-    if !collision_enabled(piece) {
+    if ce_tri_gate_enabled() && !collision_enabled(piece) {
         return;
     }
     let pd = match ctx.guid.get(&piece.guid) {
@@ -521,6 +679,7 @@ fn emit_piece(piece: &LayoutObject, m: &Mat4, ctx: &Context, tris: &mut Vec<Tri>
         Some(m) => m,
         None => return,
     };
+    let trace_from = if tri_trace_enabled() { tris.len() } else { usize::MAX };
     let pnop = piece.nopath;
     let mm = &m.m;
     for sm in &mesh.submeshes {
@@ -582,6 +741,7 @@ fn emit_piece(piece: &LayoutObject, m: &Mat4, ctx: &Context, tris: &mut Vec<Tri>
             }
         }
     }
+    tri_trace_record(trace_from, tris, pd, piece, coll);
 }
 
 /// Also follow non-tile baked links nested inside tile-alias sub-layouts.
@@ -611,11 +771,17 @@ fn emit_prop_links(lay: &Layout, world0: Option<&Mat4>, ctx: &Context, tris: &mu
         let lf = o.props.get("LAYOUT FILE").map(String::as_str).unwrap_or("");
         let sub_path = match resolve_link_layout(&ctx.media_dir, lf, ctx.fallback_dir.as_deref()) {
             Some(p) => p,
-            None => continue,
+            None => {
+                link_miss_record(lf);
+                continue;
+            }
         };
         let sub_arc = match ctx.get_layout(&sub_path) {
             Some(s) => s,
-            None => continue,
+            None => {
+                link_miss_record(lf);
+                continue;
+            }
         };
         let sub: &Layout = sub_arc.as_ref();
         let lw = o.world; // NOT scale-stripped here (mirrors Python)
@@ -667,7 +833,10 @@ fn follow_tile_links(
         let lf = o.props.get("LAYOUT FILE").map(String::as_str).unwrap_or("");
         let sp = match resolve_link_layout(&ctx.media_dir, lf, ctx.fallback_dir.as_deref()) {
             Some(p) => p,
-            None => continue,
+            None => {
+                link_miss_record(lf);
+                continue;
+            }
         };
         let key = sp.to_string_lossy().to_lowercase();
         if visited.contains(&key) {
@@ -725,6 +894,49 @@ pub fn gather(layout: &Layout, ctx: &Context, assemble_links: bool) -> Vec<Tri> 
     }
 
     tris
+}
+
+/// Summarise the triangles `emit_piece` just appended, for `MPP_TRI_TRACE`.
+fn tri_trace_record(
+    from: usize,
+    tris: &[Tri],
+    pd: &super::dat::PieceDef,
+    obj: &LayoutObject,
+    mesh: &str,
+) {
+    if from == usize::MAX || from >= tris.len() {
+        return;
+    }
+    let mut mnx = f64::INFINITY;
+    let mut mxx = f64::NEG_INFINITY;
+    let mut mnz = f64::INFINITY;
+    let mut mxz = f64::NEG_INFINITY;
+    let mut nop = false;
+    for t in &tris[from..] {
+        for p in [t.a, t.b, t.c] {
+            mnx = mnx.min(p[0]);
+            mxx = mxx.max(p[0]);
+            mnz = mnz.min(p[2]);
+            mxz = mxz.max(p[2]);
+        }
+        nop |= t.nop;
+    }
+    let via = TRI_VIA.lock().map(|g| g.clone()).unwrap_or_default();
+    if let Ok(mut g) = TRI_TRACE.lock() {
+        g.push(TriSource {
+            id: obj.props.get("ID").cloned().unwrap_or_default(),
+            scale: (obj.scale.x, obj.scale.y, obj.scale.z),
+            piece: if pd.name.is_empty() { "<unnamed>".into() } else { pd.name.clone() },
+            mesh: mesh.rsplit('/').next().unwrap_or(mesh).to_string(),
+            via,
+            nop,
+            n_tris: tris.len() - from,
+            minx: mnx,
+            maxx: mxx,
+            minz: mnz,
+            maxz: mxz,
+        });
+    }
 }
 
 // ── enclosure pass ─────────────────────────────────────────────────────────
@@ -1108,4 +1320,72 @@ pub fn build_grid_fast(
     enclosure_pass(&mut grid, gw, gh);
     add_nanos(&T_ENCLOSURE, t0);
     grid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Build `piece -> group(props)` and return the layout plus the piece index.
+    fn nest(chain: Vec<Vec<(&str, &str)>>) -> (Layout, usize) {
+        let mut objects = Vec::new();
+        let mut by_id = HashMap::new();
+        // outermost first so parents exist; ids are "0", "1", ...
+        for (i, props) in chain.iter().enumerate() {
+            let mut o = LayoutObject {
+                descriptor: "Group".into(),
+                name: format!("g{i}"),
+                ..Default::default()
+            };
+            o.props.insert("ID".into(), i.to_string());
+            if i > 0 {
+                o.props.insert("PARENTID".into(), (i - 1).to_string());
+            }
+            for (k, v) in props {
+                o.props.insert((*k).to_string(), (*v).to_string());
+            }
+            by_id.insert(i.to_string(), objects.len());
+            objects.push(o);
+        }
+        let pi = objects.len();
+        let mut piece = LayoutObject {
+            descriptor: "Room Piece".into(),
+            ..Default::default()
+        };
+        piece
+            .props
+            .insert("PARENTID".into(), (chain.len() - 1).to_string());
+        objects.push(piece);
+        (Layout { objects, by_id }, pi)
+    }
+
+    /// R47. The predicate is `VISIBLE == false`, NOT "the property is present" —
+    /// `VISIBLE=true` groups are ordinary, and treating presence as hidden scored
+    /// worse on the shipped corpus (1274 vs 1276).
+    #[test]
+    fn hidden_group_means_visible_false_not_merely_present() {
+        let (l, pi) = nest(vec![vec![("VISIBLE", "false")]]);
+        assert!(under_hidden_group(&l, pi, 16));
+
+        let (l, pi) = nest(vec![vec![("VISIBLE", "true")]]);
+        assert!(!under_hidden_group(&l, pi, 16), "VISIBLE=true is not hidden");
+
+        let (l, pi) = nest(vec![vec![("TAG", "x")]]);
+        assert!(!under_hidden_group(&l, pi, 16), "no VISIBLE key is not hidden");
+
+        // case/whitespace as the property actually appears
+        let (l, pi) = nest(vec![vec![("VISIBLE", " False ")]]);
+        assert!(under_hidden_group(&l, pi, 16));
+    }
+
+    /// Depth matters: `parent`-only scoping scored 1275 vs 1279 for the full walk,
+    /// so the walk must reach beyond the immediate parent.
+    #[test]
+    fn hidden_group_is_found_further_up_the_chain() {
+        let chain = vec![vec![("VISIBLE", "false")], vec![], vec![]];
+        let (l, pi) = nest(chain);
+        assert!(under_hidden_group(&l, pi, 16), "should find it 3 levels up");
+        assert!(!under_hidden_group(&l, pi, 1), "depth 1 sees only the parent");
+    }
 }

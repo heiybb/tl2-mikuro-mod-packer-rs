@@ -17,13 +17,13 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use tl2_mikuro_mod_packer_rs::pak::PakReader;
@@ -280,15 +280,57 @@ impl Origin {
 }
 
 /// Where the base game MEDIA can come from, in priority order.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum BaseSource {
     /// A loose `MEDIA/` folder next to the exe (already extracted).
     LooseMedia(PathBuf),
     /// `PAKS/DATA.PAK` next to the exe — targeted extraction (Phase 2).
     DataPak(PathBuf),
-    /// Embedded base bundle — always available (baked into the exe), the base
-    /// tier used when neither loose MEDIA nor DATA.PAK is present.
-    Bundled,
+    /// Nothing beside the exe, no `TL2_MEDIA_DIR`, and nothing remembered. The
+    /// user has to choose: let the packer look for an install, or name a path.
+    Unresolved,
+}
+
+/// Where the chosen base is remembered, next to the exe.
+///
+/// One line: the path the user picked. Kept beside the cache rather than in the
+/// registry or a profile dir so that a copied tool folder carries its own answer
+/// — and so deleting the folder forgets it, which is what someone clearing up
+/// expects.
+fn base_pref_file(root: &Path) -> PathBuf {
+    root.join(".tl2packer_base_dir")
+}
+
+/// The remembered choice, if it still points at usable game data.
+///
+/// Re-validated on every launch rather than trusted: an install can be moved or
+/// uninstalled, and silently baking against a path that no longer holds what it
+/// used to is the failure this whole area keeps producing. A stale entry is
+/// treated as no answer, so the user gets asked again.
+fn load_base_pref(root: &Path) -> Option<BaseSource> {
+    let raw = std::fs::read_to_string(base_pref_file(root)).ok()?;
+    let p = PathBuf::from(raw.trim());
+    if p.as_os_str().is_empty() {
+        return None;
+    }
+    if p.is_dir() && p.join("LEVELSETS").is_dir() {
+        return Some(BaseSource::LooseMedia(p));
+    }
+    if p.is_file() {
+        return Some(BaseSource::DataPak(p));
+    }
+    None
+}
+
+/// Remember a choice the user made. Env-var and next-to-the-exe sources are not
+/// written back — they are already stated somewhere the user controls, and
+/// recording a copy of them would go stale on its own.
+fn save_base_pref(root: &Path, base: &BaseSource) {
+    let p = match base {
+        BaseSource::LooseMedia(p) | BaseSource::DataPak(p) => p,
+        BaseSource::Unresolved => return,
+    };
+    let _ = std::fs::write(base_pref_file(root), p.display().to_string());
 }
 
 impl BaseSource {
@@ -297,7 +339,7 @@ impl BaseSource {
         match self {
             BaseSource::LooseMedia(p) => format!("loose MEDIA ({})", p.display()),
             BaseSource::DataPak(p) => format!("DATA.PAK ({})", p.display()),
-            BaseSource::Bundled => "bundled base (embedded)".to_string(),
+            BaseSource::Unresolved => "not set — choose one before packing levels".to_string(),
         }
     }
 
@@ -307,8 +349,12 @@ impl BaseSource {
         match self {
             BaseSource::LooseMedia(_) => "loose MEDIA",
             BaseSource::DataPak(_) => "DATA.PAK",
-            BaseSource::Bundled => "bundled",
+            BaseSource::Unresolved => "not set",
         }
+    }
+
+    fn is_set(&self) -> bool {
+        !matches!(self, BaseSource::Unresolved)
     }
 }
 
@@ -322,9 +368,42 @@ fn app_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Detect the base MEDIA source under `root`: loose MEDIA, then DATA.PAK, then
-/// the embedded bundle (if compiled in), else none.
+/// Detect the base MEDIA source: loose MEDIA under `root`, then a DATA.PAK under
+/// `root`, then the installed game, then the embedded bundle.
+///
+/// The installed game is checked BEFORE the bundle because the bundle is a
+/// subset, and a subset fails silently: a `.LAYOUT` it does not carry makes
+/// `resolve_link_layout` return None, the linked geometry never reaches the bake,
+/// and the tile ends up with VOID where that geometry's floor should be. Nothing
+/// errors — the pack just quietly produces less walkable ground. When a real
+/// install is on the machine there is no reason to prefer the subset.
 fn detect_base(root: &Path) -> BaseSource {
+    detect_base_with(
+        root,
+        tl2_mikuro_mod_packer_rs::packer::tl2_media_dir().as_deref(),
+        load_base_pref(root),
+    )
+}
+
+/// Resolve the base source WITHOUT searching the machine.
+///
+/// Order: loose `MEDIA/` beside the exe, a `DATA.PAK` beside the exe,
+/// `TL2_MEDIA_DIR`, then whatever the user chose last time. If none answer, the
+/// result is `Unresolved` and the user gets asked — the packer does not go
+/// hunting for an install on its own.
+///
+/// The ordering puts the two "you put it right here" sources first because they
+/// are unambiguous, then the env var (set per shell, so it is the deliberate
+/// override), and the remembered answer last: it is a convenience, and anything
+/// stated more locally should beat it.
+///
+/// `env_media` and `remembered` are parameters so the tier order is testable
+/// without the answer depending on the machine running the tests.
+fn detect_base_with(
+    root: &Path,
+    env_media: Option<&Path>,
+    remembered: Option<BaseSource>,
+) -> BaseSource {
     let media = root.join("MEDIA");
     if media.is_dir() {
         return BaseSource::LooseMedia(media);
@@ -334,8 +413,12 @@ fn detect_base(root: &Path) -> BaseSource {
             return BaseSource::DataPak(cand);
         }
     }
-    // The base bundle is always embedded, so this tier is always available.
-    BaseSource::Bundled
+    if let Some(p) = env_media {
+        if p.is_dir() {
+            return BaseSource::LooseMedia(p.to_path_buf());
+        }
+    }
+    remembered.unwrap_or(BaseSource::Unresolved)
 }
 
 /// A subdir with MOD.DAT is a mod source. Reads its metadata and level status.
@@ -546,41 +629,47 @@ pub fn run() -> ExitCode {
     }
 }
 
+use tl2_mikuro_mod_packer_rs::pak::base_cache_ready;
+
 /// Resolve a base MEDIA directory for MPP regeneration, logging progress to the
-/// Output tab. Loose MEDIA is used directly; DATA.PAK / the embedded bundle are
-/// unpacked into a persistent cache next to the exe on first use (reused after).
+/// Output tab. Loose MEDIA is used directly; a DATA.PAK is extracted once into a
+/// persistent cache next to the exe and reused after — but only while its
+/// version stamp matches (see `BASE_CACHE_VERSION`).
+///
+/// There is deliberately no last-resort tier here. There used to be an embedded
+/// bundle, which was a second hand-built copy of what `extract_base` produces;
+/// the two drifted, the bundle kept no `.LAYOUT` files, and packs against it
+/// silently dropped every linked piece of geometry. A tier that can go stale
+/// without anyone noticing is worse than no tier: `Unresolved` asks instead.
 fn resolve_base_media(root: &Path, base: &BaseSource, log: &Log) -> Option<PathBuf> {
     let cache = root.join(".tl2packer_base");
     match base {
+        // Reachable only if a run starts with no layouts to bake; `start_run`
+        // asks before any level pack gets here.
+        BaseSource::Unresolved => None,
         BaseSource::LooseMedia(p) => Some(p.clone()),
         BaseSource::DataPak(pak) => {
-            if cache.join("LEVELSETS").is_dir() {
+            if base_cache_ready(&cache) {
                 return Some(cache);
             }
-            logln(log, "Extracting base data from DATA.PAK (first run)…");
+            if cache.join("LEVELSETS").is_dir() {
+                logln(log, "Base cache is from an older version — re-extracting…");
+                let _ = std::fs::remove_dir_all(&cache);
+            } else {
+                logln(log, "Extracting base data from DATA.PAK (first run)…");
+            }
             match PakReader::open_pak(pak).and_then(|mut r| r.extract_base(&cache)) {
-                Ok((d, mesh)) => {
-                    logln(log, format!("  base ready: {d} DATs + {mesh} collision meshes"));
+                Ok((d, mesh, lay)) => {
+                    logln(
+                        log,
+                        format!(
+                            "  base ready: {d} DATs + {mesh} collision meshes + {lay} layouts"
+                        ),
+                    );
                     Some(cache)
                 }
                 Err(e) => {
                     logln(log, format!("  base extract failed: {e}"));
-                    None
-                }
-            }
-        }
-        BaseSource::Bundled => {
-            if cache.join("LEVELSETS").is_dir() {
-                return Some(cache);
-            }
-            logln(log, "Unpacking embedded base data (first run)…");
-            match crate::base_bundle::ensure_extracted(&cache) {
-                Ok(()) => {
-                    logln(log, "  base ready (bundled)");
-                    Some(cache)
-                }
-                Err(e) => {
-                    logln(log, format!("  bundled base failed: {e}"));
                     None
                 }
             }
@@ -791,6 +880,48 @@ impl Pane {
         self.picked.iter().filter(|&&b| b).count()
     }
 
+    /// Swap in a fresh scan, carrying over the ticks and the cursor.
+    ///
+    /// Both are carried BY PATH, not by index: a folder appearing or vanishing
+    /// shifts everything after it, so index-keyed state would silently move the
+    /// ticks onto whatever slid into those slots — the one way a refresh could
+    /// pack the wrong mod.
+    ///
+    /// The scroll offset is left alone. It belongs to the widget and is only
+    /// meaningful against the list it was computed from, but ratatui clamps it
+    /// and re-derives it from the selection on the very next render, so keeping
+    /// it is what stops an unchanged list from jumping back to the top.
+    fn refresh(&mut self, items: Vec<ModEntry>) {
+        let ticked: std::collections::BTreeSet<PathBuf> = self
+            .items
+            .iter()
+            .zip(&self.picked)
+            .filter(|(_, &on)| on)
+            .map(|(m, _)| m.dir.clone())
+            .collect();
+        let under_cursor = self
+            .state
+            .selected()
+            .and_then(|i| self.items.get(i))
+            .map(|m| m.dir.clone());
+        let picked = items.iter().map(|m| ticked.contains(&m.dir)).collect();
+        let selected = match under_cursor {
+            _ if items.is_empty() => None,
+            Some(dir) => Some(
+                items.iter().position(|m| m.dir == dir).unwrap_or_else(|| {
+                    // The row the cursor was on is gone. Hold the POSITION
+                    // instead, so the cursor stays where the eye left it and
+                    // lands on whatever took that row's place.
+                    self.state.selected().unwrap_or(0).min(items.len() - 1)
+                }),
+            ),
+            None => Some(0),
+        };
+        self.items = items;
+        self.picked = picked;
+        self.state.select(selected);
+    }
+
     /// Selected indices; if none ticked, the row under the cursor.
     fn resolved(&self) -> Vec<usize> {
         let explicit: Vec<usize> = self
@@ -807,10 +938,63 @@ impl Pane {
     }
 }
 
+/// The base-source question, asked instead of guessed.
+///
+/// `Choose` is the menu; `Pick` is the list of installs a search turned up. The
+/// search only ever runs after the user selects it from `Choose`, and even then
+/// its results are offered rather than applied — on a machine with both a Steam
+/// install and a separately unpacked reference tree, only the user knows which
+/// one their mod is built against.
+enum Prompt {
+    Choose { sel: usize },
+    Pick { found: Vec<PathBuf>, sel: usize },
+    /// Type or paste a path. Terminals deliver a paste as ordinary key events,
+    /// so this needs no clipboard integration — but it does need to accept what
+    /// Explorer's "copy as path" produces, quotes and all.
+    Input { buf: String, err: bool },
+    NoneFound,
+}
+
+/// Interpret a path the user typed as a base source, or reject it.
+///
+/// Accepts whichever of the three plausible things they pasted: the MEDIA folder
+/// itself, the game root above it, or a DATA.PAK. Rejecting a path that holds no
+/// game data is the whole point — a base that resolves but is not one bakes
+/// tiles with their linked geometry missing and says nothing.
+fn base_from_typed(raw: &str) -> Option<BaseSource> {
+    let s = raw.trim().trim_matches('"').trim();
+    if s.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(s);
+    if p.is_file() {
+        return Some(BaseSource::DataPak(p));
+    }
+    if !p.is_dir() {
+        return None;
+    }
+    if p.join("LEVELSETS").is_dir() {
+        return Some(BaseSource::LooseMedia(p));
+    }
+    if p.join("MEDIA").join("LEVELSETS").is_dir() {
+        return Some(BaseSource::LooseMedia(p.join("MEDIA")));
+    }
+    let pak = p.join("PAKS").join("DATA.PAK");
+    if pak.is_file() {
+        return Some(BaseSource::DataPak(pak));
+    }
+    None
+}
+
+/// Menu entries of `Prompt::Choose`, in order.
+const CHOOSE_N: usize = 2;
+
 struct App {
     pack: Pane,
     unpack: Pane,
     base: BaseSource,
+    /// Set while the base question is on screen; swallows keys until answered.
+    prompt: Option<Prompt>,
     root: PathBuf,
     tab: usize,
     log: Log,
@@ -827,7 +1011,15 @@ struct App {
     help_max: Cell<u16>,
     lang: Lang,
     strings: Strings,
+    /// What the last rescan found, and when — shown in the header's status slot
+    /// until it ages out. A rescan of an unchanged tree changes nothing on
+    /// screen, so without this `r` is indistinguishable from a dead key.
+    note: Option<(String, Instant)>,
 }
+
+/// How long the rescan note stays in the header, if nothing else is pressed
+/// first (`handle_key` dismisses it on any other key).
+const NOTE_TTL: Duration = Duration::from_secs(3);
 
 /// Move a scroll offset, clamped to what is actually scrollable.
 ///
@@ -850,6 +1042,7 @@ impl App {
             pack: Pane::new(packs),
             unpack: Pane::new(unpacks),
             base,
+            prompt: None,
             root,
             tab,
             log: Arc::new(Mutex::new(Vec::new())),
@@ -862,6 +1055,7 @@ impl App {
             help_max: Cell::new(0),
             lang,
             strings,
+            note: None,
         }
     }
 
@@ -906,6 +1100,46 @@ impl App {
 
     fn is_packing(&self) -> bool {
         self.packing.load(Ordering::Relaxed)
+    }
+
+    /// Scan the disk again and rebuild both pickers in place.
+    ///
+    /// The tree this app describes is one the user is actively editing while it
+    /// is open: a mod folder gets added or renamed, a `.MOD` gets built or
+    /// deleted, a `MEDIA/` or `DATA.PAK` turns up. All of it was discovered
+    /// once, at startup, so the only way to see any of it was to quit and
+    /// relaunch. The base tier is re-detected for the same reason — it is the
+    /// same kind of change, and the header claims to show which tier is live.
+    ///
+    /// Ticks and the cursor survive (see `Pane::refresh`).
+    fn refresh(&mut self) {
+        self.base = detect_base(&self.root);
+        self.pack.refresh(discover_pack_sources(&self.root));
+        self.unpack.refresh(discover_mod_files(&self.root));
+        let text = self.tr("rescanned").trim().to_string();
+        self.note = Some((text, Instant::now()));
+        // English, like every other line in the Output tab: it is transcript,
+        // and transcripts get pasted into bug reports. It also carries the
+        // counts, which the one-word header note has no room for.
+        logln(
+            &self.log,
+            format!(
+                "rescanned {}: {} mod source(s), {} .MOD file(s)",
+                self.root.display(),
+                self.pack.items.len(),
+                self.unpack.items.len()
+            ),
+        );
+    }
+
+    /// The rescan note, while it is still fresh. Ageing out here rather than on
+    /// a timer is what makes it vanish on its own: the event loop redraws every
+    /// poll timeout whether or not a key was pressed.
+    fn note(&self) -> Option<&str> {
+        self.note
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < NOTE_TTL)
+            .map(|(text, _)| text.as_str())
     }
 
     /// The picker the current tab shows (`None` on the Output tab).
@@ -957,6 +1191,13 @@ impl App {
                 }
             })
             .collect();
+        // Levels need a base tree. Ask now rather than pack against a guess: the
+        // wrong tree costs linked geometry silently, and the run would look
+        // clean. Packs with no layouts are unaffected and go straight through.
+        if !self.base.is_set() && jobs.iter().any(|j| j.action == Action::Pack && j.has_layouts) {
+            self.prompt = Some(Prompt::Choose { sel: 0 });
+            return;
+        }
         self.tab = TAB_OUTPUT;
         self.follow = true;
         self.packing.store(true, Ordering::Relaxed);
@@ -1018,6 +1259,19 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Option<ExitCode> {
             _ => None,
         };
     }
+    // The base question is modal on purpose: it is asked at the moment it
+    // blocks a pack, and answering it is the only way forward.
+    if app.prompt.is_some() {
+        handle_prompt_key(app, k);
+        return None;
+    }
+    // The rescan note owns the status slot while it is up, and that slot is also
+    // where "selected N/M" lives — the ONLY feedback Space has. So anything but
+    // `r` itself dismisses the note: press r then Space and the count answers
+    // immediately, rather than looking dead until the note ages out.
+    if !matches!(k.code, KeyCode::Char('r') | KeyCode::Char('R')) {
+        app.note = None;
+    }
     match k.code {
             // ←→ is what the footer advertises: it has room for one hint, and an
             // arrow pair needs no explaining. Tab/BackTab and the number keys go
@@ -1031,6 +1285,25 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Option<ExitCode> {
             KeyCode::Char('4') | KeyCode::Char('?') | KeyCode::F(1) => app.tab = TAB_HELP,
             // Language switch, live on every tab (see the footer hint).
             KeyCode::Char('l') | KeyCode::Char('L') => app.cycle_lang(),
+            // Change the base tree. Without this the remembered answer would be
+            // a one-way door — you would have to know the dotfile exists to undo
+            // a mis-click, on the one setting where being wrong is invisible.
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                if !app.is_packing() {
+                    app.prompt = Some(Prompt::Choose { sel: 0 });
+                }
+            }
+            // Rescan, live on every tab: what changed on disk shows up in the
+            // tab counts, which are in the header wherever you are standing.
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                // Not mid-run. The worker is writing the very files a scan
+                // reads, so a rescan then lists a half-written `.MOD` as ready
+                // to unpack — and `PakReader` cannot tell that from a finished
+                // one, it just falls back to the file stem for the title.
+                if !app.is_packing() {
+                    app.refresh();
+                }
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 // Ignore quit while a run is going (the child would orphan).
                 if !app.is_packing() {
@@ -1089,6 +1362,199 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Option<ExitCode> {
     None
 }
 
+/// Keys while the base question is up. Esc backs out without choosing, which
+/// leaves the base unset — the pack simply does not start, rather than starting
+/// against something nobody picked.
+fn handle_prompt_key(app: &mut App, k: KeyEvent) {
+    let up = matches!(k.code, KeyCode::Up | KeyCode::Char('k'));
+    let down = matches!(k.code, KeyCode::Down | KeyCode::Char('j'));
+    match app.prompt.as_mut() {
+        Some(Prompt::Choose { sel }) => {
+            if up {
+                *sel = (*sel + CHOOSE_N - 1) % CHOOSE_N;
+                return;
+            }
+            if down {
+                *sel = (*sel + 1) % CHOOSE_N;
+                return;
+            }
+            let chosen = match k.code {
+                KeyCode::Enter => *sel,
+                KeyCode::Char('1') => 0,
+                KeyCode::Char('2') => 1,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.prompt = None;
+                    return;
+                }
+                _ => return,
+            };
+            if chosen == 0 {
+                // Authorised search — only now does anything scan the machine.
+                let found = tl2_mikuro_mod_packer_rs::packer::discover_tl2_installs();
+                app.prompt = Some(if found.is_empty() {
+                    Prompt::NoneFound
+                } else {
+                    Prompt::Pick { found, sel: 0 }
+                });
+            } else {
+                // Name it yourself — typed or pasted, right here.
+                app.prompt = Some(Prompt::Input { buf: String::new(), err: false });
+            }
+        }
+        Some(Prompt::Pick { found, sel }) => {
+            let n = found.len();
+            if up {
+                *sel = (*sel + n - 1) % n;
+                return;
+            }
+            if down {
+                *sel = (*sel + 1) % n;
+                return;
+            }
+            match k.code {
+                KeyCode::Enter => {
+                    let game = found[*sel].clone();
+                    let media = game.join("MEDIA");
+                    app.base = if media.is_dir() {
+                        BaseSource::LooseMedia(media)
+                    } else {
+                        BaseSource::DataPak(game.join("PAKS").join("DATA.PAK"))
+                    };
+                    // Remembered, so the question is asked once rather than every
+                    // launch. Re-validated next time, and `b` changes it.
+                    save_base_pref(&app.root, &app.base);
+                    app.prompt = None;
+                    app.note = Some((app.base.label(), Instant::now()));
+                }
+                KeyCode::Esc | KeyCode::Char('q') => app.prompt = None,
+                _ => {}
+            }
+        }
+        Some(Prompt::Input { buf, err }) => match k.code {
+            // Paste arrives as ordinary characters in every terminal this runs
+            // in, so typing and pasting are the same path.
+            KeyCode::Char(c) => {
+                buf.push(c);
+                *err = false;
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                *err = false;
+            }
+            KeyCode::Enter => match base_from_typed(buf) {
+                Some(base) => {
+                    app.base = base;
+                    save_base_pref(&app.root, &app.base);
+                    app.prompt = None;
+                    app.note = Some((app.base.label(), Instant::now()));
+                }
+                // Stay open on a bad path: retyping a long path because the box
+                // closed is worse than an inline complaint.
+                None => *err = true,
+            },
+            KeyCode::Esc => app.prompt = Some(Prompt::Choose { sel: 1 }),
+            _ => {}
+        },
+        Some(Prompt::NoneFound) => {
+            if matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                app.prompt = None;
+            }
+        }
+        None => {}
+    }
+}
+
+/// Centred popup rect, `w`×`h` at most, clamped to the frame.
+fn centred(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width.saturating_sub(2));
+    let h = h.min(area.height.saturating_sub(2));
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn draw_prompt(f: &mut Frame, app: &App) {
+    let Some(prompt) = app.prompt.as_ref() else { return };
+    let (title, mut lines, sel, n) = match prompt {
+        Prompt::Choose { sel } => (
+            app.tr("base_prompt_title").to_string(),
+            vec![
+                app.tr("base_prompt_why").to_string(),
+                String::new(),
+                app.tr("base_opt_search").to_string(),
+                app.tr("base_opt_manual").to_string(),
+            ],
+            *sel,
+            CHOOSE_N,
+        ),
+        Prompt::Pick { found, sel } => {
+            let mut v = vec![app.tr("base_pick_title").to_string(), String::new()];
+            v.extend(found.iter().map(|p| p.display().to_string()));
+            (app.tr("base_prompt_title").to_string(), v, *sel, found.len())
+        }
+        Prompt::Input { buf, err } => {
+            let mut v = vec![
+                app.tr("base_input_how").to_string(),
+                String::new(),
+                format!("  > {buf}_"),
+            ];
+            if *err {
+                v.push(String::new());
+                v.push(app.tr("base_input_bad").to_string());
+            }
+            (app.tr("base_prompt_title").to_string(), v, usize::MAX, 0)
+        }
+        Prompt::NoneFound => (
+            app.tr("base_prompt_title").to_string(),
+            vec![
+                app.tr("base_manual_how").to_string(),
+                String::new(),
+                "    set TL2_MEDIA_DIR=<...>\\Torchlight II\\MEDIA".to_string(),
+            ],
+            usize::MAX,
+            0,
+        ),
+    };
+    // The option rows are the tail of `lines`; highlight the selected one.
+    let first_opt = lines.len().saturating_sub(n);
+    let body: Vec<Line> = lines
+        .drain(..)
+        .enumerate()
+        .map(|(i, s)| {
+            let is_opt = n > 0 && i >= first_opt;
+            if is_opt && i - first_opt == sel {
+                Line::from(Span::styled(
+                    format!(" > {s}"),
+                    Style::default().fg(theme::EMBER).add_modifier(Modifier::BOLD),
+                ))
+            } else if is_opt {
+                Line::from(Span::styled(format!("   {s}"), Style::default().fg(theme::TEXT)))
+            } else {
+                Line::from(Span::styled(s, Style::default().fg(theme::MUTED)))
+            }
+        })
+        .collect();
+
+    let h = (body.len() as u16) + 4;
+    let area = centred(f.area(), 78, h);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::EMBER))
+                    .title(format!(" {title} "))
+                    .style(Style::default().bg(theme::PANEL)),
+            ),
+        area,
+    );
+}
+
 fn draw(f: &mut Frame, app: &App) {
     // Furnace-black base under everything; panels paint their own darker fill.
     f.render_widget(
@@ -1116,6 +1582,8 @@ fn draw(f: &mut Frame, app: &App) {
         _ => draw_list(f, areas[2], app),
     }
     draw_footer(f, areas[4], app);
+    // Last, so it sits over whatever tab is underneath.
+    draw_prompt(f, app);
 }
 
 /// Display width in terminal columns. CJK and full-width punctuation take two
@@ -1169,6 +1637,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             app.tr("running").to_string(),
             Style::default().fg(theme::GOLD).add_modifier(Modifier::BOLD),
         )
+    } else if let Some(note) = app.note() {
+        // Ahead of "done" on purpose: once a run has finished that status stays
+        // up for good, and after a run is exactly when you reach for `r` — so
+        // losing to it would leave the most common rescan with no feedback.
+        (note.to_string(), Style::default().fg(theme::MAGIC))
     } else if app.finished.load(Ordering::Relaxed) {
         (
             app.tr("done").to_string(),
@@ -1476,6 +1949,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         )),
         dim(tr("tiers_2_and_3_unpack_once_into_a_cache_next")),
         path(format!("  {}", app.root.join(".tl2packer_base").display())),
+        dim(tr("base_choice_remembered")),
+        path(format!("  {}", base_pref_file(&app.root).display())),
         dim(tr("all_three_produce_byte_identical_mod_output")),
         blank(),
         head(tr("content_mod_vs_level_mod")),
@@ -1497,6 +1972,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         body(tr("the_one_deploy_writes_to_so_anything_you_jus")),
         path(format!("  {}", tl2_mods_dir().display())),
         dim(tr("rows_are_deduped_by_real_path_and_tagged_loc")),
+        body(tr("both_lists_are_scanned_at_startup_press_r_to")),
+        dim(tr("build_a_mod_add_a_mod_folder_or_delete_one_t")),
         blank(),
         head(tr("where_output_goes")),
         body(tr("pack_from_this_tui_always_deploys_i_e_writes")),
@@ -1648,11 +2125,17 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         color: theme::MAGIC,
         optional: false,
     };
+    // Rescan is on every tab, like the language switch: what it changes — the
+    // row counts beside the tab labels — is in the header wherever you stand.
+    // Optional, because at 80 columns something has to go and this key is also
+    // on the Help page and in the README, which is what `optional` means here.
+    let rescan = || hint("r", tr("rescan"), true);
 
     let mut items: Vec<Hint> = if app.tab == TAB_HELP {
         vec![
             hint("↑↓", tr("scroll"), false),
             hint("Home", tr("top"), true),
+            rescan(),
             tabs(),
             lang(),
         ]
@@ -1661,6 +2144,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             hint("↑↓", tr("scroll_2"), false),
             hint("End", tr("follow"), true),
             hint("c", tr("clear"), true),
+            rescan(),
             tabs(),
             lang(),
         ]
@@ -1671,6 +2155,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             hint("Space", tr("select"), false),
             hint("a", tr("all"), true),
             hint("Enter", run, false),
+            rescan(),
             tabs(),
             hint("?", tr("help_2"), true),
             lang(),
@@ -1747,6 +2232,53 @@ mod tests {
         }
     }
 
+    /// A typed path is accepted in the three shapes people actually paste, and
+    /// rejected when it holds no game data.
+    ///
+    /// Rejection matters more than acceptance here: a path that resolves but is
+    /// not a base tree bakes every tile with its linked geometry missing and
+    /// reports nothing, so "close enough" has to fail at the input box.
+    #[test]
+    fn typed_base_paths_are_validated_not_trusted() {
+        let root = std::env::temp_dir().join(format!("tl2typed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Torchlight II");
+        let media = game.join("MEDIA");
+        std::fs::create_dir_all(media.join("LEVELSETS")).unwrap();
+        std::fs::create_dir_all(game.join("PAKS")).unwrap();
+        let pak = game.join("PAKS").join("DATA.PAK");
+        std::fs::write(&pak, b"x").unwrap();
+
+        // The MEDIA folder itself.
+        match base_from_typed(&media.display().to_string()) {
+            Some(BaseSource::LooseMedia(p)) => assert_eq!(p, media),
+            other => panic!("MEDIA folder should be accepted, got {other:?}"),
+        }
+        // The game folder above it — resolved down to MEDIA.
+        match base_from_typed(&game.display().to_string()) {
+            Some(BaseSource::LooseMedia(p)) => assert_eq!(p, media),
+            other => panic!("game folder should resolve to MEDIA, got {other:?}"),
+        }
+        // Explorer's "copy as path" wraps the whole thing in quotes.
+        match base_from_typed(&format!("  \"{}\"  ", media.display())) {
+            Some(BaseSource::LooseMedia(p)) => assert_eq!(p, media),
+            other => panic!("quoted path should be accepted, got {other:?}"),
+        }
+        // A DATA.PAK.
+        match base_from_typed(&pak.display().to_string()) {
+            Some(BaseSource::DataPak(p)) => assert_eq!(p, pak),
+            other => panic!("DATA.PAK should be accepted, got {other:?}"),
+        }
+        // A real folder holding nothing, a path that does not exist, and blank.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(base_from_typed(&empty.display().to_string()).is_none());
+        assert!(base_from_typed(&root.join("nope").display().to_string()).is_none());
+        assert!(base_from_typed("   ").is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn discover_finds_direct_and_nested_mods_and_flags_levels() {
         let root = std::env::temp_dir().join(format!("tl2tui_{}", std::process::id()));
@@ -1797,11 +2329,50 @@ mod tests {
         // this machine must be tagged as such and must not collide with local.
         assert!(unpacks.iter().filter(|m| m.origin == Origin::Local).count() == 2);
 
-        // No loose MEDIA and no DATA.PAK → the always-embedded bundle tier.
-        assert!(matches!(detect_base(&root), BaseSource::Bundled));
-        // A loose MEDIA folder wins.
+        // Nothing beside the exe, no TL2_MEDIA_DIR, nothing remembered → ask.
+        // In particular this must NOT quietly resolve to anything: a machine can
+        // hold several usable trees, and a wrong one bakes tiles with their
+        // linked geometry missing and reports nothing.
+        assert!(matches!(detect_base_with(&root, None, None), BaseSource::Unresolved));
+
+        // A remembered choice answers instead of asking again.
+        let saved = root.join("saved").join("MEDIA");
+        std::fs::create_dir_all(saved.join("LEVELSETS")).unwrap();
+        save_base_pref(&root, &BaseSource::LooseMedia(saved.clone()));
+        match detect_base_with(&root, None, load_base_pref(&root)) {
+            BaseSource::LooseMedia(p) => assert_eq!(p, saved),
+            other => panic!("remembered base should be used, got {other:?}"),
+        }
+        // But only while it still holds game data: an install that moved must
+        // put the question back, not resolve to a path that no longer answers.
+        std::fs::remove_dir_all(root.join("saved")).unwrap();
+        assert!(load_base_pref(&root).is_none(), "stale pref must not be trusted");
+        assert!(
+            matches!(detect_base_with(&root, None, load_base_pref(&root)), BaseSource::Unresolved)
+        );
+
+        // TL2_MEDIA_DIR, when the user has set it, is taken at face value and
+        // outranks the remembered answer — it is the per-shell override.
+        let env_media = root.join("fakegame").join("MEDIA");
+        std::fs::create_dir_all(env_media.join("LEVELSETS")).unwrap();
+        save_base_pref(&root, &BaseSource::LooseMedia(saved.clone()));
+        std::fs::create_dir_all(saved.join("LEVELSETS")).unwrap();
+        match detect_base_with(&root, Some(&env_media), load_base_pref(&root)) {
+            BaseSource::LooseMedia(p) => assert_eq!(p, env_media),
+            other => panic!("TL2_MEDIA_DIR should win over the remembered one, got {other:?}"),
+        }
+        // A path that does not exist is not a base — ask instead of trusting it.
+        let missing = root.join("gone").join("MEDIA");
+        assert!(matches!(
+            detect_base_with(&root, Some(&missing), None),
+            BaseSource::Unresolved
+        ));
+        // A loose MEDIA next to the exe still wins over everything.
         std::fs::create_dir_all(root.join("MEDIA")).unwrap();
-        assert!(matches!(detect_base(&root), BaseSource::LooseMedia(_)));
+        match detect_base_with(&root, Some(&env_media), load_base_pref(&root)) {
+            BaseSource::LooseMedia(p) => assert_eq!(p, root.join("MEDIA")),
+            other => panic!("local MEDIA should win, got {other:?}"),
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1837,7 +2408,7 @@ mod tests {
             action: Action::Unpack,
             origin: Origin::Deployed,
         }];
-        let mut app = App::new(packs, unpacks, BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(packs, unpacks, BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         // Pin the language: `App::new` detects it from the OS, so without this
         // the assertions below would pass or fail depending on whose Windows
         // ran them. The Chinese frames get their own test.
@@ -1948,7 +2519,7 @@ mod tests {
             action: Action::Unpack,
             origin: Origin::Deployed,
         }];
-        let mut app = App::new(packs, unpacks, BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(packs, unpacks, BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         app.set_lang(Lang::Zh);
         let dump = |label: &str, text: &str| {
             if std::env::var_os("TL2_TUI_DUMP").is_some() {
@@ -2181,7 +2752,7 @@ mod tests {
     #[test]
     fn help_answers_every_question_with_real_paths() {
         let root = PathBuf::from("/x");
-        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, root.clone());
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), root.clone());
         app.set_lang(Lang::En);
         let text = help_lines(&app)
             .iter()
@@ -2199,11 +2770,28 @@ mod tests {
             assert!(text.contains(topic), "help section {topic:?} missing");
         }
         // Base tiers, and the live one.
-        for t in ["loose MEDIA", "DATA.PAK", "baked into this exe", "bundled base (embedded)"] {
+        for t in ["loose MEDIA", "DATA.PAK", "baked into this exe"] {
             assert!(text.contains(t), "base tier {t:?} not explained");
         }
+        // Why the embedded bundle is gone has to survive in the docs, or the
+        // next person adds one back: it was a second hand-built copy of the
+        // DATA.PAK extraction, it drifted, it carried no .LAYOUT files, and packs
+        // against it silently dropped every linked piece of geometry.
+        assert!(text.contains(".LAYOUT"), "the bundle's missing-layouts gap is not explained");
+        assert!(
+            !text.contains("All three produce byte-identical"),
+            "stale claim: there are two tiers now, and they were never interchangeable"
+        );
+        // And that nothing is guessed when neither tier answers.
+        assert!(
+            text.contains("ASKS if neither answers"),
+            "the ask-don't-guess rule is not stated"
+        );
         // The distinction is stated by its actual test (MEDIA/LAYOUTS).
         assert!(text.contains("MEDIA/LAYOUTS") && text.contains("--mpp re"));
+        // The rescan key. The footer drops it on a narrow terminal, so this page
+        // is the one place it is always documented.
+        assert!(text.contains("Press r to scan again"), "rescan not documented");
         // Real paths, straight from the same helpers the scanners use.
         assert!(text.contains(&root.join("mods").display().to_string()), "scan: ./mods");
         assert!(text.contains(&tl2_mods_dir().display().to_string()), "scan+deploy: game mods");
@@ -2239,7 +2827,7 @@ mod tests {
             terminal.draw(|f| draw(f, app)).unwrap();
         };
 
-        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         app.set_lang(Lang::En);
         // Short enough that the help page overflows it by a lot.
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
@@ -2347,7 +2935,7 @@ mod tests {
         for lang in [Lang::En, Lang::Zh, Lang::Ru] {
             for (tab, name) in [(TAB_PACK, "pack"), (TAB_UNPACK, "unpack"), (TAB_OUTPUT, "output")] {
                 let mut app =
-                    App::new(demo_pack(), demo_unpack(), BaseSource::Bundled, PathBuf::from("/x"));
+                    App::new(demo_pack(), demo_unpack(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
                 app.set_lang(lang);
                 app.tab = tab;
                 match tab {
@@ -2423,7 +3011,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         app.set_lang(Lang::En);
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -2448,7 +3036,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         app.set_lang(Lang::En);
         app.tab = TAB_OUTPUT;
         logln(&app.log, "  unpacked 12 files (3 DAT), 400 bytes".to_string());
@@ -2521,7 +3109,7 @@ mod tests {
             action: Action::Pack,
             origin: Origin::Local,
         }];
-        let mut app = App::new(packs, Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(packs, Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         app.set_lang(Lang::En);
         let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -2574,7 +3162,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         app.set_lang(Lang::En);
         app.tab = TAB_HELP;
         let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
@@ -2652,7 +3240,7 @@ mod tests {
                 origin: Origin::Local,
             })
             .collect();
-        let mut app = App::new(rows, Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(rows, Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         app.set_lang(Lang::En);
         let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
 
@@ -2727,7 +3315,7 @@ mod tests {
         };
         for lang in [Lang::En, Lang::Zh, Lang::Ru] {
             let mut app =
-                App::new(packs(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+                App::new(packs(), Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
             app.set_lang(lang);
             for width in [80u16, 96, 120] {
                 for tab in [TAB_PACK, TAB_UNPACK, TAB_OUTPUT, TAB_HELP] {
@@ -2751,9 +3339,121 @@ mod tests {
                         footer.contains(app.lang.next().tag()),
                         "{lang:?} tab {tab} at {width} cols lost the language switch: {footer:?}"
                     );
+                    // Rescan is marked optional, so 80 columns is allowed to
+                    // drop it (it is on the Help page too). A normal-width
+                    // terminal is not: the footer is where keys get found.
+                    // Matched on the LABEL — "r " also occurs inside "Enter ".
+                    if width >= 120 {
+                        assert!(
+                            footer.contains(app.tr("rescan").trim()),
+                            "{lang:?} tab {tab} at {width} cols lost rescan: {footer:?}"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    /// `r` rescans the disk. Both pickers were built once, at startup, and the
+    /// folder they describe is one the user keeps editing while the app is open:
+    /// a mod folder appears, a `.MOD` gets built or deleted. Seeing any of it
+    /// meant quitting and relaunching.
+    ///
+    /// What must survive a rescan is the state the user typed in — the ticks and
+    /// the cursor — carried by PATH. Carried by index they would slide onto
+    /// whatever moved into those slots, which is the one way a refresh could
+    /// pack the wrong mod.
+    #[test]
+    fn r_rescans_the_disk_and_carries_the_ticks_over() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let root = std::env::temp_dir().join(format!("tl2tui_refresh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        mk_mod(&root, "Bravo", false);
+        mk_mod(&root, "Charlie", true);
+
+        let mut app = App::new(
+            discover_pack_sources(&root),
+            discover_mod_files(&root),
+            detect_base(&root),
+            root.clone(),
+        );
+        app.set_lang(Lang::En);
+        let titles =
+            |a: &App| a.pack.items.iter().map(|m| m.title.clone()).collect::<Vec<String>>();
+        assert_eq!(titles(&app), ["Bravo", "Charlie"]);
+
+        // Tick Charlie, cursor on it: the state the rescan has to keep.
+        app.pack.state.select(Some(1));
+        app.pack.toggle_current();
+
+        // A source that sorts BEFORE both — every index shifts by one.
+        mk_mod(&root, "Alpha", false);
+        // …and a built .MOD, which is the change the UNPACK tab exists for.
+        let fresh = root.join("Fresh.MOD");
+        std::fs::write(&fresh, b"not a real container").unwrap();
+
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('r'))).is_none());
+        assert_eq!(titles(&app), ["Alpha", "Bravo", "Charlie"], "the new source showed up");
+        assert_eq!(app.pack.state.selected(), Some(2), "cursor followed Charlie to index 2");
+        assert_eq!(app.pack.picked, [false, false, true], "and so did its tick");
+        // The deployed mods folder is scanned too, and what THIS machine keeps
+        // there is not ours to predict — so look for the file, not for a count.
+        assert!(app.unpack.items.iter().any(|m| m.dir == fresh), "the new .MOD showed up");
+
+        // Delete the row under the cursor. The cursor holds its POSITION, so it
+        // lands on whatever took that row's place instead of jumping to the top.
+        std::fs::remove_dir_all(root.join("Charlie")).unwrap();
+        std::fs::remove_file(&fresh).unwrap();
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('r'))).is_none());
+        assert_eq!(titles(&app), ["Alpha", "Bravo"]);
+        assert_eq!(app.pack.state.selected(), Some(1), "clamped into the shorter list");
+        assert_eq!(app.pack.picked, [false, false], "Charlie's tick left with Charlie");
+        assert!(!app.unpack.items.iter().any(|m| m.dir == fresh), "the deleted .MOD is gone");
+
+        // The rescan has to SAY so. Rescanning an unchanged tree changes nothing
+        // on screen, and a key with no visible answer reads as a broken one.
+        let mut terminal = Terminal::new(TestBackend::new(96, 18)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        if std::env::var_os("TL2_TUI_DUMP").is_some() {
+            eprintln!("\n──────── AFTER RESCAN ────────\n{text}");
+        }
+        assert!(text.contains("rescanned"), "the header says the scan happened: {text}");
+        assert!(
+            app.log.lock().unwrap().iter().any(|l| l.contains("2 mod source(s)")),
+            "and the transcript keeps the counts the one-word note has no room for"
+        );
+        // …but it must not squat on the status slot, which is also where
+        // "selected N/M" lives. Space would look dead until the note aged out.
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char(' '))).is_none());
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(!text.contains("rescanned"), "the next keypress dismissed the note");
+        assert!(text.contains("selected 1/2"), "and the tick count answered: {text}");
+        app.pack.toggle_current(); // put the tick back for what follows
+
+        // Empty and back. A picker can legitimately open with no rows (launch
+        // somewhere with only `.MOD` files in reach and the PACK tab starts
+        // empty), and the row that then appears has to get the cursor — there
+        // is no earlier selection to carry over.
+        std::fs::remove_dir_all(root.join("Alpha")).unwrap();
+        std::fs::remove_dir_all(root.join("Bravo")).unwrap();
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('r'))).is_none());
+        assert!(app.pack.items.is_empty() && app.pack.state.selected().is_none());
+        mk_mod(&root, "Delta", false);
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('r'))).is_none());
+        assert_eq!(app.pack.state.selected(), Some(0), "the first row gets the cursor");
+
+        // Refused mid-run: the worker is writing the very files a scan reads.
+        app.packing.store(true, Ordering::Relaxed);
+        let before = titles(&app);
+        mk_mod(&root, "Zulu", false);
+        assert!(handle_key(&mut app, KeyEvent::from(KeyCode::Char('r'))).is_none());
+        assert_eq!(titles(&app), before, "no rescan while a run is going");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Ctrl+C must quit, not clear the log. In raw mode it is an ordinary
@@ -2761,7 +3461,7 @@ mod tests {
     /// Output tab it fell through to the bare `c` = clear binding.
     #[test]
     fn ctrl_c_quits_and_does_not_clear_the_log() {
-        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::Bundled, PathBuf::from("/x"));
+        let mut app = App::new(Vec::new(), Vec::new(), BaseSource::LooseMedia(PathBuf::from("/base/MEDIA")), PathBuf::from("/x"));
         app.set_lang(Lang::En);
         app.tab = TAB_OUTPUT;
         logln(&app.log, "important line");

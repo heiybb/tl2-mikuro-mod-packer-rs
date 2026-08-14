@@ -15,7 +15,6 @@ use tl2_mikuro_mod_packer_rs::packer::{
     self, convert_all, pack_mod, read_mod_metadata, tl2_mods_dir, Overrides,
 };
 
-mod base_bundle;
 mod tui;
 
 fn usage() -> ExitCode {
@@ -192,28 +191,18 @@ fn main() -> ExitCode {
         Some("unpack") if argv.len() >= 3 => {
             return run_unpack(&argv[1], &argv[2], &argv[3..]);
         }
-        Some("unpack-base") if argv.len() >= 2 => {
-            // unpack-base <out_dir> — unpack the embedded base bundle (no game
-            // install needed).
-            return match base_bundle::ensure_extracted(Path::new(&argv[1])) {
-                Ok(()) => {
-                    println!("unpacked embedded base bundle → {}", argv[1]);
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            };
-        }
         Some("extract-base") if argv.len() >= 3 => {
             // extract-base <DATA.PAK> <out_dir> — decompile base LEVELSETS DATs +
-            // extract their collision meshes for offline MPP (TL2_MEDIA_DIR).
+            // extract their collision meshes and the .LAYOUT files Layout Links
+            // resolve against, for offline MPP (TL2_MEDIA_DIR).
             return match tl2_mikuro_mod_packer_rs::pak::PakReader::open_pak(Path::new(&argv[1]))
                 .and_then(|mut r| r.extract_base(Path::new(&argv[2])))
             {
-                Ok((d, m)) => {
-                    println!("extracted {d} base DATs + {m} collision meshes → {}", argv[2]);
+                Ok((d, m, l)) => {
+                    println!(
+                        "extracted {d} base DATs + {m} collision meshes + {l} layouts → {}",
+                        argv[2]
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -223,13 +212,15 @@ fn main() -> ExitCode {
             };
         }
         Some("compile-mpp") if argv.len() >= 3 => {
+            // Explicit --media wins; otherwise TL2_MEDIA_DIR. Nothing is guessed —
+            // a wrong base tree bakes silently wrong grids, so ask the caller.
             let mut media = packer::tl2_media_dir();
             let mut fallback: Option<PathBuf> = None;
             let mut rest = argv[3..].iter();
             while let Some(a) = rest.next() {
                 if a == "--media" {
                     if let Some(m) = rest.next() {
-                        media = PathBuf::from(m);
+                        media = Some(PathBuf::from(m));
                     }
                 } else if a == "--fallback" {
                     // base-install MEDIA for the mod-over-base VFS overlay, so a
@@ -240,6 +231,17 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            let media = match media {
+                Some(m) => m,
+                None => {
+                    eprintln!(
+                        "error: no base MEDIA. Pass --media <MEDIA> or set TL2_MEDIA_DIR.\n\
+                         (Not guessed on purpose: baking against the wrong tree drops \
+                         linked geometry with no error.)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
             let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(
                 &media,
                 fallback.as_deref(),

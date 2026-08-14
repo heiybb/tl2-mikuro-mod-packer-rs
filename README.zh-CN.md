@@ -8,8 +8,9 @@ Torchlight 2 的 **`.MOD` 打包器 + 解包器**,单文件 exe,不需要装游�
 - **解包**:把 `.MOD`(或基础游戏的 `DATA.PAK`)还原成**可编辑的文本源目录**。
 
 三种二进制格式(BINDAT / BINLAYOUT / MPP)都是从零写的编译器:解析文本 → 序列化二进制,
-不读取任何已有二进制,所以文本改动总能正确编译。反向的两个反编译器同理。基础游戏数据
-以 ~3MB gzip 内嵌在 exe 里,所以**没装游戏也能打包**。
+不读取任何已有二进制,所以文本改动总能正确编译。反向的两个反编译器同理。打**内容 mod**
+只需要 mod 自己;打**关卡 mod** 还需要基础游戏的数据,exe 会问你它在哪,而不是自己去猜
+(见 [base 数据](#base-数据为什么打包需要它))。
 
 Python 参考实现 `mikuro_mod_packer` 已归档于 GitHub `heiybb/TL2-RE`,本仓库是唯一在用的实现。
 
@@ -83,6 +84,9 @@ cargo build --release
 所有含 `MOD.DAT` 的目录都会出现在这里 —— 来自 exe 所在目录、它的 `mods\` 子目录,
 以及**这个目录本身**(如果你就是把 exe 丢进 mod 文件夹里跑的)。
 `↑↓` 移动,`Space` 勾选,`a` 全选,`Enter` 开始。一个都没勾时,`Enter` 打光标那一行。
+
+两个列表只在程序启动时扫描一次。按 `r` 重扫,刚加的 mod 目录、刚打出来或刚删掉的
+`.MOD` 就会出现在列表里,不必关掉重开。已勾的和光标位置都保留。
 
 每行标着 `关卡 mod` 或 `内容 mod`。判据只有一条:`MEDIA/LAYOUTS` 下有没有 `*.LAYOUT`?
 这决定了要不要烘寻路走格 —— 整个构建里最慢的那部分。
@@ -175,14 +179,39 @@ tl2-mikuro-mod-packer.exe [--in-place|--temp-copy] [--mpp {re,none}] [--raw {aut
   `UNITTYPE` / `LEVEL` / `RARITY` / `CREATEAS`。
 - `.MPP` 走格要拿基础游戏的**碰撞几何**做烘焙。
 
-所以打包器需要 base 数据,取三层里第一个可用的:
+所以打包器需要 base 数据,按顺序取第一个可用的:
 
 1. exe 旁边的散装 `MEDIA/`(真实解包过的安装)
 2. 旁边的 `PAKS/DATA.PAK` 或 `DATA.PAK`(首次使用时抽取)
-3. **内嵌在 exe 里的 bundle**(永远可用,~3MB gzip)
+3. `TL2_MEDIA_DIR`,如果你设了
+4. 你上次选的那棵树,记在 `.tl2packer_base_dir`
 
-第 2、3 层只在首次解到 exe 旁的 `.tl2packer_base\` 缓存,之后复用。
-**三层产出的 `.MOD` 字节完全相同**(已在一个 level mod 上验证)。
+**都没有就询问你。** 它不会自己去搜你的机器,也没有静默的兜底层。这两样以前都有,
+错在同一个地方:一台机器上可能有多棵可用的树 —— 比如一个 Steam 安装,和一棵单独
+解包出来的参考树 —— 选错了看不出来。指向原版的 Layout Link 会解析不到,链接后面的
+几何永远进不了走格,编译照样成功,唯一的症状是玩家看得见、走不了的地面。
+
+询问时你可以让它搜索(搜到的结果列出来给你挑,绝不自己套用),也可以粘贴路径:
+`MEDIA` 目录、游戏根目录,或者一个 `DATA.PAK` 都认。路径下没有游戏数据会当场拒绝。
+你的选择会记住、每次启动重新校验,按 `b` 可以改。
+
+第 2 层只在首次解到 exe 旁的 `.tl2packer_base\` 缓存(约 2.6 秒、102 MB),之后复用。
+判定看缓存里的 `.version` 戳:改一下这个常量,所有现存缓存都会重建 —— 这就是缓存
+在需要装新东西之后不再被继续复用的机制。戳是最后才写的,所以抽到一半崩了留下的是
+一份没戳的缓存,下次重建,而不是拿来用。
+
+第 1~3 层产出的 `.MOD` 字节完全相同 —— 在一个 173 块 layout 的 mod 上验证,173/173
+走格逐格一致。
+
+打包还会把解析不到目标的 Layout Link 报出来:
+
+```
+WARNING: 12 Layout Link(s) across 4 target(s) did not resolve — their geometry is
+         MISSING from the baked grids
+           6 x MEDIA/LEVELSETS/PROPS/EXIT_CHALLENGE.LAYOUT
+```
+
+零星几个,说明 mod 里有悬空引用;成千上万,说明 base 树选错了、或者缺 `.LAYOUT`。
 
 ---
 
@@ -260,18 +289,22 @@ tl2-mikuro-mod-packer.exe unpack <in.MOD|DATA.PAK> <out目录> [--raw] [--no-tim
 | **PACK** | 扫到的 mod 源目录。每行标 content mod / level mod |
 | **UNPACK** | 扫到的 `.MOD` 文件。每行标 local / game mods |
 | **OUTPUT** | 运行日志(实时流式);`c` 清空 |
-| **HELP** | 从**真实代码路径**生成的说明:base 三层、当前用的是哪层、扫描/输出的真实路径、CLI 全部命令 |
+| **HELP** | 从**真实代码路径**生成的说明:base 各层与当前用的是哪层、记住的选择存在哪、扫描/输出的真实路径、CLI 全部命令 |
 
 扫描位置:
 
 - PACK:exe 所在目录、它的 `mods\` 子目录(**这个目录自身**若含 `MOD.DAT` 也算一个源)
 - UNPACK:上面两处,**加上游戏的 mods 目录**(`--deploy` 的落点,所以刚打的包马上就在列表里)
 
+两者都在启动时扫描一次,之后每按一次 `r` 重扫一遍 —— 界面开着的时候新加的 mod 目录、
+新打出来的 `.MOD`,就是靠这个刷出来的。
+
 输出位置:PACK 一律 deploy 到游戏 mods 目录;UNPACK 写到 exe 旁的 `unpacked\<名字>\`,
 **永远不写游戏 mods 目录**,所以解包一个你已装的 mod 是安全的。
 
-按键:`↑↓` 移动 · `Space` 勾选 · `a` 全选 · `Enter` 执行 · `Tab`/`1`-`4` 切页 ·
-`?` 帮助 · `l` 切语言 · `c` 清空日志(OUTPUT 页)· `q` 或 `Ctrl+C` 退出。
+按键:`↑↓` 移动 · `Space` 勾选 · `a` 全选 · `Enter` 执行 · `r` 重扫 ·
+`Tab`/`1`-`4` 切页 · `?` 帮助 · `l` 切语言 · `c` 清空日志(OUTPUT 页)·
+`q` 或 `Ctrl+C` 退出。
 
 界面语言按系统语言自动选(英/中/俄),`TL2_LANG=en|zh|ru` 可覆盖,界面里 `l` 随时切。
 想改措辞或加语言,不用重新编译:把改好的 ini 放到 exe 旁的 `lang\<code>.ini`,
@@ -287,8 +320,7 @@ tl2-mikuro-mod-packer.exe compile-layout   <in.LAYOUT>    <out.BINLAYOUT>
 tl2-mikuro-mod-packer.exe compile-mpp      <in.LAYOUT>    <out.mpp> [--media <MEDIA>] [--fallback <base MEDIA>]
 tl2-mikuro-mod-packer.exe decompile-dat    <in.BINDAT>    <out.DAT>  [--utf8]
 tl2-mikuro-mod-packer.exe decompile-layout <in.BINLAYOUT> <out.LAYOUT>
-tl2-mikuro-mod-packer.exe extract-base     <DATA.PAK>     <out目录>    # 抽 base LEVELSETS + 碰撞 mesh
-tl2-mikuro-mod-packer.exe unpack-base      <out目录>                   # 解内嵌 base bundle(不需要装游戏)
+tl2-mikuro-mod-packer.exe extract-base     <DATA.PAK>     <out目录>    # 抽 base LEVELSETS DAT + 碰撞 mesh + 链接 layout
 
 verify.exe binlayout|binlayout-roundtrip|bindat|raw|mpp|mpp-corpus <media_dir> ...
 verify.exe unpack <mod.MOD>     # 解包→重打包→逐条目内容对账
@@ -304,7 +336,7 @@ verify.exe unpack <mod.MOD>     # 解包→重打包→逐条目内容对账
 
 | 变量 | 作用 |
 | --- | --- |
-| `TL2_MEDIA_DIR` | 基础游戏 MEDIA 路径(默认 `E:\Torchlight 2\MEDIA`) |
+| `TL2_MEDIA_DIR` | 基础游戏 MEDIA 路径。**没有默认值** —— 不设时 TUI 会询问,CLI 会拒绝烤走格而不是去猜(`--mpp none` 可以不烤直接打包) |
 | `TL2_MOD_GAMEVER` | 覆写 header 里的 gameVersion(解包往返时用) |
 | `TL2_LANG` | TUI 界面语言 `en` / `zh` / `ru` |
 | `MIKURO_TIMING` | 打印分阶段计时 |

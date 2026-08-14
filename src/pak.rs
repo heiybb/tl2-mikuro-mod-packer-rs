@@ -363,14 +363,42 @@ impl BlockReader {
     }
 }
 
+/// Contents version of a base cache produced by `extract_base`. Readers reuse a
+/// cache only while its `.version` matches; bump this whenever the cache must
+/// hold something it did not before, or existing caches keep being reused and
+/// keep producing the output that made the bump necessary. v1 held DATs and
+/// collision meshes only, so every Layout Link into vanilla resolved to nothing.
+pub const BASE_CACHE_VERSION: &str = "2";
+
+/// True when `cache_dir` was produced by this version of `extract_base`.
+pub fn base_cache_ready(cache_dir: &Path) -> bool {
+    cache_dir.join("LEVELSETS").is_dir()
+        && std::fs::read_to_string(cache_dir.join(".version"))
+            .map(|v| v.trim() == BASE_CACHE_VERSION)
+            .unwrap_or(false)
+}
+
 impl PakReader {
     /// Provision the base data a full mod pack needs into `cache_dir` (used as
     /// `TL2_MEDIA_DIR`): the compiled base DATs the pipeline reads as TEXT —
     /// `LEVELSETS/*.DAT` (MPP piece tables + ROOMPIECES.RAW) and `UNITS/*.DAT`
     /// (UNITDATA.RAW BASEFILE inheritance) — decompiled back to source, plus the
-    /// collision meshes the levelset pieces reference, extracted raw. Returns
-    /// `(dats_written, meshes_written)`.
-    pub fn extract_base(&mut self, cache_dir: &Path) -> Result<(usize, usize), String> {
+    /// collision meshes the levelset pieces reference, extracted raw, plus the
+    /// base `.LAYOUT` files Layout Links resolve against.
+    ///
+    /// The layouts are not optional decoration. A mod tile reaches vanilla
+    /// geometry through Layout Links, and `resolve_link_layout` looks the target
+    /// up as a file on disk; with no `.LAYOUT` in the base tree the link simply
+    /// resolves to nothing and every piece behind it is skipped. That failure is
+    /// silent — no error, just fewer collision triangles — so the tile bakes with
+    /// large VOID patches where the linked floor should be, and the only symptom
+    /// is terrain the player can see and cannot walk on. Measured on
+    /// `1X1OPEN_N0S0E0W0_LANDMARK_WITHERWAYS_PB`: 20961 void cells without the
+    /// layouts, 15951 with them, the difference sitting exactly under a level
+    /// transition portal.
+    ///
+    /// Returns `(dats_written, meshes_written, layouts_written)`.
+    pub fn extract_base(&mut self, cache_dir: &Path) -> Result<(usize, usize, usize), String> {
         let root = self.manifest.root.clone();
         // Case-insensitive MEDIA-relative path -> entry, for mesh resolution.
         let by_rel: HashMap<String, Entry> = self
@@ -440,15 +468,62 @@ impl PakReader {
             }
         }
 
+        // Link targets. The PAK stores layouts compiled, under the `.LAYOUT`
+        // name (same as DATs hold BINDAT), so each one is decompiled back to
+        // source text — that is the form `resolve_link_layout` looks for.
+        //
+        // `LEVELSETS/` only. That is where the props, braziers, chests and
+        // structural sub-layouts a room block links to live; measured over the
+        // 173-layout mod corpus, adding them reproduces a full-MEDIA bake
+        // exactly (173/173 grids identical). The `LAYOUTS/` tree holds vanilla
+        // tile layouts instead — 1.4 GB of them, versus 71 MB for LEVELSETS —
+        // and a room block linking to a whole other tile is rare enough that
+        // carrying all of them is the wrong trade. A link that still fails to
+        // resolve is reported by the pack (see `native::link_miss_report`)
+        // rather than silently dropping its geometry.
+        let layout_entries: Vec<Entry> = self
+            .manifest
+            .files
+            .iter()
+            .filter(|e| {
+                let p = e.path.to_uppercase();
+                p.ends_with(".LAYOUT") && p.contains("LEVELSETS/")
+            })
+            .cloned()
+            .collect();
+        let mut layout_blocks: Vec<(String, Vec<u8>)> = Vec::with_capacity(layout_entries.len());
+        for e in &layout_entries {
+            let data = self.read_entry(e)?;
+            let rel = e.path.strip_prefix(&root).unwrap_or(&e.path).to_string();
+            layout_blocks.push((rel, data));
+        }
+        // A layout that fails to decompile is dropped rather than fatal: one bad
+        // entry must not cost the whole base cache, and a missing link target
+        // degrades exactly as before this change.
+        let layout_files: Vec<(String, Vec<u8>)> = layout_blocks
+            .par_iter()
+            .filter_map(|(rel, bin)| {
+                let doc = crate::binlayout_decompile::document_type_for(rel);
+                let text = crate::binlayout_decompile::decompile_binlayout_as(bin, doc).ok()?;
+                Some((rel.clone(), crate::binlayout_decompile::to_layout_bytes(&text)))
+            })
+            .collect();
+
         // One parallel write pass for every file (the I/O-bound bottleneck).
         let n_dat = decompiled.len();
         let n_mesh = mesh_files.len();
+        let n_layout = layout_files.len();
         decompiled
             .par_iter()
             .map(|(rel, bytes, _)| (rel, bytes))
             .chain(mesh_files.par_iter().map(|(rel, bytes)| (rel, bytes)))
+            .chain(layout_files.par_iter().map(|(rel, bytes)| (rel, bytes)))
             .try_for_each(|(rel, bytes)| write_cache(cache_dir, rel, bytes))?;
-        Ok((n_dat, n_mesh))
+        // Stamped last, so a run that dies partway leaves an unstamped cache that
+        // the next reader rebuilds rather than trusting.
+        std::fs::write(cache_dir.join(".version"), BASE_CACHE_VERSION)
+            .map_err(|e| format!("{}: {e}", cache_dir.display()))?;
+        Ok((n_dat, n_mesh, n_layout))
     }
 
     /// Extract every file whose manifest path satisfies `want` into `out_root`,
@@ -579,9 +654,12 @@ mod tests {
         let cache = std::env::temp_dir().join(format!("tl2base_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
         let mut r = PakReader::open_pak(pak).expect("open");
-        let (dats, meshes) = r.extract_base(&cache).expect("extract");
-        eprintln!("extracted {dats} base DATs + {meshes} collision meshes");
+        let (dats, meshes, layouts) = r.extract_base(&cache).expect("extract");
+        eprintln!("extracted {dats} base DATs + {meshes} collision meshes + {layouts} layouts");
         assert!(dats > 0 && meshes > 0);
+        // Layout Links resolve against these; without them the linked geometry is
+        // dropped from the bake with no error, leaving walkable ground as VOID.
+        assert!(layouts > 0, "base layouts extracted for link resolution");
 
         // The decompiled DATs must be parseable text with pieces.
         let ls = cache.join("LEVELSETS");

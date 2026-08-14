@@ -901,8 +901,12 @@ mod tests {
     /// `.MOD` and repacking it depends on. Comparing against the SHIPPED bytes
     /// instead would fold in the 19 base files the compiler already cannot
     /// reproduce (uninitialised @25 garbage the editor wrote); the second
-    /// assertion pins that down — the decompiler may not add a single mismatch
-    /// beyond the ones compilation alone already has.
+    /// assertion pins that down per file — the decompiler may not lose bytes on
+    /// a file compilation alone reproduces exactly.
+    ///
+    /// Only the first 400 files in walk order are covered here, so both counts
+    /// move whenever the tree does. That is why the failure has to name files:
+    /// the whole-corpus sweep is `verify binlayout-roundtrip`.
     #[test]
     fn roundtrips_shipped_binlayouts_if_present() {
         use std::path::Path;
@@ -937,41 +941,75 @@ mod tests {
         };
 
         let mut fixed_point_bad = Vec::new();
-        let (mut compile_bad, mut shipped_rt_bad) = (0usize, 0usize);
+        let (mut compile_bad, mut shipped_rt_bad) = (Vec::new(), Vec::new());
+        let mut no_source = 0usize;
         for f in &files {
             let shipped = std::fs::read(f).unwrap_or_default();
-            let src = std::path::PathBuf::from(
-                &f.to_string_lossy()[..f.to_string_lossy().len() - ".BINLAYOUT".len()],
-            );
-            // Fixed point: our own compile must survive decompile → compile.
-            if let Ok(ours) = compile_layout_bytes(&std::fs::read(&src).unwrap_or_default()) {
-                if ours != shipped {
-                    compile_bad += 1;
+            let s = f.to_string_lossy();
+            let src = std::path::PathBuf::from(&s[..s.len() - ".BINLAYOUT".len()]);
+            // A `.BINLAYOUT` with no `.LAYOUT` beside it says NOTHING about the
+            // compiler, so it must not reach the source comparison at all.
+            // Asking the filesystem rather than trusting `compile_layout_bytes`
+            // to reject the bytes is the whole point: `read(…).unwrap_or_default()`
+            // turns a missing file into an empty buffer, which compiles happily
+            // into an 8-byte stub — scored as "the compiler cannot reproduce
+            // this file". Source-less BINLAYOUTs are ordinary (GUTS ships the
+            // compiled form alone), so that phantom moved with the corpus and
+            // broke a test that had nothing to do with it.
+            if src.is_file() {
+                if let Ok(ours) = compile_layout_bytes(&std::fs::read(&src).unwrap_or_default()) {
+                    if ours != shipped {
+                        compile_bad.push(f.clone());
+                    }
+                    // Fixed point: our own compile must survive decompile → compile.
+                    match roundtrip(&ours) {
+                        Ok(re) if re == ours => {}
+                        Ok(_) => fixed_point_bad.push(format!("{}: not a fixed point", f.display())),
+                        Err(e) => fixed_point_bad.push(format!("{}: {e}", f.display())),
+                    }
                 }
-                match roundtrip(&ours) {
-                    Ok(re) if re == ours => {}
-                    Ok(_) => fixed_point_bad.push(format!("{}: not a fixed point", f.display())),
-                    Err(e) => fixed_point_bad.push(format!("{}: {e}", f.display())),
-                }
+            } else {
+                no_source += 1;
             }
+            // The shipped bytes are round-tripped either way: a source-less
+            // `.BINLAYOUT` is exactly what unpacking a `.MOD` hands us.
             if roundtrip(&shipped).map(|re| re == shipped) != Ok(true) {
-                shipped_rt_bad += 1;
+                shipped_rt_bad.push(f.clone());
             }
         }
         eprintln!(
-            "binlayout round-trip over {} files: fixed-point failures {}, \
-             shipped-input failures {shipped_rt_bad} (compile-alone failures {compile_bad})",
+            "binlayout round-trip over {} files ({no_source} with no .LAYOUT source): \
+             fixed-point failures {}, shipped-input failures {} \
+             (compile-alone failures {})",
             files.len(),
-            fixed_point_bad.len()
+            fixed_point_bad.len(),
+            shipped_rt_bad.len(),
+            compile_bad.len()
         );
         assert!(
             fixed_point_bad.is_empty(),
             "fixed-point failures:\n{}",
             fixed_point_bad.join("\n")
         );
-        assert_eq!(
-            shipped_rt_bad, compile_bad,
-            "the decompiler must not add mismatches beyond the ones compilation already has"
+        // Per FILE, not per count. The two totals may legitimately differ: a
+        // file our compiler cannot reproduce from source can still round-trip
+        // perfectly from the shipped bytes, because the decompiler reads the
+        // editor's uninitialised @25 bytes straight out of the binary where a
+        // source compile has nothing to invent them from. Comparing counts made
+        // that normal case look like a regression, and reported it as two bare
+        // numbers with no file to go and look at. What may never happen is the
+        // decompiler losing bytes on a file nothing else has trouble with.
+        let added: Vec<String> = shipped_rt_bad
+            .iter()
+            .filter(|f| !compile_bad.contains(*f))
+            .map(|f| f.display().to_string())
+            .collect();
+        assert!(
+            added.is_empty(),
+            "decompile → recompile lost bytes on {} file(s) that compilation alone \
+             has no trouble with:\n{}",
+            added.len(),
+            added.join("\n")
         );
     }
 }

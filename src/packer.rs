@@ -50,11 +50,208 @@ const MOD_MAGIC: u16 = 4;
 const MOD_FLAGS: u32 = 0;
 const DEFAULT_GAMEVER: u64 = 0x0005_0009_0019_0001;
 
-/// TL2 base install MEDIA dir (env-overridable).
-pub fn tl2_media_dir() -> PathBuf {
-    std::env::var("TL2_MEDIA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"E:\Torchlight 2\MEDIA"))
+/// A directory is a TL2 install if it holds the game's data either loose or packed.
+fn is_tl2_root(p: &Path) -> bool {
+    p.join("MEDIA").is_dir() || p.join("PAKS").join("DATA.PAK").is_file()
+}
+
+/// Library paths listed in Steam's `libraryfolders.vdf`.
+///
+/// Parsed by hand rather than with a VDF crate: the file is `"key" "value"` pairs
+/// and only the `path` values matter, so scanning for them is less code than a
+/// dependency and cannot be broken by the schema churn this file has had across
+/// Steam versions.
+fn steam_library_paths(steam_root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![steam_root.to_path_buf()];
+    for name in ["libraryfolders.vdf", "config/libraryfolders.vdf"] {
+        let f = steam_root.join("steamapps").join(name);
+        let text = match std::fs::read_to_string(&f) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        for line in text.lines() {
+            let mut parts = line.split('"').filter(|s| !s.trim().is_empty());
+            if parts.next().map(|k| k.eq_ignore_ascii_case("path")) != Some(true) {
+                continue;
+            }
+            if let Some(v) = parts.next() {
+                out.push(PathBuf::from(v.replace("\\\\", "\\")));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn registry_tl2_candidates() -> Vec<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let mut out = Vec::new();
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+    // Steam libraries — the common case, and the one that moves between drives.
+    let mut steam_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(k) = hkcu.open_subkey(r"Software\Valve\Steam") {
+        if let Ok(p) = k.get_value::<String, _>("SteamPath") {
+            steam_roots.push(PathBuf::from(p.replace('/', "\\")));
+        }
+    }
+    for key in [r"SOFTWARE\WOW6432Node\Valve\Steam", r"SOFTWARE\Valve\Steam"] {
+        if let Ok(k) = hklm.open_subkey(key) {
+            if let Ok(p) = k.get_value::<String, _>("InstallPath") {
+                steam_roots.push(PathBuf::from(p));
+            }
+        }
+    }
+    for root in steam_roots {
+        for lib in steam_library_paths(&root) {
+            for name in ["Torchlight II", "Torchlight 2"] {
+                out.push(lib.join("steamapps").join("common").join(name));
+            }
+        }
+    }
+
+    // Uninstall entries — covers Steam's own "Steam App 200710", the GOG and
+    // retail installers, and anything else that registered itself.
+    for base in [
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ] {
+        let root = match hklm.open_subkey(base) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        for name in root.enum_keys().flatten() {
+            let k = match root.open_subkey(&name) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let display: String = k.get_value("DisplayName").unwrap_or_default();
+            if !display.to_uppercase().contains("TORCHLIGHT") {
+                continue;
+            }
+            if let Ok(loc) = k.get_value::<String, _>("InstallLocation") {
+                if !loc.trim().is_empty() {
+                    out.push(PathBuf::from(loc));
+                }
+            }
+        }
+    }
+
+    // GOG keeps its own table; the game id is not stable enough to hardcode.
+    for base in [r"SOFTWARE\WOW6432Node\GOG.com\Games", r"SOFTWARE\GOG.com\Games"] {
+        let root = match hklm.open_subkey(base) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        for name in root.enum_keys().flatten() {
+            let k = match root.open_subkey(&name) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let game: String = k.get_value("gameName").unwrap_or_default();
+            if !game.to_uppercase().contains("TORCHLIGHT") {
+                continue;
+            }
+            if let Ok(p) = k.get_value::<String, _>("path") {
+                out.push(PathBuf::from(p));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn registry_tl2_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        for lib in [
+            ".steam/steam",
+            ".local/share/Steam",
+            "Library/Application Support/Steam",
+        ] {
+            for name in ["Torchlight II", "Torchlight 2"] {
+                out.push(
+                    PathBuf::from(&home)
+                        .join(lib)
+                        .join("steamapps/common")
+                        .join(name),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Conventional locations, tried after the registry says nothing.
+fn conventional_tl2_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Ok(pf) = std::env::var(var) {
+            let pf = PathBuf::from(pf);
+            out.push(pf.join(r"Steam\steamapps\common\Torchlight II"));
+            out.push(pf.join(r"Runic Games\Torchlight 2"));
+            out.push(pf.join("Torchlight II"));
+        }
+    }
+    #[cfg(windows)]
+    for d in 'A'..='Z' {
+        let drive = PathBuf::from(format!("{d}:\\"));
+        if !drive.is_dir() {
+            continue;
+        }
+        for name in ["Torchlight 2", "Torchlight II"] {
+            out.push(drive.join(name));
+            out.push(drive.join("Games").join(name));
+            out.push(drive.join(r"SteamLibrary\steamapps\common").join(name));
+        }
+    }
+    out
+}
+
+/// The base MEDIA dir, from `TL2_MEDIA_DIR` and nowhere else.
+///
+/// Deliberately does NOT go looking for an install. Which tree the bake reads is
+/// not a detail that can be guessed safely: a machine can hold several usable
+/// trees — a Steam install and a separately unpacked reference tree, say — and
+/// they are not interchangeable. Silently picking one changes every baked grid
+/// with no error and no log line anyone would question, which is the same shape
+/// of failure as the incomplete base cache (see `PakReader::extract_base`).
+///
+/// Callers that have no value here must ASK rather than assume:
+/// `discover_tl2_installs` exists for that, and is only run once the user says
+/// to. Returns None when the variable is unset, empty, or points nowhere.
+pub fn tl2_media_dir() -> Option<PathBuf> {
+    let p = std::env::var("TL2_MEDIA_DIR").ok()?;
+    let p = PathBuf::from(p.trim());
+    if p.as_os_str().is_empty() {
+        return None;
+    }
+    Some(p)
+}
+
+/// Candidate TL2 installs on this machine, best-guess first, deduplicated and
+/// filtered to ones that actually hold game data.
+///
+/// Offered to the user to choose from — never applied on its own.
+pub fn discover_tl2_installs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for cand in registry_tl2_candidates()
+        .into_iter()
+        .chain(conventional_tl2_candidates())
+    {
+        if !is_tl2_root(&cand) {
+            continue;
+        }
+        let key = cand.to_string_lossy().to_lowercase();
+        if seen.insert(key) {
+            out.push(cand);
+        }
+    }
+    out
 }
 
 /// Extension → manifest TYPE code (EditorGuts sub_102A1EA0 + sub_102A24F0).
@@ -154,12 +351,14 @@ fn read_gamever_exe(_exe: &Path) -> Option<u64> {
 /// gameVersion u64 from Torchlight2.exe (== EditorGuts sub_103F8CD0), else the
 /// 1.25.9.5 default. Env `TL2_MOD_GAMEVER` overrides (handled by the caller).
 pub fn read_gamever(install_dir: Option<&Path>) -> u64 {
+    // Falling back to DEFAULT_GAMEVER is fine here — unlike the pathing base, a
+    // wrong guess is visible (the header records a version) and harmless.
     let install = match install_dir {
         Some(d) => d.to_path_buf(),
-        None => tl2_media_dir()
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default(),
+        None => match tl2_media_dir().as_deref().and_then(Path::parent) {
+            Some(p) => p.to_path_buf(),
+            None => return DEFAULT_GAMEVER,
+        },
     };
     let exe = install.join("Torchlight2.exe");
     if !exe.is_file() {
@@ -1292,9 +1491,25 @@ pub fn generate_mpp_files(
         other => return Err(format!("unknown mpp backend: {other:?}")),
     }
 
-    let base_install = install_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(tl2_media_dir);
+    // No base, no guessing. Baking against a wrong or partial tree is silent —
+    // links resolve to nothing and the geometry behind them just is not in the
+    // grid — so refusing is the only honest option. `--mpp none` is the way to
+    // pack without touching pathing.
+    let base_install = match install_dir.map(|p| p.to_path_buf()).or_else(tl2_media_dir) {
+        Some(p) if p.join("LEVELSETS").is_dir() => p,
+        Some(p) => {
+            return Err(format!(
+                "base MEDIA {} has no LEVELSETS — set TL2_MEDIA_DIR to a real base \
+                 MEDIA tree, or pack with --mpp none",
+                p.display()
+            ))
+        }
+        None => {
+            return Err("no base MEDIA for pathing: set TL2_MEDIA_DIR to the game's \
+                        MEDIA folder, or pack with --mpp none"
+                .into())
+        }
+    };
     let layouts_dir = media_dir.join("LAYOUTS");
     let mut jobs = Vec::new();
     let mut all = Vec::new();
@@ -1312,10 +1527,54 @@ pub fn generate_mpp_files(
     }
 
     let ctx = crate::mpp::pipeline::Context::new(media_dir, Some(&base_install));
+    let _ = crate::mpp::native::link_miss_report(); // drop anything stale
     let out: Vec<(PathBuf, Option<Vec<u8>>)> = jobs
         .par_iter()
         .map(|lp| (lp.clone(), crate::mpp::compile_mpp(lp, &ctx).ok()))
         .collect();
+
+    // A Layout Link whose target is missing takes all its geometry out of the
+    // grid without failing the compile, so the tile bakes VOID where that
+    // geometry's floor was and the pack looks clean. Usually it means the base
+    // tree is a subset that does not carry the linked `.LAYOUT` files.
+    let misses = crate::mpp::native::link_miss_report();
+    if !misses.is_empty() {
+        let total: usize = misses.iter().map(|(_, n)| n).sum();
+        eprintln!(
+            "  WARNING: {total} Layout Link(s) across {} target(s) did not resolve — their \
+             geometry is MISSING from the baked grids (base: {})",
+            misses.len(),
+            base_install.display()
+        );
+        for (f, n) in misses.iter().take(12) {
+            eprintln!("           {n:>5} x {f}");
+        }
+        if misses.len() > 12 {
+            eprintln!("           ... and {} more target(s)", misses.len() - 12);
+        }
+    }
+
+    // Interface health check before anything is written: a variant whose floor
+    // stops at its own footprint edge bakes cleanly and still seals the joint,
+    // and only whole-zone assembly simulation finds it otherwise.
+    let baked: Vec<(PathBuf, &[u8])> = out
+        .iter()
+        .filter_map(|(lp, d)| d.as_ref().map(|d| (lp.clone(), d.as_slice())))
+        .collect();
+    let findings = crate::mpp::audit::audit_tree(media_dir, Some(&base_install), &baked);
+    if !findings.is_empty() {
+        eprintln!(
+            "  WARNING: {} room-block interface issue(s) — these seal walkable joints at assembly time:",
+            findings.len()
+        );
+        for f in findings.iter().take(20) {
+            eprintln!("           {}/{}/{}", f.zone, f.chunk_type, f.variant);
+            eprintln!("             {}", f.message);
+        }
+        if findings.len() > 20 {
+            eprintln!("           ... and {} more", findings.len() - 20);
+        }
+    }
 
     let mut count = 0;
     let mut failed: Vec<(PathBuf, &str)> = Vec::new();
@@ -1420,6 +1679,57 @@ pub fn tl2_mods_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// An install is recognised by its data, not its folder name — Steam, GOG and
+    /// retail all name the directory differently, and a loose-MEDIA tree and a
+    /// PAKS-only tree are both usable.
+    #[test]
+    fn tl2_root_is_recognised_by_media_or_pak() {
+        let root = std::env::temp_dir().join(format!("tl2root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!is_tl2_root(&root), "an empty folder is not an install");
+
+        let loose = root.join("loose");
+        std::fs::create_dir_all(loose.join("MEDIA")).unwrap();
+        assert!(is_tl2_root(&loose), "loose MEDIA counts");
+
+        let packed = root.join("packed");
+        std::fs::create_dir_all(packed.join("PAKS")).unwrap();
+        std::fs::write(packed.join("PAKS").join("DATA.PAK"), b"x").unwrap();
+        assert!(is_tl2_root(&packed), "PAKS/DATA.PAK counts");
+
+        let bogus = root.join("Torchlight II");
+        std::fs::create_dir_all(&bogus).unwrap();
+        assert!(!is_tl2_root(&bogus), "the name alone must not qualify");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `libraryfolders.vdf` has changed shape repeatedly across Steam versions;
+    /// pulling out `"path"` values survives that, and the Steam root itself is
+    /// always a library even when the file lists none.
+    #[test]
+    fn steam_libraries_come_from_path_values() {
+        let root = std::env::temp_dir().join(format!("tl2steam_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("steamapps")).unwrap();
+        std::fs::write(
+            root.join("steamapps").join("libraryfolders.vdf"),
+            b"\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"C:\\\\Steam\"\n\t\t\
+              \"label\"\t\t\"\"\n\t}\n\t\"1\"\n\t{\n\t\t\"path\"\t\t\"D:\\\\SteamLibrary\"\n\t}\n}\n",
+        )
+        .unwrap();
+        let libs = steam_library_paths(&root);
+        assert!(libs.contains(&root), "the Steam root is itself a library");
+        assert!(libs.contains(&PathBuf::from(r"C:\Steam")), "got {libs:?}");
+        assert!(libs.contains(&PathBuf::from(r"D:\SteamLibrary")), "got {libs:?}");
+        assert!(
+            !libs.iter().any(|p| p.to_string_lossy().contains("label")),
+            "only path values, got {libs:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// `re` and `none` are the whole set. `dll` is not special-cased anywhere —
     /// it is rejected exactly like any other unknown value, and in particular
     /// must NOT quietly resolve to the offline backend: a build that silently
@@ -1435,6 +1745,23 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    /// A base tree that is not a base tree must stop the bake, not be used.
+    ///
+    /// Silence is the failure mode that matters here: every Layout Link into the
+    /// base game resolves to nothing, the compile still succeeds, and the tiles
+    /// come out with their linked geometry missing. Refusing is the only way the
+    /// operator finds out at pack time rather than from a player standing on
+    /// ground they cannot walk across.
+    #[test]
+    fn pathing_refuses_a_base_that_is_not_one() {
+        let empty = std::env::temp_dir().join(format!("tl2nobase_{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = generate_mpp_files(Path::new("/x"), None, "re", Some(&empty)).unwrap_err();
+        assert!(err.contains("LEVELSETS"), "should name what is missing, got {err:?}");
+        assert!(err.contains("--mpp none"), "should offer the way to pack anyway, got {err:?}");
+        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]

@@ -1,7 +1,11 @@
 //! Corpus validation harness:
 //!   verify binlayout <media_dir>    — compile every .LAYOUT with a sibling
 //!                                     .BINLAYOUT and byte-compare (expect
-//!                                     8965/8985 on the shipped base game)
+//!                                     8966/8985 on the shipped base game; the
+//!                                     19 misses are the editor's uninitialised
+//!                                     @25 bytes, unrecoverable from source.
+//!                                     A .BINLAYOUT with no .LAYOUT beside it
+//!                                     is not a pair and is not counted)
 //!   verify bindat-py <media_dir> <n> — compile N random .DATs and compare
 //!                                     against Python compile_dat (needs py)
 //!   verify raw <media_dir>          — rebuild the 7 RAW indices and compare
@@ -11,6 +15,23 @@
 //!                                     re-compile it; must be byte-identical
 //!   verify unpack <mod.MOD>         — unpack a real .MOD, repack the tree, and
 //!                                     compare the two containers entry by entry
+//!   verify mpp-ab <media_dir> [rel_subdir]
+//!                                   — for every .LAYOUT with a GUTS-baked sibling
+//!                                     .MPP, bake offline and report the per-cell
+//!                                     CONFUSION MATRIX (walk/wall/void) plus the
+//!                                     same split by distance-to-grid-border, so a
+//!                                     systematic edge/threshold bias is visible
+//!                                     rather than hidden in one diff percentage.
+//!   verify mpp-info <mod_media> <base_media> <layout>... [--pieces]
+//!                                   — region/header provenance for one tile, vs
+//!                                     the shipped sibling header; --pieces adds
+//!                                     which piece set each hull extremum (and
+//!                                     which pieces were silently dropped)
+//!   verify mpp-boxfit <media_dir>   — CSV of collision hull vs the box GUTS
+//!                                     shipped, for fitting the snap rule
+//!   verify mpp-audit <mod_media> <base_media> [--verbose]
+//!                                   — the pack-time room-block interface check,
+//!                                     run over a tree without packing
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +63,36 @@ fn main() {
         Some("raw") => verify_raw(Path::new(&args[1])),
         Some("mpp") => verify_mpp(&args[1..]),
         Some("mpp-corpus") => verify_mpp_corpus(Path::new(&args[1]), Path::new(&args[2])),
+        Some("mpp-ab") => verify_mpp_ab(&args[1..]),
+        Some("mpp-info") => mpp_info(&args[1..]),
+        Some("mpp-audit") => mpp_audit(&args[1..]),
+        Some("mpp-boxfit") => mpp_boxfit(&args[1..]),
+        Some("mpp-tris") => mpp_tris(&args[1..]),
+        Some("ce-audit") => ce_audit(&args[1..]),
+        // Where would a pack look for base data on THIS machine? A wrong answer
+        // here degrades silently (see `packer::tl2_media_dir`), so it is worth
+        // being able to ask directly instead of inferring it from a bake.
+        Some("base-probe") => {
+            use tl2_mikuro_mod_packer_rs::packer::{discover_tl2_installs, tl2_media_dir};
+            match tl2_media_dir() {
+                Some(media) => {
+                    println!("TL2_MEDIA_DIR = {}", media.display());
+                    println!("  exists: {}   LEVELSETS: {}",
+                             media.is_dir(), media.join("LEVELSETS").is_dir());
+                }
+                None => println!("TL2_MEDIA_DIR is not set (nothing is guessed)"),
+            }
+            // Shown on request only — this is what the TUI would offer if the
+            // user authorises a search, never what it applies on its own.
+            let found = discover_tl2_installs();
+            println!("
+installs a search WOULD offer ({}):", found.len());
+            for p in &found {
+                println!("  {}   MEDIA:{}  PAKS/DATA.PAK:{}",
+                         p.display(), p.join("MEDIA").is_dir(),
+                         p.join("PAKS/DATA.PAK").is_file());
+            }
+        }
         Some("mpp-gen") => mpp_gen(&args[1..]),
         _ => {
             eprintln!("usage: verify binlayout|binlayout-roundtrip|bindat|bindat-corpus|raw|mpp|mpp-gen <media_dir> ...");
@@ -546,15 +597,860 @@ fn verify_mpp_corpus(media: &Path, corpus: &Path) {
     }
 }
 
-/// mpp-gen <mod_media> <base_media> <out_dir> [--reconnect 0]
+/// For each of the four hull extrema, the pieces that reach furthest — using the
+/// region walk's own attribution, so what is printed is exactly what set the box.
+/// A piece reached through a Layout Link is labelled with the link chain, which is
+/// the distinction that matters: whether the over-reach is a direct room piece or
+/// something a link dragged in.
+fn print_hull_extremes(
+    layout: &tl2_mikuro_mod_packer_rs::mpp::layout::Layout,
+    ctx: &tl2_mikuro_mod_packer_rs::mpp::pipeline::Context,
+) {
+    use tl2_mikuro_mod_packer_rs::mpp::region::{hull_contributors, HullContrib};
+
+    // Why each Room Piece did or did not reach the hull. Several of the skip
+    // paths are silent in the bake (an unknown GUID just `continue`s and is NOT
+    // counted by n_pieces_missing), and a silently dropped piece is exactly what
+    // an under-sized box looks like.
+    {
+        use tl2_mikuro_mod_packer_rs::mpp::region::{collision_enabled, select_collision_file};
+        let mut tally: std::collections::BTreeMap<&str, usize> = Default::default();
+        let mut dropped_west: Vec<(f64, String, &str)> = Vec::new();
+        for pi in layout.room_piece_indices() {
+            let o = &layout.objects[pi];
+            let reason = if !collision_enabled(o) {
+                "COLLISION ENABLED:false"
+            } else if !ctx.guid.contains_key(&o.guid) {
+                "GUID not in LEVELSETS (silent skip)"
+            } else {
+                let pd = &ctx.guid[&o.guid];
+                if select_collision_file(pd, o.visual).is_empty() {
+                    "no COLLISIONFILE"
+                } else if ctx.get_bounds(select_collision_file(pd, o.visual)).is_none() {
+                    "collision mesh unloadable"
+                } else {
+                    "reached the hull (or a later gate)"
+                }
+            };
+            *tally.entry(reason).or_default() += 1;
+            if reason != "reached the hull (or a later gate)" {
+                // Report the piece's would-be COLLISION extent, not its origin:
+                // an under-sized box is a question about extents.
+                let mut lbl = String::new();
+                let mut west = o.world.m[0][3];
+                if let Some(pd) = ctx.guid.get(&o.guid) {
+                    let cf = select_collision_file(pd, o.visual);
+                    if !cf.is_empty() {
+                        if let Some(b) = ctx.get_bounds(cf) {
+                            use tl2_mikuro_mod_packer_rs::mpp::region::transform_bounds_f32;
+                            let (mnx, _, mxx, _) = transform_bounds_f32(&b, &o.world);
+                            west = mnx as f64;
+                            lbl = format!(
+                                "{} [{}] collx[{:.3},{:.3}]{}{}",
+                                pd.name, cf.rsplit('/').next().unwrap_or(cf), mnx, mxx,
+                                if pd.alwaysbakecollision { " ALWAYSBAKECOLLISION" } else { "" },
+                                if pd.neverbake { " NEVERBAKE" } else { "" },
+                            );
+                        }
+                    }
+                }
+                if lbl.is_empty() {
+                    lbl = format!("{} guid={}", o.name, o.guid);
+                }
+                dropped_west.push((west, lbl, reason));
+            }
+        }
+        println!("  Room Piece disposition:");
+        for (k, v) in &tally {
+            println!("      {v:>5}  {k}");
+        }
+        dropped_west.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for (x, n, r) in dropped_west.iter().take(8) {
+            println!("      dropped, reaches x={x:>9.3}  {n}
+          ({r})");
+        }
+    }
+
+    let cs = hull_contributors(layout, ctx);
+    let n_link = cs.iter().filter(|c| !c.via.is_empty()).count();
+    println!(
+        "  hull contributors: {} ({} direct room pieces, {n_link} via Layout Links)",
+        cs.len(),
+        cs.len() - n_link
+    );
+    let show = |c: &HullContrib, v: f32| {
+        let sc = if (c.scale.0 - 1.0).abs() > 1e-6
+            || (c.scale.1 - 1.0).abs() > 1e-6
+            || (c.scale.2 - 1.0).abs() > 1e-6
+        {
+            format!("  scale=({:.3},{:.3},{:.3})", c.scale.0, c.scale.1, c.scale.2)
+        } else {
+            String::new()
+        };
+        println!(
+            "      {v:>12.4}  {} [{}]{}{}{sc}",
+            c.piece,
+            c.mesh,
+            if c.flags.is_empty() { String::new() } else { format!("  {}", c.flags) },
+            if c.via.is_empty() { String::new() } else { format!("
+                    via {}", c.via) }
+        );
+    };
+    for (axis, get, want_min) in [
+        ("min x", (|c: &HullContrib| c.minx) as fn(&HullContrib) -> f32, true),
+        ("max x", |c: &HullContrib| c.maxx, false),
+        ("min z", |c: &HullContrib| c.minz, true),
+        ("max z", |c: &HullContrib| c.maxz, false),
+    ] {
+        let mut v: Vec<&HullContrib> = cs.iter().collect();
+        v.sort_by(|a, b| {
+            let (x, y) = (get(a), get(b));
+            if want_min { x.partial_cmp(&y).unwrap() } else { y.partial_cmp(&x).unwrap() }
+        });
+        println!("    {axis}:");
+        for (rank, c) in v.iter().take(3).enumerate() {
+            show(c, get(c));
+            // Only the top contributor actually sets the box, so print its ancestor
+            // chain: that is where the editor's base/detail split reads from.
+            if rank == 0 {
+                for (d, a) in c.chain.iter().enumerate() {
+                    println!("                    anc[{d}] {a}");
+                }
+            }
+        }
+    }
+}
+
+/// ce-audit <mod_media> <base_media> <layout>...
+/// Group a tile's `COLLISION ENABLED:false` Room Pieces by piece definition, so the
+/// ground pieces can be told from the props.
+///
+/// The flag removes a piece from BOTH the region box and the triangle gather (gate2
+/// @0x10203b62) while leaving its visual mesh, so on a PROP it usefully clears an
+/// obstacle, and on a GROUND piece it deletes the floor from the walk grid and leaves
+/// terrain the player can see but not stand on.
+fn ce_audit(args: &[String]) {
+    use tl2_mikuro_mod_packer_rs::mpp::layout::load_layout_file;
+    use tl2_mikuro_mod_packer_rs::mpp::pipeline::Context;
+    use tl2_mikuro_mod_packer_rs::mpp::region::{collision_enabled, select_collision_file};
+
+    let ctx = Context::new(Path::new(&args[0]), Some(Path::new(&args[1])));
+    // Substrings that mark a piece as walkable ground rather than decoration.
+    const GROUND: [&str; 12] = [
+        "FLOOR", "GROUND", "SLOPE", "DIRT", "SAND", "PATH", "TERRAIN", "BED", "PLAZA",
+        "STAIR", "RAMP", "BRIDGE",
+    ];
+    for lp in args[2..].iter().filter(|a| !a.starts_with("--")) {
+        let p = Path::new(lp);
+        let Ok(layout) = load_layout_file(p) else {
+            println!("{lp}: parse error");
+            continue;
+        };
+        // bucket: 0 = CE:false, 1 = has no COLLISIONFILE at all, 2 = contributes
+        let mut by: std::collections::HashMap<(u8, String), (usize, String, String)> =
+            Default::default();
+        let mut total = 0usize;
+        for pi in layout.room_piece_indices() {
+            let o = &layout.objects[pi];
+            total += 1;
+            let has_coll = ctx
+                .guid
+                .get(&o.guid)
+                .map(|pd| !select_collision_file(pd, o.visual).is_empty())
+                .unwrap_or(false);
+            let bucket = if !collision_enabled(o) {
+                0u8
+            } else if !has_coll {
+                1
+            } else {
+                2
+            };
+            if bucket == 2 {
+                continue;
+            }
+            let (name, mesh) = match ctx.guid.get(&o.guid) {
+                Some(pd) => (
+                    if pd.name.is_empty() { "<unnamed>".to_string() } else { pd.name.clone() },
+                    select_collision_file(pd, o.visual).to_string(),
+                ),
+                None => ("<GUID not in LEVELSETS>".to_string(), String::new()),
+            };
+            let e = by.entry((bucket, o.guid.clone())).or_insert((0, name, mesh));
+            e.0 += 1;
+        }
+        let mut rows: Vec<_> = by.into_iter().collect();
+        rows.sort_by_key(|((b, _), v)| (*b, std::cmp::Reverse(v.0)));
+        let ce: usize = rows.iter().filter(|((b, _), _)| *b == 0).map(|(_, v)| v.0).sum();
+        let nocoll: usize = rows.iter().filter(|((b, _), _)| *b == 1).map(|(_, v)| v.0).sum();
+        println!(
+            "
+===== {} =====
+  Room Pieces {total}   CE:false {ce} ({:.0}%)   无碰撞网格 {nocoll}",
+            p.file_name().unwrap_or_default().to_string_lossy(),
+            100.0 * ce as f64 / total.max(1) as f64
+        );
+        println!("  {:>5}  {:<34} {:<46} 判定", "数量", "件名", "碰撞网格");
+        let mut last = 9u8;
+        for ((b, guid), (n, name, mesh)) in &rows {
+            if *b != last {
+                println!(
+                    "  -- {} --",
+                    if *b == 0 { "COLLISION ENABLED:false" } else { "件定义里没有 COLLISIONFILE" }
+                );
+                last = *b;
+            }
+            let up = format!("{} {}", name.to_uppercase(), mesh.to_uppercase());
+            let is_ground = GROUND.iter().any(|g| up.contains(g));
+            println!(
+                "  {:>5}  {:<34} {:<44} {}",
+                n,
+                name,
+                if mesh.is_empty() { "(无)" } else { mesh.rsplit('/').next().unwrap_or(mesh) },
+                if is_ground { "<<< 地面类" } else { "道具" }
+            );
+            let _ = guid;
+        }
+        let ground: usize = rows
+            .iter()
+            .filter(|(_, (_, name, mesh))| {
+                let up = format!("{} {}", name.to_uppercase(), mesh.to_uppercase());
+                GROUND.iter().any(|g| up.contains(g))
+            })
+            .map(|(_, v)| v.0)
+            .sum();
+        println!("  -> 地面类合计 {ground} 块 / 共 {ce} 块 CE:false");
+    }
+}
+
+/// mpp-tris <mod_media> <base_media> <layout> [top_n]
+/// Which pieces contributed the TRIANGLES, sorted by how far east they reach.
+/// The region box and the triangle gather admit different pieces (links are gated
+/// differently), so a tile can be walkable where its box hull says there is nothing —
+/// this names the piece responsible.
+fn mpp_tris(args: &[String]) {
+    use tl2_mikuro_mod_packer_rs::mpp::native;
+    use tl2_mikuro_mod_packer_rs::mpp::pipeline::Context;
+
+    if !native::tri_trace_enabled() {
+        println!("set MPP_TRI_TRACE=1 to enable the collector");
+        return;
+    }
+    let ctx = Context::new(Path::new(&args[0]), Some(Path::new(&args[1])));
+    let lp = Path::new(&args[2]);
+    let top: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(14);
+    let _ = native::tri_trace_take(); // drop anything stale
+    match tl2_mikuro_mod_packer_rs::mpp::compile_mpp(lp, &ctx) {
+        Err(e) => println!("{}: {e}", lp.display()),
+        Ok(_) => {
+            let mut src = native::tri_trace_take();
+            println!("{} — {} piece emissions", lp.file_name().unwrap_or_default().to_string_lossy(), src.len());
+            src.sort_by(|a, b| b.maxx.partial_cmp(&a.maxx).unwrap_or(std::cmp::Ordering::Equal));
+            println!("  furthest EAST (local x):");
+            for t in src.iter().take(top) {
+                println!(
+                    "    maxx {:>8.3}  x[{:>8.3},{:>8.3}] z[{:>8.3},{:>8.3}] {:>5}t{} {} [{}] id={} sc=({:.2},{:.2},{:.2}){}",
+                    t.maxx, t.minx, t.maxx, t.minz, t.maxz, t.n_tris,
+                    if t.nop { " NOP" } else { "   " },
+                    t.piece, t.mesh, t.id, t.scale.0, t.scale.1, t.scale.2,
+                    if t.via.is_empty() { String::new() } else { format!(" via {}", t.via) }
+                );
+            }
+        }
+    }
+}
+
+/// mpp-boxfit <media_dir>
+/// CSV of `raw collision hull` against the box GUTS actually shipped
+/// (`box_min = -worldExt`, `box_max = box_min + bounds`), one row per tile with a
+/// sibling .MPP. Lets the snap rule be FITTED to 1293 observations instead of
+/// guessed from one tile — which matters because the rule only shows itself on
+/// hulls that land within the pad distance of a 10-unit quantum.
+fn mpp_boxfit(args: &[String]) {
+    use tl2_mikuro_mod_packer_rs::mpp::layout::load_layout_file;
+    use tl2_mikuro_mod_packer_rs::mpp::pipeline::{compute_region, Context};
+    use tl2_mikuro_mod_packer_rs::mpp::region::SNAP;
+
+    let media = PathBuf::from(&args[0]);
+    let ctx = Context::new(&media, None);
+    let root = media.join("LAYOUTS");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    let pairs: Vec<(PathBuf, PathBuf)> = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_uppercase().ends_with(".LAYOUT"))
+                .unwrap_or(false)
+        })
+        .filter_map(|lp| {
+            let s = lp.to_string_lossy();
+            let mp = PathBuf::from(format!("{}.MPP", &s[..s.len() - ".LAYOUT".len()]));
+            mp.exists().then(|| (lp.clone(), mp))
+        })
+        .collect();
+
+    println!("name,hull_min_x,hull_max_x,hull_min_z,hull_max_z,guts_min_x,guts_max_x,guts_min_z,guts_max_z,our_min_x,our_max_x,our_min_z,our_max_z");
+    let rows: Vec<String> = pairs
+        .par_iter()
+        .filter_map(|(lp, mp)| {
+            let layout = load_layout_file(lp).ok()?;
+            let buf = std::fs::read(mp).ok()?;
+            if buf.len() < 24 {
+                return None;
+            }
+            let gf = |o: usize| f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+            let (ex, ez, bx, bz) = (gf(8), gf(12), gf(16), gf(20));
+            // Unsnapped hull, then our snapped box, so the fit sees both.
+            let (raw_box, res) = compute_region(&layout, &ctx, 0.0);
+            let (snapped, _) = compute_region(&layout, &ctx, SNAP);
+            if res.aabb.null {
+                return None;
+            }
+            let name = lp.strip_prefix(&root).unwrap_or(lp).to_string_lossy().replace(',', ";");
+            Some(format!(
+                "{name},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                raw_box.min.x, raw_box.max.x, raw_box.min.z, raw_box.max.z,
+                -ex, -ex + bx, -ez, -ez + bz,
+                snapped.min.x, snapped.max.x, snapped.min.z, snapped.max.z
+            ))
+        })
+        .collect();
+    for r in rows {
+        println!("{r}");
+    }
+}
+
+/// mpp-audit <mod_media> <base_media> [--verbose]
+/// Run the pack-time interface health check over a whole tree without packing,
+/// and with --verbose dump the per-variant edge coverage table the findings come
+/// from (useful for calibrating the thresholds against real data).
+fn mpp_audit(args: &[String]) {
+    use tl2_mikuro_mod_packer_rs::mpp::audit;
+    use tl2_mikuro_mod_packer_rs::mpp::pipeline::Context;
+
+    let media = PathBuf::from(&args[0]);
+    let base = PathBuf::from(&args[1]);
+    let verbose = args.iter().any(|a| a == "--verbose");
+    let t0 = std::time::Instant::now();
+    let ctx = Context::new(&media, Some(&base));
+    let layouts_root = media.join("LAYOUTS");
+    let mut files = Vec::new();
+    walk(&layouts_root, &mut files);
+    let layouts: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_uppercase().ends_with(".LAYOUT"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let owned: Vec<(PathBuf, Vec<u8>)> = layouts
+        .par_iter()
+        .filter_map(|lp| {
+            tl2_mikuro_mod_packer_rs::mpp::compile_mpp(lp, &ctx)
+                .ok()
+                .map(|d| (lp.clone(), d))
+        })
+        .collect();
+    let baked: Vec<(PathBuf, &[u8])> =
+        owned.iter().map(|(p, d)| (p.clone(), d.as_slice())).collect();
+    println!(
+        "baked {}/{} layouts in {:.1}s",
+        owned.len(),
+        layouts.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    if verbose {
+        // Re-derive the table for the chunk types that have a rules entry.
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for (lp, _) in &baked {
+            if let Ok(rel) = lp.strip_prefix(&layouts_root) {
+                let parts: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().to_uppercase())
+                    .collect();
+                if parts.len() == 3 && !seen.contains(&(parts[0].clone(), parts[1].clone())) {
+                    seen.push((parts[0].clone(), parts[1].clone()));
+                }
+            }
+        }
+        println!("\nper-variant edge coverage (inside% / spill% of the shared band)");
+        for (zone, ctype) in &seen {
+            let rules = audit::load_zone_rules(&media, Some(&base), zone);
+            let Some((zr, ct)) = audit::find_chunk_type(&rules, ctype) else { continue };
+            let fp = zr.footprint(ct);
+            let (cx, hw, cz, hd) = fp;
+            println!(
+                "  {zone}/{ctype}  footprint local x[{:.0},{:.0}] z[{:.0},{:.0}]  exits={:?}",
+                cx - hw,
+                cx + hw,
+                cz - hd,
+                cz + hd,
+                ct.exits
+            );
+            let mut rows: Vec<(String, [audit::EdgeCoverage; 4])> = Vec::new();
+            for (lp, bytes) in &owned {
+                let rel = lp.strip_prefix(&layouts_root).unwrap_or(lp).to_string_lossy().to_uppercase();
+                if !rel.starts_with(&format!("{zone}\\{ctype}\\")) {
+                    continue;
+                }
+                if let Some(g) = audit::Grid::parse(bytes) {
+                    rows.push((
+                        lp.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                        g.edge_coverage(fp),
+                    ));
+                }
+            }
+            let bdir = base.join("LAYOUTS").join(zone).join(ctype);
+            if let Ok(rd) = std::fs::read_dir(&bdir) {
+                for e in rd.flatten() {
+                    let fname = e.file_name().to_string_lossy().to_string();
+                    if !fname.to_uppercase().ends_with(".MPP") {
+                        continue;
+                    }
+                    if let Ok(buf) = std::fs::read(e.path()) {
+                        if let Some(g) = audit::Grid::parse(&buf) {
+                            rows.push((format!("{fname} (base)"), g.edge_coverage(fp)));
+                        }
+                    }
+                }
+            }
+            for (name, cov) in rows {
+                let s: Vec<String> = (0..4)
+                    .map(|i| {
+                        format!(
+                            "{}: {:>3.0}/{:>3.0}",
+                            audit::EDGE_NAMES[i],
+                            100.0 * cov[i].inside_frac(),
+                            100.0 * cov[i].outside_frac()
+                        )
+                    })
+                    .collect();
+                println!("     {:<58} {}", name, s.join("  "));
+            }
+        }
+    }
+
+    let findings = audit::audit_tree(&media, Some(&base), &baked);
+    println!("\n== interface findings: {} ==", findings.len());
+    for f in &findings {
+        println!("  {}/{}/{}\n    {}", f.zone, f.chunk_type, f.variant, f.message);
+    }
+}
+
+/// mpp-info <mod_media> <base_media> <layout>...
+/// Region/header provenance for one tile: the collision hull the grid box comes
+/// from, and how many room pieces contributed vs how many had an unresolvable
+/// collision mesh. A high `missing` is the signature of a bake that under-fills
+/// because the geometry never loaded, which looks identical to "no floor here"
+/// in the finished grid.
+fn mpp_info(args: &[String]) {
+    use tl2_mikuro_mod_packer_rs::mpp::layout::load_layout_file;
+    use tl2_mikuro_mod_packer_rs::mpp::pipeline::{generate_header, Context};
+
+    let ctx = Context::new(Path::new(&args[0]), Some(Path::new(&args[1])));
+    for lp in args[2..].iter().filter(|a| !a.starts_with("--")) {
+        let p = Path::new(lp);
+        match load_layout_file(p) {
+            Err(e) => println!("{lp}: parse error {e}"),
+            Ok(layout) => {
+                let h = generate_header(&layout, &ctx);
+                println!("\n{}", p.file_name().unwrap_or_default().to_string_lossy());
+                println!(
+                    "  grid {}x{}   origin=({:.3},{:.3})   snapped box x[{:.2},{:.2}] z[{:.2},{:.2}]",
+                    h.grid_w, h.grid_h, h.origin_x, h.origin_z, h.bx.min.x, h.bx.max.x, h.bx.min.z, h.bx.max.z
+                );
+                println!(
+                    "  raw collision hull x[{:.3},{:.3}] z[{:.3},{:.3}]",
+                    h.region.aabb.min.x, h.region.aabb.max.x, h.region.aabb.min.z, h.region.aabb.max.z
+                );
+                println!(
+                    "  header worldExt=({:.3},{:.3}) bounds=({:.3},{:.3})",
+                    h.world_ext_x, h.world_ext_z, h.bounds_x, h.bounds_z
+                );
+                println!(
+                    "  room pieces contributing collision: {}   with UNRESOLVABLE mesh: {}",
+                    h.region.n_pieces_used, h.region.n_pieces_missing
+                );
+                // --pieces: who is responsible for each hull extremum. A box that
+                // disagrees with GUTS by one snap quantum is almost always ONE
+                // piece reaching a little too far, so name it.
+                if args.iter().any(|a| a == "--pieces") {
+                    print_hull_extremes(&layout, &ctx);
+                }
+                // Sibling shipped .MPP, when there is one: the header is what the
+                // engine stamps by, so a delta here misplaces the whole tile and
+                // is a different class of problem from a cell disagreement.
+                let s = lp.to_uppercase();
+                if s.ends_with(".LAYOUT") {
+                    let mp = format!("{}.MPP", &lp[..lp.len() - ".LAYOUT".len()]);
+                    if let Ok(buf) = std::fs::read(&mp) {
+                        if buf.len() >= 24 {
+                            let gi = |o: usize| i32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+                            let gf = |o: usize| f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+                            let (sw, sh) = (gi(0), gi(4));
+                            let (sex, sez, sbx, sbz) = (gf(8), gf(12), gf(16), gf(20));
+                            println!(
+                                "  GUTS   grid {sw}x{sh}   worldExt=({sex:.3},{sez:.3}) bounds=({sbx:.3},{sbz:.3})"
+                            );
+                            let dw = h.grid_w - sw;
+                            let dh = h.grid_h - sh;
+                            if (dw, dh) == (0, 0)
+                                && h.world_ext_x == sex
+                                && h.world_ext_z == sez
+                                && h.bounds_x == sbx
+                                && h.bounds_z == sbz
+                            {
+                                println!("  header MATCHES");
+                            } else {
+                                println!(
+                                    "  header DIFFERS  dgrid=({dw:+},{dh:+})  dExt=({:+.3},{:+.3})  dBounds=({:+.3},{:+.3})",
+                                    h.world_ext_x - sex,
+                                    h.world_ext_z - sez,
+                                    h.bounds_x - sbx,
+                                    h.bounds_z - sbz
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Cell class for A/B purposes. The three are NOT interchangeable at merge time:
+/// the engine stamps a tile's cell over the level grid when `cell != 0xFF`, so
+/// void yields to a neighbour while wall overwrites it. A bake that emits wall
+/// where GUTS emits void therefore seals its own doorway.
+fn cls(v: u8) -> usize {
+    match v {
+        0 => 0,        // walkable
+        0xFF => 2,     // void (no geometry under the cell)
+        _ => 1,        // wall
+    }
+}
+const CLS_NAME: [&str; 3] = ["walk", "wall", "void"];
+
+/// Chebyshev distance to the nearest grid border, bucketed.
+fn band_of(x: i32, z: i32, gw: i32, gh: i32) -> usize {
+    let d = x.min(z).min(gw - 1 - x).min(gh - 1 - z);
+    match d {
+        0..=2 => 0,
+        3..=5 => 1,
+        6..=15 => 2,
+        _ => 3,
+    }
+}
+const BAND_NAME: [&str; 4] = ["border 0-2", "ring 3-5", "ring 6-15", "interior >15"];
+
+/// Does walkable reach within `k` cells of each side? (order: N=-z, S=+z, W=-x, E=+x)
+fn side_touch(g: &[u8], gw: i32, gh: i32, k: i32) -> [bool; 4] {
+    let mut t = [false; 4];
+    let at = |x: i32, z: i32| g[(z * gw + x) as usize] == 0;
+    for x in 0..gw {
+        for z in 0..k.min(gh) {
+            if at(x, z) {
+                t[0] = true;
+            }
+            if at(x, gh - 1 - z) {
+                t[1] = true;
+            }
+        }
+    }
+    for z in 0..gh {
+        for x in 0..k.min(gw) {
+            if at(x, z) {
+                t[2] = true;
+            }
+            if at(gw - 1 - x, z) {
+                t[3] = true;
+            }
+        }
+    }
+    t
+}
+
+/// A/B the offline bake against every GUTS-baked sibling .MPP in a tree.
+///
+/// One aggregate diff percentage cannot tell "we are 0.3% noisy everywhere" from
+/// "we systematically wall the door thresholds", and only the latter can close a
+/// tile's interface at merge time. So this reports the full walk/wall/void
+/// confusion matrix and repeats it per distance-to-border band.
+fn verify_mpp_ab(args: &[String]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let media = PathBuf::from(&args[0]);
+    let sub = args.get(1).cloned().unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(&media, None);
+    let ctx_s = t0.elapsed().as_secs_f64();
+
+    let root = if sub.is_empty() {
+        media.join("LAYOUTS")
+    } else {
+        media.join("LAYOUTS").join(&sub)
+    };
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    let pairs: Vec<(PathBuf, PathBuf)> = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_uppercase().ends_with(".LAYOUT"))
+                .unwrap_or(false)
+        })
+        .filter_map(|lp| {
+            let s = lp.to_string_lossy();
+            let mp = PathBuf::from(format!("{}.MPP", &s[..s.len() - ".LAYOUT".len()]));
+            // Windows FS is case-insensitive, so this catches ".mpp" too.
+            if mp.exists() {
+                Some((lp.clone(), mp))
+            } else {
+                None
+            }
+        })
+        .collect();
+    println!(
+        "== MPP A/B vs GUTS ({}) ==\ncontext {ctx_s:.1}s   {} LAYOUT+MPP pairs",
+        root.display(),
+        pairs.len()
+    );
+
+    struct Row {
+        name: String,
+        i0x: i64,
+        dim_ok: bool,
+        err: bool,
+        conf: [[u64; 3]; 3],
+        band: [[[u64; 3]; 3]; 4],
+        // walkable-reaches-side, GUTS vs ours, within 3 cells of each side
+        side_lost: [bool; 4],
+    }
+
+    let done = AtomicUsize::new(0);
+    let total = pairs.len();
+    let t1 = std::time::Instant::now();
+    let rows: Vec<Row> = pairs
+        .par_iter()
+        .map(|(lp, mp)| {
+            let name = lp
+                .strip_prefix(&root)
+                .unwrap_or(lp)
+                .to_string_lossy()
+                .to_string();
+            let mut r = Row {
+                name,
+                i0x: 0,
+                dim_ok: false,
+                err: false,
+                conf: [[0; 3]; 3],
+                band: [[[0; 3]; 3]; 4],
+                side_lost: [false; 4],
+            };
+            let shipped = std::fs::read(mp).unwrap_or_default();
+            let gen = match tl2_mikuro_mod_packer_rs::mpp::compile_mpp(lp, &ctx) {
+                Ok(g) => g,
+                Err(_) => {
+                    r.err = true;
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d.is_multiple_of(200) || d == total {
+                        eprint!("\r  {d}/{total}   ");
+                    }
+                    return r;
+                }
+            };
+            if shipped.len() < 24 || gen.len() != shipped.len() || gen[..8] != shipped[..8] {
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d.is_multiple_of(200) || d == total {
+                    eprint!("\r  {d}/{total}   ");
+                }
+                return r;
+            }
+            r.dim_ok = true;
+            r.i0x = tl2_mikuro_mod_packer_rs::mpp::audit::stamp_i0(
+                f32::from_le_bytes(gen[8..12].try_into().unwrap()));
+            let gw = i32::from_le_bytes(gen[0..4].try_into().unwrap());
+            let gh = i32::from_le_bytes(gen[4..8].try_into().unwrap());
+            let (a, b) = (&shipped[24..], &gen[24..]);
+            for z in 0..gh {
+                for x in 0..gw {
+                    let i = (z * gw + x) as usize;
+                    let (ca, cb) = (cls(a[i]), cls(b[i]));
+                    r.conf[ca][cb] += 1;
+                    r.band[band_of(x, z, gw, gh)][ca][cb] += 1;
+                }
+            }
+            let sa = side_touch(a, gw, gh, 3);
+            let sb = side_touch(b, gw, gh, 3);
+            for s in 0..4 {
+                r.side_lost[s] = sa[s] && !sb[s];
+            }
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if d.is_multiple_of(200) || d == total {
+                eprint!("\r  {d}/{total}   ");
+            }
+            r
+        })
+        .collect();
+    eprintln!();
+
+    let n = rows.len();
+    let errs = rows.iter().filter(|r| r.err).count();
+    let dim_bad = rows.iter().filter(|r| !r.dim_ok && !r.err).count();
+    let ok: Vec<&Row> = rows.iter().filter(|r| r.dim_ok).collect();
+    let mut conf = [[0u64; 3]; 3];
+    let mut band = [[[0u64; 3]; 3]; 4];
+    for r in &ok {
+        for (i, row) in r.conf.iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
+                conf[i][j] += v;
+            }
+        }
+        for (b, rb) in r.band.iter().enumerate() {
+            for (i, row) in rb.iter().enumerate() {
+                for (j, v) in row.iter().enumerate() {
+                    band[b][i][j] += v;
+                }
+            }
+        }
+    }
+    let cells: u64 = conf.iter().flatten().sum();
+    let diff: u64 = (0..3).map(|i| (0..3).filter(|&j| j != i).map(|j| conf[i][j]).sum::<u64>()).sum();
+    println!(
+        "compile+compare {:.1}s   dim-match {}/{n}   dim-mismatch {dim_bad}   errors {errs}",
+        t1.elapsed().as_secs_f64(),
+        ok.len()
+    );
+    println!(
+        "cells {cells}   diff {diff}   accuracy {:.4}%",
+        100.0 * (cells - diff) as f64 / cells.max(1) as f64
+    );
+
+    let show = |label: &str, m: &[[u64; 3]; 3]| {
+        let tot: u64 = m.iter().flatten().sum();
+        println!("\n-- {label} ({tot} cells) --");
+        println!("            ours=walk      ours=wall      ours=void");
+        for (i, row) in m.iter().enumerate() {
+            print!("GUTS={:<5}", CLS_NAME[i]);
+            for v in row {
+                let pct = 100.0 * *v as f64 / tot.max(1) as f64;
+                print!("{v:>12} {pct:>5.2}%");
+            }
+            println!();
+        }
+    };
+    show("ALL CELLS", &conf);
+    for b in 0..4 {
+        show(BAND_NAME[b], &band[b]);
+    }
+
+    // The connectivity-relevant asymmetries, called out by name.
+    println!("\n-- interface risk (blocking direction only) --");
+    for (lbl, i, j) in [
+        ("GUTS void -> ours WALL  (stamps a wall where engine expected yield)", 2usize, 1usize),
+        ("GUTS walk -> ours WALL  (under-fill: walkable sealed)", 0, 1),
+        ("GUTS walk -> ours void  (under-fill: geometry missed)", 0, 2),
+        ("GUTS wall -> ours walk  (over-fill, opens)", 1, 0),
+        ("GUTS void -> ours walk  (over-fill, opens)", 2, 0),
+    ] {
+        println!(
+            "  {lbl}: {} total, border 0-2 {} ({:.1}% of that band's diff)",
+            conf[i][j],
+            band[0][i][j],
+            100.0 * band[0][i][j] as f64
+                / (0..3)
+                    .map(|a| (0..3).filter(|&b2| b2 != a).map(|b2| band[0][a][b2]).sum::<u64>())
+                    .sum::<u64>()
+                    .max(1) as f64
+        );
+    }
+
+    // A wrong grid dim is not a cosmetic miss: the engine stamps by
+    // floor((pos - worldExt)/cell), so a dim/header disagreement misplaces the
+    // whole tile. List them by name rather than as a count.
+    let bad: Vec<&Row> = rows.iter().filter(|r| !r.dim_ok && !r.err).collect();
+    if !bad.is_empty() {
+        println!("\n-- dim/header mismatches (tile would stamp at the wrong size/offset) --");
+        for r in bad.iter().take(40) {
+            println!("  {}", r.name);
+        }
+    }
+
+    // Split accuracy by the stamp-alignment index. If WE placed content differently
+    // from GUTS on i0==1 tiles, their cell agreement would collapse; if it matches the
+    // i0==2 tiles, GUTS bakes the same in-grid placement and the runtime shift is the
+    // engine's own reading, not ours.
+    println!("
+-- cell agreement split by stamp-alignment index i0 (X axis) --");
+    for want in [1i64, 2] {
+        let sel: Vec<&&Row> = ok.iter().filter(|r| r.i0x == want).collect();
+        if sel.is_empty() {
+            continue;
+        }
+        let cells: u64 = sel.iter().map(|r| r.conf.iter().flatten().sum::<u64>()).sum();
+        let diff: u64 = sel
+            .iter()
+            .map(|r| {
+                (0..3)
+                    .map(|i| (0..3).filter(|&j| j != i).map(|j| r.conf[i][j]).sum::<u64>())
+                    .sum::<u64>()
+            })
+            .sum();
+        println!(
+            "  i0={want}: {:>4} tiles  {:>11} cells  diff {:>8}  accuracy {:.4}%",
+            sel.len(),
+            cells,
+            diff,
+            100.0 * (cells - diff) as f64 / cells.max(1) as f64
+        );
+    }
+
+    let lost: Vec<&&Row> = ok.iter().filter(|r| r.side_lost.iter().any(|&b| b)).collect();
+    println!(
+        "\n-- tiles where a side GUTS could reach (walkable within 3 cells) is no longer reachable in ours: {}/{} --",
+        lost.len(),
+        ok.len()
+    );
+    for r in lost.iter().take(25) {
+        let s: Vec<&str> = ["N", "S", "W", "E"]
+            .iter()
+            .zip(r.side_lost)
+            .filter(|(_, l)| *l)
+            .map(|(n, _)| *n)
+            .collect();
+        println!("  {} lost {:?}", r.name, s);
+    }
+
+    let mut worst: Vec<&&Row> = ok.iter().collect();
+    worst.sort_by_key(|r| std::cmp::Reverse(r.band[0][2][1] + r.band[0][0][1] + r.band[0][0][2]));
+    println!("\n-- worst border-band blockers (void->wall + walk->wall + walk->void, band 0-2) --");
+    for r in worst.iter().take(15) {
+        println!(
+            "  {:>6}  v>w {:<5} w>W {:<5} w>v {:<5}  {}",
+            r.band[0][2][1] + r.band[0][0][1] + r.band[0][0][2],
+            r.band[0][2][1],
+            r.band[0][0][1],
+            r.band[0][0][2],
+            r.name
+        );
+    }
+}
+
+/// mpp-gen <mod_media> <base_media> <out_dir> [rel_substring_filter]
 /// Context built ONCE (mod-over-base overlay: mod_media wins, base_media fallback);
 /// walk mod_media/LAYOUTS, compile every .LAYOUT, write out_dir/<rel>.MPP. Parallel.
+/// The optional filter (case-insensitive substring of the path relative to
+/// LAYOUTS/) narrows the run to one tile or folder for diagnosis.
 fn mpp_gen(args: &[String]) {
     let mod_media = PathBuf::from(&args[0]);
     let base_media = PathBuf::from(&args[1]);
     let out_dir = PathBuf::from(&args[2]);
+    let filter = args.get(3).map(|s| s.to_uppercase());
     let t0 = std::time::Instant::now();
     let ctx = tl2_mikuro_mod_packer_rs::mpp::pipeline::Context::new(&mod_media, Some(&base_media));
+    let _ = tl2_mikuro_mod_packer_rs::mpp::native::link_miss_report(); // drop anything stale
     let layouts_root = mod_media.join("LAYOUTS");
     let mut files = Vec::new();
     walk(&layouts_root, &mut files);
@@ -564,6 +1460,15 @@ fn mpp_gen(args: &[String]) {
             p.file_name()
                 .map(|f| f.to_string_lossy().to_uppercase().ends_with(".LAYOUT"))
                 .unwrap_or(false)
+        })
+        .filter(|p| match &filter {
+            None => true,
+            Some(f) => p
+                .strip_prefix(&layouts_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .to_uppercase()
+                .contains(f),
         })
         .collect();
     let ctx_s = t0.elapsed().as_secs_f64();
@@ -596,6 +1501,24 @@ fn mpp_gen(args: &[String]) {
     );
     for e in fail.iter().filter_map(|r| r.as_ref().err()).take(20) {
         println!("  FAIL {e}");
+    }
+    // Same report the packer prints: an unresolved link drops its geometry from
+    // the grid without failing the compile, which is how a base tree missing its
+    // `.LAYOUT` files silently cost one tile 5010 cells of walkable ground.
+    let misses = tl2_mikuro_mod_packer_rs::mpp::native::link_miss_report();
+    if !misses.is_empty() {
+        let total: usize = misses.iter().map(|(_, n)| n).sum();
+        println!(
+            "  WARNING: {total} Layout Link(s) across {} target(s) did not resolve — \
+             their geometry is MISSING from these grids",
+            misses.len()
+        );
+        for (f, n) in misses.iter().take(12) {
+            println!("           {n:>5} x {f}");
+        }
+        if misses.len() > 12 {
+            println!("           ... and {} more target(s)", misses.len() - 12);
+        }
     }
 }
 

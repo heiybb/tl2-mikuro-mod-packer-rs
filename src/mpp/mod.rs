@@ -9,6 +9,7 @@
 //! agrees with native to the float floor. That is why this is the only backend;
 //! the one that drove the real editor for byte-exact grids is gone.
 
+pub mod audit;
 pub mod dat;
 pub mod geom;
 pub mod layout;
