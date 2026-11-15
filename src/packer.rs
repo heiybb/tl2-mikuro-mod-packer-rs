@@ -1331,9 +1331,13 @@ pub fn convert_all(
     // original hash is written back verbatim, so the engine still sees the data),
     // but the readable name is gone — say so once, loudly, with examples.
     let mut raw_hash_hits: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut odd_tag_hits: Vec<(PathBuf, Vec<crate::bindat::OddTag>)> = Vec::new();
     for (dp, bp, res) in bindat_out {
         match res {
             Ok(gen) => {
+                if !gen.odd_tags.is_empty() {
+                    odd_tag_hits.push((dp.clone(), gen.odd_tags));
+                }
                 if !gen.raw_hash_names.is_empty() {
                     raw_hash_hits.push((dp, gen.raw_hash_names));
                 }
@@ -1366,6 +1370,34 @@ pub fn convert_all(
         }
         if raw_hash_hits.len() > 10 {
             eprintln!("    ... and {} more file(s)", raw_hash_hits.len() - 10);
+        }
+    }
+    // The game and GUTS know ten tags, compared case-sensitively; anything else
+    // becomes a STRING there. The packer still packs its lenient spellings
+    // (`<INT>`, `<Integer>`) as the type meant, but the same DAT then behaves
+    // differently in GUTS or the game's text loader — so name every file.
+    if !odd_tag_hits.is_empty() {
+        eprintln!(
+            "  WARNING: {} DAT file(s) use value tag(s) the game does not recognize.\n\
+             \x20          The game and GUTS only know (case-sensitive): INTEGER INTEGER64 FLOAT\n\
+             \x20          DOUBLE \"UNSIGNED INT\" BOOL STRING TRANSLATE DIALOG NOTE, and store any\n\
+             \x20          other tag as STRING, so a number under it reads as a string id.\n\
+             \x20          <TAG>=TYPE  packed as TYPE by this packer only; write TYPE instead.\n\
+             \x20          <TAG>?      not a tag at all; stored as STRING, like the game does.",
+            odd_tag_hits.len()
+        );
+        for (dp, tags) in odd_tag_hits.iter().take(10) {
+            let shown: Vec<String> = tags
+                .iter()
+                .map(|t| match t.packed_as {
+                    Some(c) => format!("<{}>={c}", t.tag),
+                    None => format!("<{}>?", t.tag),
+                })
+                .collect();
+            eprintln!("    {}: {}", dp.display(), shown.join("  "));
+        }
+        if odd_tag_hits.len() > 10 {
+            eprintln!("    ... and {} more file(s)", odd_tag_hits.len() - 10);
         }
     }
     for (bp, res) in layout_out {

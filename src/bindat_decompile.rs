@@ -113,11 +113,13 @@ fn type_tag(tc: u32) -> &'static str {
     match tc {
         1 => "INTEGER",
         2 => "FLOAT",
+        3 => "DOUBLE",
         4 => "UNSIGNED INT",
         5 => "STRING",
         6 => "BOOL",
         7 => "INTEGER64",
         8 => "TRANSLATE",
+        9 => "NOTE",
         _ => "STRING",
     }
 }
@@ -166,7 +168,9 @@ fn emit_node(
         let key_hash = c.u32()?;
         let tc = c.u32()?;
         let value = match tc {
-            5 | 8 => {
+            // 9 never comes out of GUTS (its writer drops NOTE); read it as a
+            // string id on a best-effort basis.
+            5 | 8 | 9 => {
                 let sid = c.u32()?;
                 strs.get(&sid).cloned().unwrap_or_default()
             }
@@ -175,6 +179,8 @@ fn emit_node(
                 if v != 0 { "true".to_string() } else { "false".to_string() }
             }
             2 => fmt_f32(f32::from_bits(c.u32()?)),
+            // 8-byte slot (engine reader sub_67A970 reads 8 for types 3 and 7).
+            3 => f64::from_bits(c.i64()? as u64).to_string(),
             4 => c.u32()?.to_string(),
             7 => c.i64()?.to_string(),
             _ => (c.u32()? as i32).to_string(),
@@ -360,6 +366,49 @@ mod tests {
                 "{lookalike} must NOT be treated as a raw-hash escape"
             );
         }
+    }
+
+    /// Value tags follow the engine's CDataValue::setFromTag (0x679E20) and GUTS'
+    /// writer (sub_102896D0): DOUBLE is an 8-byte type 3, DIALOG is TRANSLATE,
+    /// NOTE is dropped from the BINDAT. On top of that the packer keeps its
+    /// lenient spellings (`<INT>`, `<Integer>`, `<UNSIGNEDINT>`) but reports
+    /// each one, and a tag that is no tag at all is a STRING, reported too.
+    #[test]
+    fn value_tags_follow_engine() {
+        use crate::bindat::{compile_dat_bytes_reported, OddTag};
+        // Real key names, so the reverse dictionary gives them back verbatim.
+        let src = "[X]\r\n<DOUBLE>DAMAGE:2.5\r\n<DIALOG>DESCRIPTION:hello\r\n\
+                   <NOTE>NOTES:just a note\r\n<INTEGER>LEVEL:7\r\n<INT>VALUE:8\r\n\
+                   <Integer>DURATION:9\r\n<UNSIGNEDINT>RARITY:10\r\n<string>NAME:n\r\n\
+                   <STIRNG>DISPLAYNAME:d\r\n[/X]\r\n";
+        let out = compile_dat_bytes_reported(&to_dat_bytes(src), None).expect("compile");
+        let odd = |tag: &str, packed_as| OddTag { tag: tag.into(), packed_as };
+        assert_eq!(
+            out.odd_tags,
+            vec![
+                odd("INT", Some("INTEGER")),
+                odd("Integer", Some("INTEGER")),
+                odd("UNSIGNEDINT", Some("UNSIGNED INT")),
+                odd("STIRNG", None),
+            ]
+        );
+
+        let text = decompile_bindat(&out.bytes).expect("decompile");
+        assert!(text.contains("<DOUBLE>DAMAGE:2.5\r\n"), "{text}");
+        assert!(text.contains("<TRANSLATE>DESCRIPTION:hello\r\n"), "{text}");
+        assert!(!text.contains("NOTE") && !text.contains("just a note"), "{text}");
+        assert!(text.contains("<INTEGER>LEVEL:7\r\n"), "{text}");
+        assert!(text.contains("<INTEGER>VALUE:8\r\n"), "{text}");
+        assert!(text.contains("<INTEGER>DURATION:9\r\n"), "{text}");
+        assert!(text.contains("<UNSIGNED INT>RARITY:10\r\n"), "{text}");
+        for (k, v) in [("NAME", "n"), ("DISPLAYNAME", "d")] {
+            assert!(text.contains(&format!("<STRING>{k}:{v}\r\n")), "{text}");
+        }
+        // Decompile → compile is byte-identical (the 8-byte DOUBLE slot keeps
+        // the stream aligned).
+        let again = compile_dat_bytes_reported(&to_dat_bytes(&text), None).expect("recompile");
+        assert_eq!(again.bytes, out.bytes);
+        assert!(again.odd_tags.is_empty());
     }
 
     /// End-to-end (only where the game is installed): every LEVELSETS DAT in

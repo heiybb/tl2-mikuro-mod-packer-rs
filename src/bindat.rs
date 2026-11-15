@@ -24,23 +24,86 @@ use crate::text::{
 
 const EMPTY_ID: u32 = 0xFFFF_FFFF;
 
-/// Property type codes from the <TAG> in the DAT text.
-fn type_code(tag: &[u32]) -> u32 {
-    // _norm_tag: upper + remove spaces (tags are ASCII).
-    let norm: String = tag
-        .iter()
-        .filter(|&&c| c != 0x20)
-        .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}').to_ascii_uppercase())
-        .collect();
-    match norm.as_str() {
-        "INTEGER" | "INT" => 1,
+/// `<NOTE>` properties: parsed, but GUTS' writer (EditorGuts sub_102896D0) skips
+/// type 9 entirely and back-patches the property count, so they never reach a
+/// BINDAT. (The engine's BINDAT reader sub_67A970 would not remap a type-9
+/// string id anyway — only 5 and 8 go through the file's string table.)
+const NOTE_TYPE: u32 = 9;
+
+/// The engine's own type code for a `<TAG>` (CDataValue::setFromTag,
+/// Torchlight2.exe 0x679E20 = EditorGuts sub_10289190): a whole-string,
+/// CASE-SENSITIVE compare against these ten. The parser upper-cases KEY names
+/// but leaves the tag as written, so anything else — `<Integer>`, `<INT>`,
+/// `<UNSIGNEDINT>`, a typo — falls through to the final `else` as a STRING (5).
+/// Numeric getters (getInt 0x677F80 etc.) do not check the type, so a key
+/// stored that way reads its string-table id: not the number, not a default.
+fn engine_type_code(tag: &str) -> Option<u32> {
+    Some(match tag {
+        "INTEGER" => 1,
         "FLOAT" => 2,
-        "UNSIGNEDINT" | "UINT" => 4,
+        "DOUBLE" => 3,
+        "UNSIGNED INT" => 4,
         "STRING" => 5,
-        "BOOL" | "BOOLEAN" => 6,
-        "INTEGER64" | "INT64" => 7,
-        "TRANSLATE" => 8,
-        _ => 5,
+        "BOOL" => 6,
+        "INTEGER64" => 7,
+        "TRANSLATE" | "DIALOG" => 8,
+        "NOTE" => NOTE_TYPE,
+        _ => return None,
+    })
+}
+
+/// The packer's deliberate leniency on top of the engine: upper-case, drop
+/// spaces, and accept the common short spellings. The game and GUTS read every
+/// tag this rescues as a STRING, so each use is reported.
+fn lenient_type_code(tag: &str) -> Option<u32> {
+    let norm: String = tag.chars().filter(|&c| c != ' ').map(|c| c.to_ascii_uppercase()).collect();
+    match norm.as_str() {
+        "INT" => Some(1),
+        "UNSIGNEDINT" | "UINT" => Some(4),
+        "BOOLEAN" => Some(6),
+        "INT64" => Some(7),
+        n => engine_type_code(n),
+    }
+}
+
+/// Canonical tag for a type code (what the warning says a tag was packed as).
+fn canonical_tag(tc: u32) -> &'static str {
+    match tc {
+        1 => "INTEGER",
+        2 => "FLOAT",
+        3 => "DOUBLE",
+        4 => "UNSIGNED INT",
+        6 => "BOOL",
+        7 => "INTEGER64",
+        8 => "TRANSLATE",
+        NOTE_TYPE => "NOTE",
+        _ => "STRING",
+    }
+}
+
+/// A value tag the engine would not read the way it was meant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OddTag {
+    /// The tag as written.
+    pub tag: String,
+    /// What the packer stored it as. `Some` = rescued by the packer's leniency
+    /// (the game's text loader and GUTS would make it a STRING); `None` = not a
+    /// tag at all, stored as STRING just like the engine does.
+    pub packed_as: Option<&'static str>,
+}
+
+/// Type code for a `<TAG>`: the engine's mapping, plus the packer's leniency.
+/// The second value is set when the result differs from a plain engine read.
+fn type_code(tag: &[u32]) -> (u32, Option<OddTag>) {
+    let s: String = tag.iter().filter_map(|&c| char::from_u32(c)).collect();
+    if let Some(tc) = engine_type_code(&s) {
+        return (tc, None);
+    }
+    match lenient_type_code(&s) {
+        // Lower-case `<string>` and the like: STRING either way, nothing to say.
+        Some(5) => (5, None),
+        Some(tc) => (tc, Some(OddTag { tag: s, packed_as: Some(canonical_tag(tc)) })),
+        None => (5, Some(OddTag { tag: s, packed_as: None })),
     }
 }
 
@@ -55,6 +118,13 @@ pub struct Node {
 /// Mirrors `parse_dat_text`: `[NAME]`/`[/NAME]` sections nest; property lines
 /// are `<TYPE>KEY:VALUE` (KEY may be empty; VALUE keeps trailing spaces).
 pub fn parse_dat_text(text: &[u32]) -> Vec<Node> {
+    parse_dat_text_reported(text).0
+}
+
+/// `parse_dat_text` + every distinct tag spelling the engine would not read as
+/// written (see [`OddTag`]), in first-seen order.
+pub fn parse_dat_text_reported(text: &[u32]) -> (Vec<Node>, Vec<OddTag>) {
+    let mut odd_tags: Vec<OddTag> = Vec::new();
     // text.lstrip('﻿')
     let mut t = text;
     while !t.is_empty() && t[0] == 0xFEFF {
@@ -112,7 +182,13 @@ pub fn parse_dat_text(text: &[u32]) -> Vec<Node> {
         // _PROP_RE: ^<([A-Za-z0-9_ ]+)>\s*([^:]*?)\s*:(.*)$
         if let Some((tag, key, value)) = match_prop_line(line) {
             if let Some(top) = stack.last_mut() {
-                top.props.push((type_code(&tag), key, value));
+                let (tc, odd) = type_code(&tag);
+                if let Some(o) = odd {
+                    if !odd_tags.contains(&o) {
+                        odd_tags.push(o);
+                    }
+                }
+                top.props.push((tc, key, value));
             }
         }
     }
@@ -121,7 +197,7 @@ pub fn parse_dat_text(text: &[u32]) -> Vec<Node> {
     while let Some(done) = stack.pop() {
         attach(&mut roots, &mut stack, done);
     }
-    roots
+    (roots, odd_tags)
 }
 
 fn is_tag_char(c: u32) -> bool {
@@ -352,14 +428,21 @@ fn name_hash(name: &[u32], raw: &mut Vec<String>) -> u32 {
 
 fn serialize_node(node: &Node, ids: &HashMap<WStr, u32>, out: &mut Vec<u8>, raw: &mut Vec<String>) {
     out.extend_from_slice(&name_hash(&node.name, raw).to_le_bytes());
-    out.extend_from_slice(&(node.props.len() as u32).to_le_bytes());
+    // GUTS writes only the non-NOTE props and back-patches this count.
+    let stored = node.props.iter().filter(|(tc, _, _)| *tc != NOTE_TYPE).count();
+    out.extend_from_slice(&(stored as u32).to_le_bytes());
     for (tc, key, value) in &node.props {
+        if *tc == NOTE_TYPE {
+            continue;
+        }
         out.extend_from_slice(&name_hash(key, raw).to_le_bytes());
         out.extend_from_slice(&tc.to_le_bytes());
         match tc {
             5 | 8 => out.extend_from_slice(&resolve_id(ids, value).to_le_bytes()),
             6 => out.extend_from_slice(&encode_bool(value).to_le_bytes()),
             2 => out.extend_from_slice(&encode_float_bits(value).to_le_bytes()),
+            // 8-byte slot, both in GUTS' writer and the engine's reader.
+            3 => out.extend_from_slice(&py_parse_f64(value).unwrap_or(0.0).to_le_bytes()),
             4 => out.extend_from_slice(&((encode_int(value) as u64 & 0xFFFF_FFFF) as u32).to_le_bytes()),
             7 => out.extend_from_slice(&(encode_int(value) as u64).to_le_bytes()),
             _ => out.extend_from_slice(&(encode_int(value) as i32).to_le_bytes()),
@@ -412,6 +495,10 @@ fn serialize_with_ids(
 pub struct CompiledDat {
     pub bytes: Vec<u8>,
     pub raw_hash_names: Vec<String>,
+    /// Value tags the engine would not read as written: the packer's lenient
+    /// spellings (`<INT>`, `<Integer>`) and tags that are no tag at all. Filled
+    /// by the `compile_dat_*_reported` entry points; empty from `compile_tree*`.
+    pub odd_tags: Vec<OddTag>,
 }
 
 /// Serialize a parsed node tree to BINDAT bytes (per-file hash ids — the
@@ -436,7 +523,7 @@ pub fn compile_tree_reported(roots: &[Node]) -> Result<CompiledDat, String> {
     let ids: HashMap<WStr, u32> = sdict.s2id.iter().map(|(s, &i)| (s.clone(), i)).collect();
     let mut raw = Vec::new();
     let bytes = serialize_with_ids(roots, &ordered, &ids, &mut raw);
-    Ok(CompiledDat { bytes, raw_hash_names: raw })
+    Ok(CompiledDat { bytes, raw_hash_names: raw, odd_tags: Vec::new() })
 }
 
 /// Serialize with the GLOBAL corpus dictionary — the exact sub_10289A40 /
@@ -476,7 +563,7 @@ pub fn compile_tree_corpus_reported(
     }
     let mut raw = Vec::new();
     let bytes = serialize_with_ids(roots, &ordered, &ids, &mut raw);
-    Ok(CompiledDat { bytes, raw_hash_names: raw })
+    Ok(CompiledDat { bytes, raw_hash_names: raw, odd_tags: Vec::new() })
 }
 
 /// Compile .DAT bytes (UTF-16, BOM-aware) into BINDAT bytes from scratch.
@@ -501,11 +588,13 @@ pub fn compile_dat_bytes_reported(
     dict: Option<&CorpusDict>,
 ) -> Result<CompiledDat, String> {
     let text = decode_dat_bytes(data);
-    let roots = parse_dat_text(&text);
-    match dict {
+    let (roots, odd_tags) = parse_dat_text_reported(&text);
+    let mut out = match dict {
         Some(d) => compile_tree_corpus_reported(&roots, d),
         None => compile_tree_reported(&roots),
-    }
+    }?;
+    out.odd_tags = odd_tags;
+    Ok(out)
 }
 
 /// `compile_dat_bytes_reported` for a file path.
