@@ -6,9 +6,6 @@
 //! picker, and packs the chosen mod(s). The picker is selection-only; once the
 //! user confirms we restore the terminal and pack with the normal console
 //! output, so the proven `convert_all` / `pack_mod` core is untouched.
-//!
-//! Binary-only: this module is never part of the library the wasm front-end
-//! reuses via `#[path]`, so its ratatui dependency stays off the wasm target.
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};

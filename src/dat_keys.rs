@@ -224,7 +224,7 @@ pub fn lookup(hash: u32) -> Option<(&'static str, Tier)> {
 }
 
 /// The marker every surface agrees on for a name that could not be recovered.
-/// The TUI and the browser page both colour a line red on finding this substring,
+/// The TUI colours a line red on finding this substring,
 /// so the placeholder text itself is the contract -- no side channel to keep in sync.
 pub const UNK_PREFIX: &str = "UNK_";
 
@@ -244,13 +244,8 @@ pub fn paint_ok(s: &str, is_tty: bool) -> String {
 
 /// Whether ANSI colour may be emitted, given what `IsTerminal` claimed.
 ///
-/// `is_tty` alone is NOT enough, and the failure is not hypothetical: under
-/// `browser_wasi_shim` a `ConsoleStdout` fd reports as a character device, so the native
-/// check answers "terminal" inside a browser tab and the escape codes land in the page
-/// as literal `[1;32m` / `[0m` text. On wasm the answer is therefore no by default --
-/// every wasm consumer either colours the line itself by matching the markers, or is a
-/// CLI runner where plain text is fine. `FORCE_COLOR` overrides; `NO_COLOR` (the de-facto
-/// standard) wins over everything.
+/// `FORCE_COLOR` overrides a non-terminal; `NO_COLOR` (the de-facto standard) wins
+/// over everything.
 pub fn want_color(is_tty: bool) -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
@@ -258,7 +253,7 @@ pub fn want_color(is_tty: bool) -> bool {
     if std::env::var_os("FORCE_COLOR").is_some() {
         return true;
     }
-    !cfg!(target_family = "wasm") && is_tty
+    is_tty
 }
 
 /// Wrap `s` in ANSI red. Callers pass [`want_color`], never a bare `is_terminal()`.
@@ -283,15 +278,13 @@ pub fn len() -> usize {
 mod tests {
     use super::*;
 
-    /// The colour policy, not the call sites. This regressed in the browser: a
-    /// `ConsoleStdout` fd under browser_wasi_shim reports as a character device, the
-    /// native `IsTerminal` said "terminal", and `[1;32m` was printed into the page.
+    /// The colour policy, not the call sites: piped output (the TUI's child
+    /// process) must stay plain.
     #[test]
-    fn colour_is_off_on_wasm_because_is_terminal_lies_there() {
-        if cfg!(target_family = "wasm") {
-            assert!(!want_color(true), "wasm must never emit ANSI on its own");
+    fn colour_is_off_when_not_a_terminal() {
+        if std::env::var_os("FORCE_COLOR").is_none() {
+            assert!(!want_color(false), "a non-tty is never coloured");
         }
-        assert!(!want_color(false), "a non-tty is never coloured");
     }
 
     #[test]

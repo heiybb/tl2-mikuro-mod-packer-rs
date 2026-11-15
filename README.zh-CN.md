@@ -460,14 +460,12 @@ per-instance 运行时 nocollide),换语言/精度都不移动它。
 | `src/binlayout_decompile.rs` | BINLAYOUT → LAYOUT 反编译(schema 反查;不动点 8986/8986) |
 | `src/bindat_decompile.rs` | BINDAT → DAT 反编译(内嵌词表 + `UNK_<HEX8>` 转义) |
 | `src/pak.rs` / `src/unpack.rs` | 容器读取(header/manifest/块)与 `.MOD`→源目录解包 |
-| `src/tui.rs` | ratatui 交互界面(binary-only,不进 wasm) |
+| `src/tui.rs` | ratatui 交互界面 |
 | `src/mpp/*` | region 头部 f32 舍入逐操作对齐;生产用网格构建器按桶剔除、逐行 rayon 并行 |
 
 刻意保留的 bug-for-bug 行为:ogre_mesh 顶点声明只读第一个 element(沿袭下来的 +14
 步进 bug,POSITION 恒为 element 0);binlayout 的 `NAME`/`CHOICE`/`GAME MODE` 首次出现
 吞为对象元数据;TAGS.DAT 空根名哈希等 —— 详见各文件注释。
-
-浏览器版(同一套 `#[path]` 共享代码编到 wasm)见 `../tl2-mikuro-mod-packer-wasm`。
 
 ## BINDAT 双 id 模式(2026-07-04 起)
 

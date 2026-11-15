@@ -468,10 +468,7 @@ fn write_file(dst: &Path, data: &[u8], ftime: Option<u64>) -> Result<(), String>
     if let Some(ft) = ftime {
         if let Some(t) = filetime_to_system(ft) {
             // Best-effort: a filesystem that cannot store the time is not a
-            // reason to fail the unpack. (On WASI this is where the synthesized
-            // FILETIME 0 → 1601 stamp is dropped — `filestat_set_times` takes
-            // UNSIGNED nanoseconds since 1970, so a pre-epoch time has no
-            // representation there and those files keep the host's clock.)
+            // reason to fail the unpack.
             let _ = f.set_modified(t);
         }
     }

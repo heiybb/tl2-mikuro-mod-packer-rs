@@ -592,16 +592,13 @@ change of language or precision moves it.
 | `src/binlayout_decompile.rs` | BINLAYOUT → LAYOUT (schema reverse lookup; fixed point 8986/8986) |
 | `src/bindat_decompile.rs` | BINDAT → DAT (embedded dictionary + the `UNK_<HEX8>` escape) |
 | `src/pak.rs` / `src/unpack.rs` | Container reading (header/manifest/blocks) and `.MOD` → source tree |
-| `src/tui.rs` | The ratatui interface (binary-only; never reaches wasm) |
+| `src/tui.rs` | The ratatui interface |
 | `src/mpp/*` | Region-header f32 rounding aligned per operation; the production grid builder culls by bucket and runs row-parallel with rayon |
 
 Bug-for-bug behaviour kept on purpose: ogre_mesh reads only the first vertex-declaration
 element (an inherited +14 stride bug; POSITION is always element 0); binlayout swallows
 the first occurrence of `NAME` / `CHOICE` / `GAME MODE` as object metadata; TAGS.DAT's
 empty root-name hash. See the comments in each file.
-
-For the browser build (the same code shared via `#[path]`, compiled to wasm), see
-`../tl2-mikuro-mod-packer-wasm`.
 
 ## BINDAT's two id modes (since 2026-07-04)
 
